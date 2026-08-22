@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+work/
+out/
+*.mp4
+*.m4a
+*.wav
+.DS_Store
+dist/
+*.egg-info/
