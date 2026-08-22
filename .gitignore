@@ -12,3 +12,6 @@ out/
 .DS_Store
 dist/
 *.egg-info/
+node_modules/
+.vite/
+tsconfig.tsbuildinfo
