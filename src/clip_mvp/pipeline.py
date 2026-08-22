@@ -59,6 +59,10 @@ class JobSummary:
     vertical_ok: int = 0
     vertical_skipped: int = 0
     min_score: float = 0.0
+    #: Cortes que passaram do limiar absoluto mas ficaram muito abaixo do melhor
+    #: deste vídeo (SPEC §3.5: qualidade > quantidade).
+    below_floor_removed: int = 0
+    quality_floor: float | None = None
     dry_run: bool = False
     cost_estimate: dict[str, Any] | None = None
     budget_warning: str | None = None
@@ -170,14 +174,53 @@ def _ensure_diarization_method(
     return method
 
 
+@dataclass
+class SelectionOutcome:
+    selected: list[tuple[Candidate, Score]] = field(default_factory=list)
+    deduped_removed: int = 0
+    below_floor_removed: int = 0
+    quality_floor: float | None = None
+
+
+def _apply_relative_floor(
+    passing: list[tuple[Candidate, Score]],
+    *,
+    relative_gap: float | None,
+    keep_at_least: int,
+) -> tuple[list[tuple[Candidate, Score]], int, float | None]:
+    """Corta o que ficou muito abaixo do melhor corte do job (SPEC §3.5).
+
+    O limiar absoluto (``min_score``) responde "isso é publicável?". Ele não
+    responde "isso presta ao lado do resto deste vídeo": num podcast com um
+    momento de 92, entregar também um de 61 só porque passou do limiar dilui o
+    lote e é exatamente o "corte mediano" que a spec pede para evitar
+    ("qualidade > quantidade").
+
+    Nunca desce abaixo do piso da faixa alvo da SPEC §3, e ``relative_gap=None``
+    desliga a regra (é o caso de ``--count N``, em que o usuário pediu um número
+    explícito).
+    """
+    if relative_gap is None or relative_gap <= 0 or len(passing) <= max(1, keep_at_least):
+        return passing, 0, None
+
+    best = passing[0][1].total
+    floor = best - relative_gap
+    kept = [cs for cs in passing if cs[1].total >= floor]
+    if len(kept) < keep_at_least:
+        kept = passing[:keep_at_least]
+    return kept, len(passing) - len(kept), round(floor, 2)
+
+
 def _select_clips(
     scored: list[tuple[Candidate, Score]],
     *,
     min_score: float,
     max_score_only: float | None,
     count_cap: int,
-) -> tuple[list[tuple[Candidate, Score]], int]:
-    """Aplica limiar + dedupe (por score) + teto (SPEC §3 fluxo interno)."""
+    keep_at_least: int = 1,
+    relative_gap: float | None = None,
+) -> SelectionOutcome:
+    """Aplica limiar + dedupe (por score) + piso relativo + teto (SPEC §3)."""
     items = [
         DedupeItem(
             item=(c, s),
@@ -196,8 +239,17 @@ def _select_clips(
     threshold = max_score_only if max_score_only is not None else min_score
     passing = [(c, s) for c, s in deduped if s.total >= threshold]
     passing.sort(key=lambda cs: cs[1].total, reverse=True)
-    selected = passing[:count_cap]
-    return selected, dedupe_result.removed_count
+    passing = passing[:count_cap]
+
+    kept, below_floor, floor = _apply_relative_floor(
+        passing, relative_gap=relative_gap, keep_at_least=min(keep_at_least, count_cap)
+    )
+    return SelectionOutcome(
+        selected=kept,
+        deduped_removed=dedupe_result.removed_count,
+        below_floor_removed=below_floor,
+        quality_floor=floor,
+    )
 
 
 def make_reporter(settings: Settings, job_id: str, **kwargs: Any) -> ProgressReporter:
@@ -364,7 +416,7 @@ def _execute(
     min_score = options.min_score if options.min_score is not None else settings.min_score_default
     summary.min_score = options.max_score_only if options.max_score_only is not None else min_score
 
-    _, target_hi = resolve_target_range(duration_s, more=options.more, count=options.count)
+    target_lo, target_hi = resolve_target_range(duration_s, more=options.more, count=options.count)
 
     cost = estimate_cost(duration_s, candidates_pool_hint(target_hi), settings)
     summary.cost_estimate = cost.model_dump()
@@ -468,13 +520,26 @@ def _execute(
     check_cancel()
     reporter.start_stage("select", units_total=1)
     count_cap = options.count if options.count is not None else target_hi
-    selected, removed = _select_clips(
+    outcome = _select_clips(
         scored,
         min_score=min_score,
         max_score_only=options.max_score_only,
         count_cap=count_cap,
+        keep_at_least=target_lo,
+        # --count N é um pedido explícito de quantidade: aí o piso relativo não
+        # deve entrar no caminho do usuário.
+        relative_gap=None if options.count is not None else settings.score_relative_gap,
     )
-    summary.deduped_removed = removed
+    selected = outcome.selected
+    summary.deduped_removed = outcome.deduped_removed
+    summary.below_floor_removed = outcome.below_floor_removed
+    summary.quality_floor = outcome.quality_floor
+    if outcome.below_floor_removed:
+        summary.notes.append(
+            f"{outcome.below_floor_removed} corte(s) descartado(s) por ficarem muito abaixo "
+            f"do melhor deste vídeo (piso relativo {outcome.quality_floor:.0f}); "
+            "qualidade > quantidade (SPEC §3)."
+        )
 
     if not selected:
         message = (
@@ -490,7 +555,8 @@ def _execute(
 
     reporter.finish_stage(
         "select",
-        f"selected={len(selected)}, candidates={summary.candidates}, deduped={removed}",
+        f"selected={len(selected)}, candidates={summary.candidates}, "
+        f"deduped={outcome.deduped_removed}, abaixo_do_piso={outcome.below_floor_removed}",
     )
 
     slugs = _unique_slugs(selected)
@@ -569,6 +635,8 @@ def _summary_payload(summary: JobSummary) -> dict[str, Any]:
         "candidates": summary.candidates,
         "selected": summary.selected,
         "deduped_removed": summary.deduped_removed,
+        "below_floor_removed": summary.below_floor_removed,
+        "quality_floor": summary.quality_floor,
         "vertical_ok": summary.vertical_ok,
         "vertical_skipped": summary.vertical_skipped,
         "min_score": summary.min_score,

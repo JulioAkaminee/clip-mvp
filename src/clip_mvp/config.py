@@ -92,6 +92,12 @@ class Settings:
     short_clip_score_cap: float = field(
         default_factory=lambda: _env_float("CLIP_SHORT_CLIP_SCORE_CAP", 70.0)
     )
+    # Piso relativo da seleção (SPEC §3.5): distância máxima entre o melhor corte
+    # do job e o pior que ainda vale entregar. O limiar absoluto diz "é
+    # publicável?"; este diz "presta ao lado do resto deste vídeo?". 0 desliga.
+    score_relative_gap: float = field(
+        default_factory=lambda: _env_float("CLIP_SCORE_RELATIVE_GAP", 22.0)
+    )
 
     # Diretórios (SPEC §5)
     work_dir: Path = field(default_factory=lambda: Path(os.getenv("CLIP_WORK_DIR", "work")))
