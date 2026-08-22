@@ -36,11 +36,20 @@ cd web && npm install && npm run build && cd ..
 clip serve                    # http://127.0.0.1:8765
 ```
 
-Desenvolvendo o front, rode os dois processos (o Vite faz proxy de `/api`):
+O build fica em `web/dist/`, que é gitignorado: depois de clonar o repo é preciso
+buildar uma vez, senão `clip serve` sobe a API e serve uma página explicando isso
+(`GET /api/health` também responde `ui_built: false`).
+
+Desenvolvendo o front, rode os dois processos (o Vite faz proxy de `/api` para a
+porta default de `clip serve`; use `CLIP_MVP_API` se subir em outra):
 
 ```bash
 clip serve                    # API em :8765
 cd web && npm run dev         # UI em :5173 com hot reload
+
+# API em outra porta:
+clip serve --port 9000
+CLIP_MVP_API=http://127.0.0.1:9000 npm run dev
 ```
 
 A interface é um app React + Vite (`web/`) que consome o mesmo payload de
@@ -214,9 +223,17 @@ Se o processo morrer (kill, reboot, laptop fechado no meio do render), o
 `status.json` continuaria dizendo `running` para sempre. Como um job vivo
 reescreve esse arquivo a cada batimento — inclusive quando roda na CLI, em outro
 processo — o frescor do arquivo é o que separa "morreu" de "está vivo em outro
-lugar". Passado esse tempo, a API devolve o job como erro retriável
-(`stale: true`) com **Retomar de onde parou**, que reaproveita todo o cache em
-`work/`. Nada de spinner eterno.
+lugar". Passado esse tempo, o job aparece como erro retriável (`stale: true`) com
+**Retomar de onde parou**, que reaproveita o cache em `work/`. Nada de spinner
+eterno — e isso vale tanto na API/UI quanto no `clip status`, que usa a mesma
+regra.
+
+O mesmo frescor resolve a convivência entre CLI e `clip serve`: o `job_id` vem da
+URL, então colar na UI um link que já está rodando no terminal **acompanha** o job
+existente em vez de disparar uma segunda execução sobre o mesmo `status.json` e a
+mesma pasta `out/`. Nesse caso `retry` e `cancel` respondem 409 explicando que o
+job é de outro processo (cancelar é um sinal em memória: só alcança quem
+começou).
 
 ### Payload de progresso
 
@@ -315,6 +332,13 @@ out/87_hook-fulano/
   depois que aquela paráfrase foi gerada. Os primeiros 3s vão separados para o
   scorer, e um corte que abre praticamente sem fala tem o `hook` limitado de
   forma determinística.
+- **Os quatro critérios do score são a nota.** SPEC §8 pede `hook`/`emocao`/
+  `citavel`/`arco` de 0–25 somando 100, e isso é validado no código, não só
+  pedido no prompt: cada critério é limitado à faixa e o total passa a ser a soma
+  do breakdown. Sem isso um `hook: 40` entrava cru (notas em escalas diferentes
+  não são comparáveis no ranking) e as penalidades determinísticas, que descontam
+  do total a diferença cortada de um critério, deixavam `meta.json` com breakdown
+  e nota contando histórias diferentes.
 - Corte truncado não é publicável: contexto aberto tem teto de score 45 e `arco`
   no máximo 6, independentemente da nota que o modelo deu.
 - Dedupe olha overlap temporal no 16:9 **e** no 9:16 (é o 9:16 que vai para o
@@ -328,6 +352,19 @@ out/87_hook-fulano/
 - `--more`/`--count` nunca inventam clip fraco: qualidade > quantidade.
 - Face tracking (MediaPipe) roda só no `vertical_facetrack`, nunca no
   `vertical_center`/`horizontal_16x9`.
+- **O crop segue quem está falando.** A timeline de falantes sai dos speaker
+  labels da própria transcrição, que já foi paga. Cada falante é ligado ao rosto
+  que se mexe enquanto ele fala — mapeamento um-para-um, então dois falantes nunca
+  caem no mesmo rosto — e a troca de turno vira um crossfade curto em vez de um
+  corte seco. Se o modelo de STT não expõe labels, o **papel de diarização**
+  (Configurações) pode apontar para um modelo que exponha: aí sim vale uma segunda
+  passada de áudio, que reusa o chunking da transcrição e entra na estimativa de
+  custo. Sem nada disso, o alvo é o rosto de maior área: o `activity_proxy`
+  documentado na SPEC §14.6. O que de fato guiou o crop vai em
+  `meta.json.speaker_matching.method`.
+- `meta.json.boundaries` diz qual fronteira foi usada de verdade
+  (`word_level_snapping`): o STT pode não expor palavras, e aí o snap é por
+  segmento.
 - Todas as chamadas de IA (STT, candidatos, score/vision, títulos, diarização)
   passam pela OpenRouter. A chave vem do arquivo de Configurações ou de
   `OPENROUTER_API_KEY` no `.env`.
@@ -340,6 +377,10 @@ out/87_hook-fulano/
   regenerar candidatos não reaproveita frames de outro momento (o scorer
   avaliaria o vídeo errado), e dois candidatos com a mesma janela dividem a
   extração.
+- Diarização não custa chamada nenhuma: sai dos speaker labels da transcrição que
+  já foi paga. `resume --more`/`--count N` regenera o pool de candidatos **só**
+  quando o pedido não caberia no pool em cache (um prompt de texto; o vídeo e a
+  transcrição continuam vindo do disco).
 - Chamadas de rede (STT, score, títulos) rodam em paralelo limitado
   (`CLIP_NETWORK_WORKERS`, default 3); render e face tracking usam um pool
   menor (`CLIP_RENDER_WORKERS`, default 2) porque ffmpeg e MediaPipe competem
@@ -366,6 +407,36 @@ out/87_hook-fulano/
 - **`out/` e `work/` não têm expiração automática** (SPEC §15 pede limpar
   `work/` antigo). Hoje é manual.
 
+## Limites conhecidos
+
+Coisas que funcionam, mas com fronteira definida. Estão aqui para não parecerem
+bug depois:
+
+- **Diarização depende do provider.** A timeline sai dos speaker labels do STT, e
+  a maioria dos modelos Whisper-compatíveis na OpenRouter não os expõe hoje
+  (SPEC §15). Sem labels o face track usa o `activity_proxy`. O proxy é o rosto de
+  maior área, não análise de movimento de boca por frame.
+- **Labels de falante valem dentro do bloco de STT.** Diarização vem por
+  requisição, então o `SPEAKER_00` de um bloco de ~10 min não é necessariamente a
+  mesma pessoa do bloco seguinte. Os labels são escopados por bloco e o
+  mapeamento speaker→rosto é recalculado por corte, então um corte inteiro dentro
+  de um bloco (o caso normal) fica correto; um corte que atravessa a fronteira de
+  dois blocos vê mais "falantes" do que existem e cada um pega um rosto.
+- **Cancelar não mata processo em andamento.** O sinal é checado entre cortes,
+  entre formatos e a cada candidato avaliado, então o job para em segundos; mas o
+  ffmpeg/MediaPipe que já está rodando e a chamada HTTP já em voo terminam.
+- **`resume` reaproveita o cache, não o progresso.** Download, transcrição e
+  candidatos vêm do disco; score, seleção, legendas, render e meta rodam de novo
+  do começo. Não existe "continuar do arquivo 4/7".
+- **O percentual pode recuar num retry.** Cada execução começa um reporter novo,
+  então a marca d'água de percentual reinicia. Dentro de uma execução o número
+  nunca volta.
+- **O 9:16 encolhido tem SRT próprio** (`captions_9x16.srt`); o `captions.srt` é
+  o do 16:9. São arquivos diferentes de propósito, porque as janelas podem ser
+  diferentes.
+- **Dedupe é temporal + vocabulário**, sem chamada de LLM para julgar "mesma
+  punchline". A SPEC §14.3 aceita as duas formas; a de texto é a que roda.
+
 ## Testes
 
 ```bash
@@ -386,5 +457,15 @@ o payload de progresso promete. `tests/test_settings_store.py` e
 `tests/test_server_settings.py` cobrem mascaramento da chave, persistência
 `0600`, override `.env` ← UI e o contrato da tela de Configurações (sem vazar
 o valor da chave).
+
+`tests/test_fixture_expectations.py` é o teste que a SPEC §14.8 pede para rodar
+**sempre que os prompts de candidatos/score mudarem**: ele roda o pipeline sobre
+a fixture BR e valida as regras duras no artefato final, contra as expectativas
+versionadas em `tests/fixtures/expected.json` — contexto fechado, 9:16 ≤90s sem
+corte no meio de palavra, janela 9:16 dentro da 16:9, score no nome da pasta,
+aspect ratio e trilha de áudio de cada export, e legenda que não vaza do corte.
+A fixture existe nas duas variantes de STT: com speaker labels
+(`whisper_verbose_json_diarized.json`, caminho de diarização) e sem
+(`whisper_verbose_json_raw.json`, caminho `activity_proxy`).
 
 Alvo: MacBook Pro Intel i5 16GB; ffmpeg + yt-dlp + MediaPipe locais; STT/LLM/vision no OpenRouter.
