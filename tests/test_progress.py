@@ -345,3 +345,30 @@ class TestEventBroker:
         broker.publish({"status": "done", "percent": 100})
         payloads = list(broker.stream(timeout=0.1))
         assert payloads[-1]["status"] == "done"
+
+
+class TestMonotonicPercent:
+    """A barra nunca anda para trás — nem quando um estágio é reprocessado."""
+
+    def test_restarting_a_finished_stage_does_not_regress(self, reporter, clock):
+        reporter.start_stage("download", units_total=1)
+        clock.advance(5)
+        reporter.finish_stage("download")
+        after_download = reporter.snapshot()["percent"]
+
+        # retry parcial: o mesmo estágio volta a rodar do zero
+        reporter.start_stage("download", units_total=1)
+        assert reporter.snapshot()["percent"] >= after_download
+
+    def test_percent_never_decreases_across_a_whole_run(self, reporter, clock):
+        seen = []
+        for stage in STAGE_ORDER:
+            reporter.start_stage(stage, units_total=3)
+            seen.append(reporter.snapshot()["percent"])
+            for unit in (1, 2, 3):
+                reporter.advance_units(stage, unit)
+                seen.append(reporter.snapshot()["percent"])
+            clock.advance(3)
+            reporter.finish_stage(stage)
+            seen.append(reporter.snapshot()["percent"])
+        assert seen == sorted(seen)

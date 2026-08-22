@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>clip-mvp — cortes automáticos</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #141821;
+    --panel-2: #1b2029;
+    --line: #262c38;
+    --text: #e8ecf4;
+    --muted: #8b93a6;
+    --accent: #5b8cff;
+    --ok: #3ecf8e;
+    --warn: #f2b544;
+    --err: #ff6b6b;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 40px 20px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 28px; font-size: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 18px;
+  }
+  form { display: flex; gap: 10px; flex-wrap: wrap; }
+  input[type=url], input[type=number] {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 10px; padding: 11px 14px; font-size: 14px; outline: none;
+  }
+  input[type=url] { flex: 1 1 320px; }
+  input[type=number] { width: 92px; }
+  input:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+    padding: 11px 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+  .opts { display: flex; gap: 14px; align-items: center; color: var(--muted);
+          font-size: 13px; margin-top: 12px; flex-wrap: wrap; }
+  .opts label { display: flex; gap: 6px; align-items: center; }
+
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .stage-name { font-size: 17px; font-weight: 600; }
+  .eta { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
+  .eta.idle { color: var(--muted); font-weight: 400; }
+  .bar { height: 10px; background: var(--panel-2); border-radius: 999px;
+         overflow: hidden; margin: 14px 0 6px; }
+  .bar > i { display: block; height: 100%; width: 0;
+             background: linear-gradient(90deg, var(--accent), #8ab0ff);
+             transition: width .45s ease; }
+  .bar.done > i { background: var(--ok); }
+  .bar.error > i { background: var(--err); }
+  .meta-line { display: flex; justify-content: space-between;
+               color: var(--muted); font-size: 13px; }
+  .msg { color: var(--muted); font-size: 13px; margin-top: 10px; min-height: 20px; }
+
+  ul.stages { list-style: none; padding: 0; margin: 18px 0 0; }
+  ul.stages li {
+    display: grid; grid-template-columns: 22px 1fr auto;
+    gap: 10px; align-items: center; padding: 7px 0;
+    border-top: 1px solid var(--line); font-size: 14px;
+  }
+  ul.stages li:first-child { border-top: 0; }
+  .dot { width: 16px; height: 16px; border-radius: 50%;
+         border: 2px solid var(--line); }
+  .dot.running { border-color: var(--accent); border-top-color: transparent;
+                 animation: spin .8s linear infinite; }
+  .dot.done { background: var(--ok); border-color: var(--ok); }
+  .dot.skipped { background: var(--warn); border-color: var(--warn); opacity: .6; }
+  .dot.error { background: var(--err); border-color: var(--err); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  li.pending { color: var(--muted); }
+  li .right { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  .clips { display: grid; gap: 10px; margin-top: 6px; }
+  .clip {
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px;
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  }
+  .clip .slug { font-weight: 600; font-size: 14px; }
+  .clip .score { color: var(--accent); font-weight: 700; margin-right: 8px; }
+  .tags { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tag { font-size: 11px; padding: 3px 8px; border-radius: 999px;
+         border: 1px solid var(--line); color: var(--muted); }
+  .tag.done { color: var(--ok); border-color: rgba(62,207,142,.4); }
+  .tag.running { color: var(--accent); border-color: rgba(91,140,255,.4); }
+  .tag.error { color: var(--err); border-color: rgba(255,107,107,.4); }
+  .tag.skip { color: var(--warn); border-color: rgba(242,181,68,.4); }
+
+  .error-box { border-color: rgba(255,107,107,.45);
+               background: rgba(255,107,107,.07); }
+  .error-box h3 { margin: 0 0 6px; font-size: 15px; color: var(--err); }
+  .error-box p { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+  .hidden { display: none !important; }
+  .done-box a { color: var(--accent); }
+  code { background: var(--panel-2); padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>clip-mvp</h1>
+  <p class="sub">Cole o link do vídeo longo. A IA acha os momentos com contexto fechado e exporta 9:16 (face + center) e 16:9.</p>
+
+  <div class="card">
+    <form id="job-form">
+      <input type="url" id="url" placeholder="https://youtube.com/watch?v=..." required />
+      <input type="number" id="min-score" value="60" min="0" max="100" title="Limiar de score" />
+      <button type="submit" id="submit-btn">Gerar cortes</button>
+    </form>
+    <div class="opts">
+      <label><input type="checkbox" id="more" /> mais cortes (+50%)</label>
+      <label><input type="checkbox" id="dry-run" /> só estimar custo</label>
+      <label>teto <input type="number" id="count" placeholder="auto" min="1" max="30" style="width:70px" /></label>
+    </div>
+  </div>
+
+  <div class="card hidden" id="progress-card">
+    <div class="head">
+      <span class="stage-name" id="stage-name">Preparando…</span>
+      <span class="eta idle" id="eta">calculando tempo restante…</span>
+    </div>
+    <div class="bar" id="bar"><i id="bar-fill"></i></div>
+    <div class="meta-line">
+      <span id="percent">0%</span>
+      <span id="clips-counter"></span>
+    </div>
+    <div class="msg" id="message"></div>
+    <ul class="stages" id="stages"></ul>
+  </div>
+
+  <div class="card hidden" id="clips-card">
+    <div class="head"><span class="stage-name">Cortes</span><span class="eta idle" id="clips-summary"></span></div>
+    <div class="clips" id="clips"></div>
+  </div>
+
+  <div class="card error-box hidden" id="error-card">
+    <h3 id="error-title">Erro</h3>
+    <p id="error-msg"></p>
+    <button class="ghost" id="retry-btn">Tentar de novo (usa o cache)</button>
+  </div>
+
+  <div class="card done-box hidden" id="done-card">
+    <div class="head"><span class="stage-name" id="done-title">Concluído</span></div>
+    <div class="msg" id="done-msg"></div>
+  </div>
+</div>
+
+<script>
+const FORMAT_LABEL = {
+  vertical_facetrack: "9:16 face",
+  vertical_center: "9:16 center",
+  horizontal_16x9: "16:9",
+};
+
+let currentJob = null;
+let eventSource = null;
+let pollTimer = null;
+
+const $ = (id) => document.getElementById(id);
+
+document.getElementById("job-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const body = {
+    url: $("url").value.trim(),
+    more: $("more").checked,
+    dry_run: $("dry-run").checked,
+    min_score: parseFloat($("min-score").value || "60"),
+    count: $("count").value ? parseInt($("count").value, 10) : null,
+  };
+  $("submit-btn").disabled = true;
+  resetUI();
+  try {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || "falha ao criar job");
+    const data = await res.json();
+    follow(data.job_id);
+  } catch (err) {
+    showError("Não consegui iniciar", String(err), false);
+    $("submit-btn").disabled = false;
+  }
+});
+
+$("retry-btn").addEventListener("click", async () => {
+  if (!currentJob) return;
+  $("retry-btn").disabled = true;
+  try {
+    await fetch(`/api/jobs/${currentJob}/retry`, { method: "POST" });
+    $("error-card").classList.add("hidden");
+    follow(currentJob);
+  } finally {
+    $("retry-btn").disabled = false;
+  }
+});
+
+function resetUI() {
+  $("progress-card").classList.remove("hidden");
+  $("error-card").classList.add("hidden");
+  $("done-card").classList.add("hidden");
+  $("clips-card").classList.add("hidden");
+  $("stages").innerHTML = "";
+  $("clips").innerHTML = "";
+  setBar(0, "");
+  $("stage-name").textContent = "Preparando…";
+  $("eta").textContent = "calculando tempo restante…";
+  $("eta").className = "eta idle";
+}
+
+function follow(jobId) {
+  currentJob = jobId;
+  closeStreams();
+  // SSE é o caminho principal; o polling entra se o stream cair.
+  eventSource = new EventSource(`/api/jobs/${jobId}/events`);
+  eventSource.onmessage = (ev) => {
+    try { render(JSON.parse(ev.data)); } catch (e) { /* ignora frame inválido */ }
+  };
+  eventSource.onerror = () => {
+    closeStreams();
+    startPolling(jobId);
+  };
+}
+
+function startPolling(jobId) {
+  if (pollTimer) return;
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`);
+      if (!res.ok) return;
+      render(await res.json());
+    } catch (e) { /* rede instável: tenta de novo no próximo tick */ }
+  }, 2000);
+}
+
+function closeStreams() {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+function setBar(percent, state) {
+  $("bar-fill").style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  $("bar").className = `bar ${state || ""}`;
+  $("percent").textContent = `${percent.toFixed(1)}%`;
+}
+
+function render(s) {
+  if (s.type === "heartbeat") return;
+  const finished = ["done", "error", "canceled"].includes(s.status);
+  setBar(s.percent || 0, s.status === "error" ? "error" : (s.status === "done" ? "done" : ""));
+  $("stage-name").textContent = s.stage_label || "";
+  $("message").textContent = s.message || "";
+
+  const etaEl = $("eta");
+  if (s.status === "running" && s.eta_seconds !== null && s.eta_seconds !== undefined) {
+    etaEl.textContent = s.eta_text;
+    etaEl.className = "eta";
+  } else if (s.status === "done") {
+    etaEl.textContent = "concluído";
+    etaEl.className = "eta idle";
+  } else if (s.status === "error") {
+    etaEl.textContent = "interrompido";
+    etaEl.className = "eta idle";
+  } else {
+    etaEl.textContent = s.eta_text || "calculando tempo restante…";
+    etaEl.className = "eta idle";
+  }
+
+  $("clips-counter").textContent = s.clips_total
+    ? `${s.clips_done}/${s.clips_total} cortes prontos`
+    : "";
+
+  renderStages(s.stages || []);
+  renderClips(s);
+
+  if (s.status === "error" && s.error) {
+    showError(`Erro em ${s.error.stage_label}`, `${s.error.message}${s.error.hint ? " — " + s.error.hint : ""}`, s.error.retriable);
+    closeStreams();
+    $("submit-btn").disabled = false;
+  }
+  if (s.status === "done") {
+    showDone(s);
+    closeStreams();
+    $("submit-btn").disabled = false;
+  }
+  if (finished) closeStreams();
+}
+
+function renderStages(stages) {
+  const list = $("stages");
+  list.innerHTML = "";
+  for (const st of stages) {
+    const li = document.createElement("li");
+    li.className = st.status;
+    const dot = document.createElement("span");
+    dot.className = `dot ${st.status}`;
+    const label = document.createElement("span");
+    label.textContent = st.status === "running" && st.message ? st.message : st.label;
+    const right = document.createElement("span");
+    right.className = "right";
+    if (st.status === "running") right.textContent = `${st.percent.toFixed(0)}%`;
+    else if (st.status === "done" && st.elapsed_seconds) right.textContent = fmtDur(st.elapsed_seconds);
+    else if (st.status === "skipped") right.textContent = "cache";
+    li.append(dot, label, right);
+    list.appendChild(li);
+  }
+}
+
+function renderClips(s) {
+  const clips = s.clips || [];
+  if (!clips.length) { $("clips-card").classList.add("hidden"); return; }
+  $("clips-card").classList.remove("hidden");
+  $("clips-summary").textContent = `${s.clips_done}/${s.clips_total}`;
+  const box = $("clips");
+  box.innerHTML = "";
+  for (const clip of clips) {
+    const row = document.createElement("div");
+    row.className = "clip";
+    const left = document.createElement("div");
+    left.innerHTML =
+      `<span class="score">${clip.score !== null && clip.score !== undefined ? Math.round(clip.score) : "–"}</span>` +
+      `<span class="slug">${escapeHtml(clip.slug)}</span>` +
+      (clip.message ? `<div class="right" style="font-size:12px;color:var(--muted)">${escapeHtml(clip.message)}</div>` : "");
+    const tags = document.createElement("div");
+    tags.className = "tags";
+    for (const [name, state] of Object.entries(clip.formats || {})) {
+      const tag = document.createElement("span");
+      tag.className = `tag ${state}`;
+      tag.textContent = FORMAT_LABEL[name] || name;
+      tags.appendChild(tag);
+    }
+    if (clip.vertical_skipped) {
+      const tag = document.createElement("span");
+      tag.className = "tag skip";
+      tag.textContent = "9:16 pulado (>90s)";
+      tags.appendChild(tag);
+    }
+    row.append(left, tags);
+    box.appendChild(row);
+  }
+}
+
+function showError(title, msg, retriable) {
+  $("error-card").classList.remove("hidden");
+  $("error-title").textContent = title;
+  $("error-msg").textContent = msg;
+  $("retry-btn").classList.toggle("hidden", retriable === false);
+}
+
+function showDone(s) {
+  const card = $("done-card");
+  card.classList.remove("hidden");
+  const summary = (s.result && s.result.summary) || {};
+  const dirs = summary.out_dirs || [];
+  $("done-title").textContent = dirs.length
+    ? `${dirs.length} ${dirs.length === 1 ? "corte pronto" : "cortes prontos"}`
+    : "Job concluído";
+  const notes = summary.notes || [];
+  $("done-msg").innerHTML =
+    (dirs.length
+      ? dirs.map((d) => `<div><code>${escapeHtml(d)}</code></div>`).join("")
+      : escapeHtml(s.message)) +
+    (notes.length
+      ? `<div style="margin-top:10px">${notes.map((n) => escapeHtml(n)).join("<br>")}</div>`
+      : "");
+}
+
+function fmtDur(seconds) {
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60), s = Math.round(seconds % 60);
+  return `${m}m${String(s).padStart(2, "0")}s`;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text == null ? "" : String(text);
+  return div.innerHTML;
+}
+
+// Se já havia um job rodando, reengata nele ao abrir a página.
+(async () => {
+  try {
+    const res = await fetch("/api/jobs");
+    const { jobs } = await res.json();
+    const active = (jobs || []).find((j) => j.status === "running");
+    if (active) { resetUI(); $("submit-btn").disabled = true; follow(active.job_id); }
+  } catch (e) { /* primeira execução: sem jobs */ }
+})();
+</script>
+</body>
+</html>

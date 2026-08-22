@@ -299,6 +299,7 @@ class ProgressReporter:
         self._eta_smoothed: float | None = None
         self._last_emit = 0.0
         self._last_percent = -1
+        self._percent_high_water = 0.0
         self._predict_all()
 
     # -- configuração -------------------------------------------------
@@ -532,7 +533,11 @@ class ProgressReporter:
         done = 0.0
         for st in self.stages.values():
             done += st.weight * (st.percent / 100.0)
-        return min(100.0, 100.0 * done / total_weight)
+        percent = min(100.0, 100.0 * done / total_weight)
+        # A barra nunca anda para trás: reprocessar um estágio já concluído
+        # (retry parcial) não pode fazer o número cair na cara do usuário.
+        self._percent_high_water = max(self._percent_high_water, percent)
+        return self._percent_high_water
 
     def _raw_eta(self) -> float | None:
         """Segundos restantes = estágio atual + estágios futuros, calibrados."""
