@@ -6,7 +6,7 @@ import math
 from importlib import resources
 from typing import Any
 
-from .boundaries import snap_window
+from .boundaries import fit_vertical_window, snap_window
 from .config import Settings
 from .models import Candidate, Transcript, Window
 from .openrouter import OpenRouterClient
@@ -130,16 +130,72 @@ def generate_candidates(
         if cand is None:
             continue
         cand.window_16x9 = _snap(cand.window_16x9, words, transcript, pad_before, pad_after)
-        if cand.window_9x16 is not None:
-            snapped = _snap(cand.window_9x16, words, transcript, pad_before, pad_after)
-            if snapped.duration_s > settings.vertical_max_s:
-                cand.window_9x16 = None
-                cand.vertical_skip_reason = "context_exceeds_90s"
-            else:
-                cand.window_9x16 = snapped
+        cand.context_complete = cand.context_complete and _closes_context(
+            cand.window_16x9, words, transcript, pad_before, pad_after
+        )
+        _resolve_vertical(cand, words, transcript, settings, pad_before, pad_after)
         candidates.append(cand)
 
     return candidates
+
+
+def _resolve_vertical(
+    cand: Candidate,
+    words,
+    transcript: Transcript,
+    settings: Settings,
+    pad_before: float,
+    pad_after: float,
+) -> None:
+    """Define a janela 9:16 respeitando o teto de 90s (SPEC §2).
+
+    Quando o contexto fechado passa de 90s a spec permite encolher, desde que
+    a janela menor ainda feche contexto; só descartamos o vertical se não
+    houver nenhuma sub-janela válida. Descartar direto jogaria fora Shorts
+    perfeitamente exportáveis.
+    """
+    proposed = cand.window_9x16 or cand.window_16x9
+    if not words:
+        snapped = _snap(proposed, words, transcript, pad_before, pad_after)
+        if snapped.duration_s > settings.vertical_max_s:
+            cand.window_9x16 = None
+            cand.vertical_skip_reason = "context_exceeds_90s"
+        else:
+            cand.window_9x16 = snapped
+        return
+
+    fitted, skip_reason = fit_vertical_window(
+        proposed.start,
+        proposed.end,
+        words,
+        max_duration_s=settings.vertical_max_s,
+        pad_before_s=pad_before,
+        pad_after_s=pad_after,
+        media_duration=transcript.duration or None,
+    )
+    if fitted is None:
+        cand.window_9x16 = None
+        cand.vertical_skip_reason = skip_reason or "context_exceeds_90s"
+        return
+
+    cand.window_9x16 = Window(start=fitted.start, end=fitted.end)
+    cand.vertical_skip_reason = None
+
+
+def _closes_context(
+    window: Window, words, transcript: Transcript, pad_before: float, pad_after: float
+) -> bool:
+    """Revalida o fechamento de contexto de forma determinística."""
+    result = snap_window(
+        window.start,
+        window.end,
+        words=words,
+        segments=transcript.segments,
+        pad_before_s=pad_before,
+        pad_after_s=pad_after,
+        media_duration=transcript.duration or None,
+    )
+    return result.context_complete
 
 
 def _snap(window: Window, words, transcript: Transcript, pad_before: float, pad_after: float) -> Window:

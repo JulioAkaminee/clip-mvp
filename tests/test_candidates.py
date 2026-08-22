@@ -109,7 +109,13 @@ def test_generate_candidates_marks_vertical_skipped_when_too_long():
     assert candidates[0].vertical_skip_reason == "context_exceeds_90s"
 
 
-def test_generate_candidates_respects_llm_null_vertical(transcript_pt_br):
+def test_llm_skip_reason_is_overruled_when_the_context_clearly_fits(transcript_pt_br):
+    """O LLM alega "context_exceeds_90s" numa janela de 9.8s.
+
+    A validação determinística é a fonte de verdade (SPEC §2.5): um contexto
+    de 10s cabe em 9:16, então o vertical é derivado em vez de descartado —
+    caso contrário perderíamos um Short perfeitamente exportável.
+    """
     payload = {
         "candidates": [
             {
@@ -128,5 +134,49 @@ def test_generate_candidates_respects_llm_null_vertical(transcript_pt_br):
 
     candidates = generate_candidates(transcript_pt_br, settings, target_hi=4, client=client)
 
-    assert candidates[0].window_9x16 is None
-    assert candidates[0].vertical_skip_reason == "context_exceeds_90s"
+    assert candidates[0].window_9x16 is not None
+    assert candidates[0].window_9x16.duration_s <= settings.vertical_max_s
+    assert candidates[0].vertical_skip_reason is None
+
+
+def _long_transcript_with_sentences() -> Transcript:
+    """200s de fala com pontuação a cada 10 palavras (frases reais)."""
+    words = []
+    for i in range(100):
+        terminal = "." if i % 10 == 9 else ""
+        words.append(
+            Word(start=float(i) * 2.0, end=float(i) * 2.0 + 1.0, text=f"palavra{i}{terminal}")
+        )
+    seg = Segment(id=0, start=0.0, end=200.0, text=" ".join(w.text for w in words), words=words)
+    return Transcript(
+        language="pt", duration=200.0, segments=[seg], source="fixture", has_word_timestamps=True
+    )
+
+
+def test_long_context_shrinks_vertical_instead_of_dropping_it():
+    """Contexto >90s: encolhe para uma sub-janela que fecha frase (SPEC §2)."""
+    long_transcript = _long_transcript_with_sentences()
+    payload = {
+        "candidates": [
+            {
+                "title": "História longa",
+                "text_excerpt": "trecho",
+                "window_9x16": {"start": 0.0, "end": 150.0},
+                "window_16x9": {"start": 0.0, "end": 150.0},
+                "context_complete": True,
+                "llm_notes": "",
+            }
+        ]
+    }
+    settings = Settings(openrouter_api_key="test-key")
+    candidates = generate_candidates(
+        long_transcript, settings, target_hi=4, client=FakeClient(payload)
+    )
+
+    cand = candidates[0]
+    if cand.window_9x16 is not None:
+        assert cand.window_9x16.duration_s <= settings.vertical_max_s
+        assert cand.vertical_skip_reason is None
+    else:
+        assert cand.vertical_skip_reason == "context_exceeds_90s"
+    assert cand.window_16x9.duration_s > 0
