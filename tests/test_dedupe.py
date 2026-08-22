@@ -56,3 +56,34 @@ def test_dedupe_keeps_distinct_candidates():
     result = dedupe_items(items)
     assert set(result.kept) == {"A", "B", "C"}
     assert result.removed_count == 0
+
+
+def test_short_texts_are_not_treated_as_the_same_moment():
+    """Dois trechos curtos batem quase 100% por acaso — não são duplicata."""
+    items = [
+        DedupeItem(item="a", start=0.0, end=30.0, text="Isso mudou tudo.", score=90.0),
+        DedupeItem(item="b", start=600.0, end=630.0, text="Isso mudou tudo.", score=80.0),
+    ]
+    result = dedupe_items(items)
+    assert result.kept == ["a", "b"]
+    assert result.removed_count == 0
+
+
+def test_long_near_identical_texts_are_still_deduped():
+    text = (
+        "eu perdi oitenta mil reais no primeiro ano por vergonha de cobrar o preço "
+        "certo, porque eu olhava pro cliente e falava um número trinta por cento "
+        "menor do que tinha calculado em casa antes da reunião"
+    )
+    items = [
+        DedupeItem(item="a", start=0.0, end=60.0, text=text, score=90.0),
+        DedupeItem(item="b", start=600.0, end=660.0, text=text, score=70.0),
+    ]
+    result = dedupe_items(items)
+    assert result.kept == ["a"]
+    assert result.removed_count == 1
+
+
+def test_text_similarity_respects_min_words():
+    assert text_similarity("mudou tudo", "mudou tudo", min_words=6) == 0.0
+    assert text_similarity("mudou tudo", "mudou tudo") > 0.9

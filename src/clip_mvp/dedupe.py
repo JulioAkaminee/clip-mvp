@@ -11,6 +11,13 @@ T = TypeVar("T")
 TEXT_SIMILARITY_THRESHOLD = 0.82
 OVERLAP_RATIO_THRESHOLD = 0.5
 
+#: Similaridade de texto só é confiável com vocabulário suficiente: dois
+#: trechos de 3 palavras ("Isso mudou tudo.") batem quase 100% por acaso e não
+#: são o mesmo momento. Abaixo disso, só o overlap temporal decide. Na prática
+#: um excerpt real de corte tem dezenas de palavras, então o piso só barra
+#: casos degenerados.
+MIN_WORDS_FOR_TEXT_MATCH = 6
+
 
 def temporal_overlap_ratio(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
     """Overlap relativo à janela mais curta (0..1). Ex.: se B está totalmente
@@ -25,10 +32,17 @@ def temporal_overlap_ratio(a_start: float, a_end: float, b_start: float, b_end: 
     return inter / shortest
 
 
-def text_similarity(a: str, b: str) -> float:
+def text_similarity(a: str, b: str, *, min_words: int = 1) -> float:
+    """Similaridade 0..1 entre dois trechos.
+
+    ``min_words`` protege contra falso positivo: textos curtos demais não têm
+    vocabulário suficiente para que a semelhança signifique "mesma ideia".
+    """
     a_norm = (a or "").strip().lower()
     b_norm = (b or "").strip().lower()
     if not a_norm or not b_norm:
+        return 0.0
+    if len(a_norm.split()) < min_words or len(b_norm.split()) < min_words:
         return 0.0
     return SequenceMatcher(None, a_norm, b_norm).ratio()
 
@@ -72,7 +86,9 @@ def dedupe_items(
                 duplicate_of = keeper
                 reason = f"overlap={overlap:.2f}"
                 break
-            sim = text_similarity(candidate.text, keeper.text)
+            sim = text_similarity(
+                candidate.text, keeper.text, min_words=MIN_WORDS_FOR_TEXT_MATCH
+            )
             if sim > text_threshold:
                 duplicate_of = keeper
                 reason = f"text_similarity={sim:.2f}"

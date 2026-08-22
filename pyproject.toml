@@ -10,6 +10,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.111",
+  "uvicorn>=0.30",
+]
+
 [project.scripts]
 clip = "clip_mvp.cli:main"
 
@@ -17,7 +23,7 @@ clip = "clip_mvp.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-clip_mvp = ["prompts/*.md"]
+clip_mvp = ["prompts/*.md", "web/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
