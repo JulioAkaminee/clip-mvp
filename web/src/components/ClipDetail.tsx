@@ -60,6 +60,12 @@ export function ClipDetail({
   const [rating, setRating] = useState(clip.rating);
   const [busy, setBusy] = useState(false);
 
+  // Os artefatos chegam depois do card (o render termina um formato por vez):
+  // se a aba escolhida ainda não existe, cai na primeira disponível.
+  useEffect(() => {
+    if (available.length > 0 && !available.includes(tab)) setTab(available[0]);
+  }, [available, tab]);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();

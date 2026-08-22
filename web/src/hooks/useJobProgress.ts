@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, eventsUrl } from "../lib/api";
 import type { Clip, JobProgress, LogLine } from "../lib/types";
 
@@ -15,7 +15,7 @@ const CLIPS_POLL_MS = 4000;
  */
 export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
   const [progress, setProgress] = useState<JobProgress | null>(null);
-  const [clips, setClips] = useState<Clip[]>([]);
+  const [details, setDetails] = useState<Clip[]>([]);
   const [log, setLog] = useState<LogLine[]>([]);
   const [live, setLive] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -37,7 +37,7 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
   const loadClips = useCallback(async (id: string) => {
     try {
       const data = await api.clips(id);
-      setClips(data.clips);
+      setDetails(data.clips);
     } catch {
       /* durante o job o job.json pode ainda não existir */
     }
@@ -58,7 +58,7 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
   // Reset ao trocar de job.
   useEffect(() => {
     setProgress(null);
-    setClips([]);
+    setDetails([]);
     setLog([]);
     setError(null);
     lastMessage.current = "";
@@ -151,7 +151,7 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
 
   const applyRating = useCallback(
     (slug: string, verdict: "good" | "bad", note: string) => {
-      setClips((current) =>
+      setDetails((current) =>
         current.map((clip) =>
           clip.slug === slug ? { ...clip, rating: verdict, rating_note: note } : clip,
         ),
@@ -160,5 +160,50 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
     [],
   );
 
+  // O card aparece no instante em que o pipeline registra o corte (via SSE) e
+  // vai ganhando meta.json/artefatos conforme o job avança — em vez de só
+  // surgir no fim, quando a listagem em disco fica pronta.
+  const clips = useMemo(
+    () => mergeClips(progress?.clips ?? [], details),
+    [progress?.clips, details],
+  );
+
   return { progress, clips, log, live, error, reload, applyRating };
+}
+
+const EMPTY_CLIP: Omit<Clip, "slug" | "score" | "status" | "formats" | "vertical_skipped"> = {
+  title: "",
+  reason: "",
+  context_complete: null,
+  windows: {},
+  breakdown: {},
+  speaker_matching: {},
+  boundaries: {},
+  youtube: {},
+  tiktok: {},
+  artifacts: {},
+  rating: null,
+  rating_note: null,
+};
+
+function mergeClips(live: JobProgress["clips"], details: Clip[]): Clip[] {
+  const bySlug = new Map(details.map((clip) => [clip.slug, clip]));
+  const merged: Clip[] = live.map((item) => {
+    const detail = bySlug.get(item.slug);
+    bySlug.delete(item.slug);
+    return {
+      ...EMPTY_CLIP,
+      ...detail,
+      slug: item.slug,
+      // O progresso ao vivo manda no status e no render por formato.
+      status: item.status,
+      formats: item.formats,
+      score: item.score ?? detail?.score ?? null,
+      vertical_skipped: item.vertical_skipped ?? detail?.vertical_skipped ?? null,
+      message: item.message || detail?.message || "",
+      title: detail?.title || item.slug.replace(/-/g, " "),
+    };
+  });
+  // Cortes que só existem em disco (job de outra execução) continuam na lista.
+  return [...merged, ...bySlug.values()];
 }
