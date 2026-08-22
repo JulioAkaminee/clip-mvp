@@ -77,9 +77,12 @@ def build_meta(
         },
         "reason": score.reason,
         "selection": selection,
+        # Sem `boundary_info` o default não pode afirmar snapping por palavra: o
+        # STT pode não ter devolvido palavra nenhuma, e aí a fronteira é de
+        # segmento (SPEC §14.1). Quem publica precisa saber qual das duas foi.
         "boundaries": boundary_info
         or {
-            "word_level_snapping": True,
+            "word_level_snapping": False,
             "never_mid_word": True,
         },
         "speaker_matching": {"method": speaker_matching_method},

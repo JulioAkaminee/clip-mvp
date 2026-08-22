@@ -313,10 +313,12 @@ def snap_to_segment_boundaries(
 
     new_start = start
     did_snap_start = False
-    for seg in segs_sorted:
+    start_index: int | None = None
+    for i, seg in enumerate(segs_sorted):
         if seg.start <= start < seg.end:
             new_start = seg.start
             did_snap_start = new_start != start
+            start_index = i
             break
 
     new_end = end
@@ -346,8 +348,26 @@ def snap_to_segment_boundaries(
         else:
             new_end = segs_sorted[-1].end
 
-    padded_start = max(0.0, new_start - max(0.0, pad_before_s))
-    padded_end = new_end + max(0.0, pad_after_s)
+    # Um segmento só começa uma ideia se o anterior fechou a dele. Assumir que
+    # sim escondia exatamente o caso que a SPEC §2.1 proíbe: corte que abre no
+    # meio da frase porque o STT quebrou o segmento na respiração.
+    starts_on_sentence = True
+    if start_index is not None and start_index > 0:
+        previous = (segs_sorted[start_index - 1].text or "").strip()
+        gap_before_segment = segs_sorted[start_index].start - segs_sorted[start_index - 1].end
+        starts_on_sentence = bool(
+            (previous and previous[-1] in TERMINAL_PUNCT) or gap_before_segment >= NATURAL_GAP_S
+        )
+
+    # A folga é limitada ao silêncio disponível, como no caminho por palavra:
+    # padding cego puxa a fala do segmento vizinho para dentro do corte.
+    pad_min = min(pad_before_s, pad_after_s)
+    pad_max = max(pad_before_s, pad_after_s)
+    gap_before = new_start - _previous_segment_end(segs_sorted, new_start)
+    gap_after = _next_segment_start(segs_sorted, new_end, media_duration) - new_end
+
+    padded_start = max(0.0, new_start - _pad_without_swallowing(gap_before, pad_min, pad_max))
+    padded_end = new_end + _pad_without_swallowing(gap_after, pad_min, pad_max)
     if media_duration is not None:
         padded_end = min(media_duration, padded_end)
 
@@ -358,10 +378,30 @@ def snap_to_segment_boundaries(
         snapped_end=did_snap_end,
         pad_before_s=pad_before_s,
         pad_after_s=pad_after_s,
-        context_complete=ends_on_sentence,
-        starts_on_sentence=True,
+        context_complete=starts_on_sentence and ends_on_sentence,
+        starts_on_sentence=starts_on_sentence,
         ends_on_sentence=ends_on_sentence,
     )
+
+
+def _previous_segment_end(segments: list[Segment], point: float) -> float:
+    """Fim do último segmento que termina antes de ``point`` (0.0 se não houver)."""
+    previous = 0.0
+    for seg in segments:
+        if seg.end <= point + 1e-6:
+            previous = max(previous, seg.end)
+    return previous
+
+
+def _next_segment_start(
+    segments: list[Segment], point: float, media_duration: float | None
+) -> float:
+    """Início do próximo segmento depois de ``point`` (o teto da mídia se não houver)."""
+    ceiling = media_duration if media_duration is not None else float("inf")
+    for seg in segments:
+        if seg.start >= point - 1e-6:
+            return min(seg.start, ceiling)
+    return ceiling
 
 
 def snap_window(

@@ -131,6 +131,54 @@ def test_snap_window_falls_back_to_segments_without_words():
     assert result.end == 6.9
 
 
+TIGHT_SEGMENTS = [
+    Segment(id=0, start=0.0, end=2.6, text="Antes disso ele já tinha avisado.", words=[]),
+    # 50ms de silêncio: não há espaço para os 300ms de folga.
+    Segment(id=1, start=2.65, end=5.0, text="Aí a coisa desandou de vez.", words=[]),
+    Segment(id=2, start=5.05, end=7.0, text="E ninguém falou nada.", words=[]),
+]
+
+
+def test_segment_fallback_padding_does_not_swallow_the_neighbour_segment():
+    """Mesma regra do caminho por palavra: a folga cabe no silêncio disponível.
+
+    Sem isso, os 300ms de folga entravam 250ms dentro da fala do segmento
+    vizinho — que é exatamente a fala de outra pessoa começando.
+    """
+    result = snap_to_segment_boundaries(3.0, 4.0, TIGHT_SEGMENTS, pad_before_s=0.3, pad_after_s=0.3)
+
+    assert result.start >= 2.6, "a folga entrou no segmento anterior"
+    assert result.end <= 5.05, "a folga entrou no segmento seguinte"
+
+
+def test_segment_fallback_uses_full_padding_when_there_is_silence():
+    segments = [
+        Segment(id=0, start=0.0, end=2.0, text="Primeira ideia fechada.", words=[]),
+        Segment(id=1, start=4.0, end=6.0, text="Segunda ideia fechada.", words=[]),
+    ]
+    result = snap_to_segment_boundaries(4.5, 5.0, segments, pad_before_s=0.4, pad_after_s=0.4)
+    assert result.start == pytest.approx(3.6, abs=0.01)
+
+
+def test_segment_fallback_admits_when_it_starts_mid_sentence():
+    """O STT quebra segmento na respiração: o anterior sem pontuação significa
+    que este começa no meio da frase (SPEC §2.1) — não pode alegar o contrário."""
+    segments = [
+        Segment(id=0, start=0.0, end=2.0, text="Eu perdi oitenta mil reais porque", words=[]),
+        Segment(id=1, start=2.1, end=4.0, text="tive vergonha de cobrar o preço.", words=[]),
+    ]
+    result = snap_to_segment_boundaries(2.5, 3.0, segments, pad_before_s=0.0, pad_after_s=0.0)
+
+    assert result.starts_on_sentence is False
+    assert result.context_complete is False
+
+
+def test_segment_fallback_accepts_a_start_after_a_closed_sentence():
+    result = snap_to_segment_boundaries(3.0, 4.0, TIGHT_SEGMENTS, pad_before_s=0.0, pad_after_s=0.0)
+    assert result.starts_on_sentence is True
+    assert result.context_complete is True
+
+
 # --------------------------------------------------------------------------
 # Fechamento de contexto (SPEC §2.1-§2.3): o snap por palavra sozinho ainda
 # entrega corte que começa/termina no meio da ideia.

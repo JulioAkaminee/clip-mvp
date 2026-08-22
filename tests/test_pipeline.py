@@ -173,6 +173,10 @@ def test_full_pipeline_end_to_end_mocked_ai(tmp_path, monkeypatch, sample_video_
     assert meta["youtube"]["shorts_title"]
     assert meta["tiktok"]["caption"]
     assert meta["speaker_matching"]["method"] == "activity_proxy"
+    # A fixture tem word timestamps, então o meta deve dizer isso — e dizer o
+    # contrário quando o STT só der segmentos (SPEC §14.1).
+    assert meta["boundaries"]["word_level_snapping"] is True
+    assert meta["boundaries"]["pad_ms"] == [settings.pad_ms_min, settings.pad_ms_max]
 
     # Regra dura: nunca cortar no meio de palavra (SPEC §2.5/§14.1).
     job_dir = settings.work_dir / summary.job_id

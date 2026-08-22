@@ -638,6 +638,11 @@ def _execute(
         options=options,
         selection_meta=selection_meta,
         speaker_method=speaker_method,
+        boundary_info={
+            "word_level_snapping": transcript.has_word_timestamps,
+            "never_mid_word": True,
+            "pad_ms": [settings.pad_ms_min, settings.pad_ms_max],
+        },
         client=client,
         reporter=reporter,
         summary=summary,
@@ -855,6 +860,7 @@ def _write_selected_meta(
     options: RunOptions,
     selection_meta: dict[str, Any],
     speaker_method: str,
+    boundary_info: dict[str, Any],
     client: OpenRouterClient,
     reporter: ProgressReporter,
     summary: JobSummary,
@@ -871,6 +877,7 @@ def _write_selected_meta(
             settings=settings,
             selection_meta=selection_meta,
             speaker_method=speaker_method,
+            boundary_info=boundary_info,
             client=client,
         )
 
@@ -957,6 +964,7 @@ def _write_clip_meta(
     settings: Settings,
     selection_meta: dict[str, Any],
     speaker_method: str,
+    boundary_info: dict[str, Any],
     client: OpenRouterClient,
 ) -> dict[str, Any]:
     """Gera os textos sociais e grava meta.json (SPEC §7)."""
@@ -981,6 +989,7 @@ def _write_clip_meta(
         selection=selection_meta,
         social_copy=social_copy,
         speaker_matching_method=speaker_method,
+        boundary_info=boundary_info,
     )
     write_json(clip_dir / "meta.json", meta_dict)
 

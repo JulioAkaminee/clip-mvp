@@ -74,3 +74,22 @@ def test_build_meta_vertical_skipped_omits_vertical_window():
     )
     assert "vertical_9x16" not in meta["windows"]
     assert meta["vertical_skipped"] == "context_exceeds_90s"
+
+
+def test_build_meta_does_not_claim_word_level_snapping_by_default():
+    """O STT pode não ter devolvido palavra nenhuma; nesse caso a fronteira é de
+    segmento (SPEC §14.1) e o default não pode afirmar o contrário."""
+    candidate = _candidate()
+    meta = build_meta(
+        source_url="https://youtube.com/watch?v=abc",
+        candidate=candidate,
+        score=_score(),
+        window_9x16=candidate.window_9x16,
+        window_16x9=candidate.window_16x9,
+        vertical_skipped=None,
+        selection={},
+        social_copy={"youtube": {}, "tiktok": {}},
+        speaker_matching_method="activity_proxy",
+    )
+    assert meta["boundaries"]["word_level_snapping"] is False
+    assert meta["boundaries"]["never_mid_word"] is True
