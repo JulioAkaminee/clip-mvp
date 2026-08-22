@@ -1,6 +1,3 @@
-"""clip-mvp — cortes automáticos com IA via OpenRouter."""
+"""clip-mvp: cortes automáticos a partir de link, com IA via OpenRouter."""
 
-from .config import VERSION
-
-__version__ = VERSION
-__all__ = ["__version__"]
+__version__ = "0.1.0"

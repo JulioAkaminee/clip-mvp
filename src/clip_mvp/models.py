@@ -1,124 +1,116 @@
-"""Modelos de domínio compartilhados entre pipeline, CLI e API."""
+"""Modelos de dados compartilhados pelo pipeline do clip-mvp."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from typing import Literal, Optional
 
-from .boundaries import Window
+from pydantic import BaseModel, Field
 
 
-@dataclass
-class Breakdown:
-    hook: int = 0
-    emocao: int = 0
-    citavel: int = 0
-    arco: int = 0
+class Word(BaseModel):
+    """Palavra com timestamps (word-level), quando o STT expõe."""
+
+    start: float
+    end: float
+    text: str
+
+
+class Segment(BaseModel):
+    """Segmento de transcrição (frase/trecho), com palavras opcionais."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+    words: list[Word] = Field(default_factory=list)
+
+
+class Transcript(BaseModel):
+    """Transcrição completa de um job."""
+
+    language: str = "pt"
+    duration: float = 0.0
+    segments: list[Segment] = Field(default_factory=list)
+    source: Literal["openrouter_whisper", "fixture"] = "openrouter_whisper"
+    has_word_timestamps: bool = False
+
+    def all_words(self) -> list[Word]:
+        words: list[Word] = []
+        for seg in self.segments:
+            words.extend(seg.words)
+        return words
+
+
+class Window(BaseModel):
+    """Janela de tempo (start/end) já com fronteira de palavra + padding aplicados."""
+
+    start: float
+    end: float
 
     @property
-    def total(self) -> int:
-        return self.hook + self.emocao + self.citavel + self.arco
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict | None) -> "Breakdown":
-        data = data or {}
-        return cls(
-            hook=int(data.get("hook", 0) or 0),
-            emocao=int(data.get("emocao", 0) or 0),
-            citavel=int(data.get("citavel", 0) or 0),
-            arco=int(data.get("arco", 0) or 0),
-        )
+    def duration_s(self) -> float:
+        return round(self.end - self.start, 3)
 
 
-@dataclass
-class Candidate:
-    """Momento proposto pelo LLM, já com janelas normalizadas."""
+class Candidate(BaseModel):
+    """Candidato a corte gerado pela IA (antes de score/dedupe)."""
 
     id: str
     title: str
-    reason: str
-    horizontal: Window
-    vertical: Window | None
-    transcript_text: str = ""
-    score: int = 0
-    breakdown: Breakdown = field(default_factory=Breakdown)
+    text_excerpt: str
+    window_9x16: Optional[Window] = None
+    window_16x9: Window
     context_complete: bool = True
-    vertical_skipped: str | None = None
-    dedupe_of: str | None = None
-    slug: str = ""
+    llm_notes: str = ""
+    vertical_skip_reason: Optional[str] = None
+
+
+class ScoreBreakdown(BaseModel):
+    hook: float = 0
+    emocao: float = 0
+    citavel: float = 0
+    arco: float = 0
 
     @property
-    def duration(self) -> float:
-        return self.horizontal.duration
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "title": self.title,
-            "reason": self.reason,
-            "slug": self.slug,
-            "horizontal": self.horizontal.to_dict(),
-            "vertical": self.vertical.to_dict() if self.vertical else None,
-            "transcript_text": self.transcript_text,
-            "score": self.score,
-            "breakdown": self.breakdown.to_dict(),
-            "context_complete": self.context_complete,
-            "vertical_skipped": self.vertical_skipped,
-            "dedupe_of": self.dedupe_of,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "Candidate":
-        def _window(raw: dict | None) -> Window | None:
-            if not raw:
-                return None
-            return Window(
-                start=float(raw["start"]),
-                end=float(raw["end"]),
-                context_complete=bool(raw.get("context_complete", True)),
-                method=raw.get("boundary_method", "word"),
-                note=raw.get("note"),
-            )
-
-        horizontal = _window(data["horizontal"])
-        assert horizontal is not None
-        return cls(
-            id=data["id"],
-            title=data.get("title", ""),
-            reason=data.get("reason", ""),
-            slug=data.get("slug", ""),
-            horizontal=horizontal,
-            vertical=_window(data.get("vertical")),
-            transcript_text=data.get("transcript_text", ""),
-            score=int(data.get("score", 0) or 0),
-            breakdown=Breakdown.from_dict(data.get("breakdown")),
-            context_complete=bool(data.get("context_complete", True)),
-            vertical_skipped=data.get("vertical_skipped"),
-            dedupe_of=data.get("dedupe_of"),
-        )
+    def total(self) -> float:
+        return round(self.hook + self.emocao + self.citavel + self.arco, 2)
 
 
-@dataclass
-class SelectionStats:
-    mode: str = "auto"
-    candidates: int = 0
-    selected: int = 0
-    deduped: int = 0
-    below_threshold: int = 0
-    min_score: int = 60
-    target_min: int = 0
-    target_max: int = 0
-    vertical_ok: int = 0
-    vertical_skipped: int = 0
-    reason: str = ""
+class Score(BaseModel):
+    total: float
+    breakdown: ScoreBreakdown
+    reason: str
+    context_complete: bool = True
 
-    def to_dict(self) -> dict:
-        return asdict(self)
 
-    @classmethod
-    def from_dict(cls, data: dict | None) -> "SelectionStats":
-        data = data or {}
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in data.items() if k in known})
+class SpeakerSegment(BaseModel):
+    start: float
+    end: float
+    speaker: str
+
+
+class DiarizationResult(BaseModel):
+    segments: list[SpeakerSegment] = Field(default_factory=list)
+    method: Literal["diarization", "activity_proxy", "unavailable"] = "unavailable"
+
+
+class SelectedClip(BaseModel):
+    """Um clip selecionado, pronto para render + meta."""
+
+    slug: str
+    candidate: Candidate
+    score: Score
+    vertical_skipped: Optional[str] = None
+
+    @property
+    def vertical_ok(self) -> bool:
+        return self.vertical_skipped is None
+
+
+class CostEstimate(BaseModel):
+    stt_minutes: float
+    stt_usd: float
+    n_candidates: int
+    text_usd: float
+    vision_usd: float
+    total_usd: float

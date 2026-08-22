@@ -1,47 +1,36 @@
-import os
-import sys
+from __future__ import annotations
+
+import json
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+from clip_mvp.models import Transcript
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-@pytest.fixture(autouse=True)
-def isolated_home(tmp_path, monkeypatch):
-    """Cada teste roda com `work/` e `out/` próprios."""
-    monkeypatch.setenv("CLIP_MVP_HOME", str(tmp_path))
-    monkeypatch.setenv("CLIP_MVP_DEMO", "1")
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from clip_mvp import config
-
-    config.get_settings(refresh=True)
-    yield tmp_path
-    config._cached = None
+@pytest.fixture()
+def fixtures_dir() -> Path:
+    return FIXTURES_DIR
 
 
-@pytest.fixture
-def transcript():
-    from clip_mvp import demo
-
-    return demo.build_transcript(900.0, seed="pytest")
+@pytest.fixture()
+def sample_video_path() -> Path:
+    return FIXTURES_DIR / "sample_video.mp4"
 
 
-def pytest_addoption(parser):
-    parser.addoption(
-        "--fixture-video",
-        action="store",
-        default=os.environ.get("CLIP_MVP_FIXTURE_VIDEO", ""),
-        help="Vídeo local usado no teste de ponta a ponta (SPEC 14.8)",
-    )
+@pytest.fixture()
+def transcript_pt_br() -> Transcript:
+    data = json.loads((FIXTURES_DIR / "transcript_pt_br.json").read_text(encoding="utf-8"))
+    return Transcript.model_validate(data)
 
 
-@pytest.fixture
-def fixture_video(request) -> Path | None:
-    raw = request.config.getoption("--fixture-video")
-    if raw:
-        path = Path(raw)
-        return path if path.exists() else None
-    default = ROOT / "tests" / "fixtures" / "demo_480s.mp4"
-    return default if default.exists() else None
+@pytest.fixture()
+def whisper_verbose_json_raw() -> dict:
+    return json.loads((FIXTURES_DIR / "whisper_verbose_json_raw.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture()
+def expected_fixture() -> dict:
+    return json.loads((FIXTURES_DIR / "expected.json").read_text(encoding="utf-8"))

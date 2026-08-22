@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, artifactUrl } from "../lib/api";
+import { api, artifactUrl, posterUrl } from "../lib/api";
 import {
-  FORMAT_LABELS,
+  ARTIFACT_LABELS,
+  SKIP_REASONS,
+  VIDEO_ARTIFACTS,
   copyToClipboard,
   formatDuration,
   scoreRing,
@@ -10,8 +12,13 @@ import {
 import type { Clip } from "../lib/types";
 import { Badge, Button, Segmented, TextInput, cx } from "./ui";
 
-const VIDEO_KEYS = ["vertical_facetrack", "vertical_center", "horizontal_16x9"] as const;
-type VideoKey = (typeof VIDEO_KEYS)[number];
+type VideoArtifact = (typeof VIDEO_ARTIFACTS)[number];
+
+const VIDEO_LABELS: Record<string, string> = {
+  "vertical_facetrack.mp4": "9:16 face tracking",
+  "vertical_center.mp4": "9:16 center",
+  "horizontal_16x9.mp4": "16:9",
+};
 
 const BREAKDOWN_LABELS: Record<string, string> = {
   hook: "Hook (3s)",
@@ -20,10 +27,17 @@ const BREAKDOWN_LABELS: Record<string, string> = {
   arco: "Arco completo",
 };
 
-const SKIP_REASONS: Record<string, string> = {
-  context_exceeds_90s:
-    "O contexto fechado desse momento passa de 90s, então o 9:16 foi descartado em vez de cortar a frase no meio. Só o 16:9 foi exportado.",
-  vertical_window_invalida: "A janela 9:16 proposta era inválida e foi descartada.",
+const BREAKDOWN_COLORS: Record<string, string> = {
+  hook: "from-brand-600 to-brand-400",
+  emocao: "from-fuchsia-600 to-fuchsia-400",
+  citavel: "from-amber-500 to-amber-300",
+  arco: "from-lime-600 to-lime-300",
+};
+
+const SPEAKER_LABELS: Record<string, string> = {
+  diarization: "diarização (fala → rosto)",
+  activity_proxy: "proxy de atividade facial",
+  unavailable: "sem diarização",
 };
 
 export function ClipDetail({
@@ -38,10 +52,10 @@ export function ClipDetail({
   onRated: (slug: string, verdict: "good" | "bad", note: string) => void;
 }) {
   const available = useMemo(
-    () => VIDEO_KEYS.filter((key) => clip.artifacts[key]),
+    () => VIDEO_ARTIFACTS.filter((name) => clip.artifacts[name]),
     [clip.artifacts],
   );
-  const [tab, setTab] = useState<VideoKey>(available[0] ?? "horizontal_16x9");
+  const [tab, setTab] = useState<VideoArtifact>(available[0] ?? "horizontal_16x9.mp4");
   const [note, setNote] = useState(clip.rating_note ?? "");
   const [rating, setRating] = useState(clip.rating);
   const [busy, setBusy] = useState(false);
@@ -58,9 +72,10 @@ export function ClipDetail({
     };
   }, [onClose]);
 
-  const isVertical = tab !== "horizontal_16x9";
-  const window16x9 = clip.windows.horizontal_16x9;
-  const window9x16 = clip.windows.vertical_9x16;
+  const isVertical = tab.startsWith("vertical");
+  const horizontal = clip.windows?.horizontal_16x9;
+  const vertical = clip.windows?.vertical_9x16;
+  const speakerMethod = clip.speaker_matching?.method;
 
   const rate = async (verdict: "good" | "bad") => {
     setBusy(true);
@@ -94,11 +109,11 @@ export function ClipDetail({
                   scoreTone(clip.score),
                 )}
               >
-                {clip.score}
+                {clip.score ?? "—"}
               </span>
               <h2 className="truncate text-base font-semibold text-white">{clip.title}</h2>
             </div>
-            <p className="font-mono text-[0.72rem] text-mist-400">{clip.slug}</p>
+            <p className="font-mono text-[0.72rem] text-mist-400">{clip.out_dir ?? clip.slug}</p>
           </div>
           <Button variant="ghost" size="sm" onClick={onClose} aria-label="Fechar">
             ✕
@@ -109,10 +124,10 @@ export function ClipDetail({
           <div className="space-y-4">
             {available.length > 0 ? (
               <>
-                <Segmented<VideoKey>
+                <Segmented<VideoArtifact>
                   value={tab}
                   onChange={setTab}
-                  options={available.map((key) => ({ value: key, label: FORMAT_LABELS[key] }))}
+                  options={available.map((name) => ({ value: name, label: VIDEO_LABELS[name] }))}
                 />
                 <div
                   className={cx(
@@ -122,12 +137,8 @@ export function ClipDetail({
                 >
                   <video
                     key={`${clip.slug}-${tab}`}
-                    src={artifactUrl(jobId, clip.slug, clip.artifacts[tab])}
-                    poster={
-                      clip.artifacts.poster
-                        ? artifactUrl(jobId, clip.slug, clip.artifacts.poster)
-                        : undefined
-                    }
+                    src={artifactUrl(jobId, clip.slug, tab)}
+                    poster={posterUrl(jobId, clip.slug)}
                     controls
                     preload="metadata"
                     className={cx("w-full", isVertical ? "aspect-[9/16]" : "aspect-video")}
@@ -136,7 +147,9 @@ export function ClipDetail({
               </>
             ) : (
               <p className="rounded-xl border border-dashed border-white/12 px-4 py-8 text-center text-[0.82rem] text-mist-400">
-                Nenhum vídeo exportado para este corte.
+                {clip.status === "running"
+                  ? "Renderizando este corte…"
+                  : "Nenhum vídeo exportado para este corte."}
               </p>
             )}
 
@@ -147,82 +160,91 @@ export function ClipDetail({
             )}
 
             <div className="grid gap-3 sm:grid-cols-2">
-              <WindowCard title="16:9 (YouTube)" window={window16x9} note="duração escolhida pela IA" />
+              <WindowCard
+                title="16:9 (YouTube)"
+                window={horizontal}
+                note="duração escolhida pela IA, sem teto fixo"
+              />
               <WindowCard
                 title="9:16 (Shorts / TikTok)"
-                window={window9x16}
-                note={
-                  window9x16?.note === "shrunk_to_90s"
-                    ? "encolhido para caber em 90s sem cortar frase"
-                    : "máximo 90s"
-                }
+                window={vertical}
+                note="máximo 90s, sempre em fronteira de frase"
               />
             </div>
 
-            {clip.transcript_text && <Transcript text={clip.transcript_text} />}
+            <section className="space-y-2 rounded-2xl border border-white/8 bg-white/3 p-4">
+              <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
+                Downloads
+              </h3>
+              <ul className="grid gap-1 sm:grid-cols-2">
+                {Object.keys(clip.artifacts).map((name) => (
+                  <li key={name}>
+                    <a
+                      href={artifactUrl(jobId, clip.slug, name, true)}
+                      download
+                      className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[0.78rem] text-mist-300 transition-colors hover:bg-white/6 hover:text-white"
+                    >
+                      <span>{ARTIFACT_LABELS[name] ?? name}</span>
+                      <span className="font-mono text-[0.68rem] text-mist-400">↓</span>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </section>
           </div>
 
           <aside className="space-y-4">
             <section className="space-y-2.5 rounded-2xl border border-white/8 bg-white/3 p-4">
               <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-                Score {clip.score}/100
+                Score {clip.score ?? "—"}/100
               </h3>
               <ul className="space-y-2">
-                {Object.entries(clip.breakdown).map(([key, value]) => (
+                {Object.entries(clip.breakdown ?? {}).map(([key, value]) => (
                   <li key={key} className="space-y-1">
                     <div className="flex justify-between text-[0.74rem]">
                       <span className="text-mist-300">{BREAKDOWN_LABELS[key] ?? key}</span>
-                      <span className="font-mono text-mist-400">{value}/25</span>
+                      <span className="font-mono text-mist-400">{Math.round(value)}/25</span>
                     </div>
                     <div className="h-1 overflow-hidden rounded-full bg-white/8">
                       <div
-                        className="h-full rounded-full bg-gradient-to-r from-brand-600 to-brand-400"
+                        className={cx(
+                          "h-full rounded-full bg-gradient-to-r",
+                          BREAKDOWN_COLORS[key] ?? "from-brand-600 to-brand-400",
+                        )}
                         style={{ width: `${(Math.min(25, value) / 25) * 100}%` }}
                       />
                     </div>
                   </li>
                 ))}
               </ul>
-              <p className="border-t border-white/8 pt-2.5 text-[0.76rem] leading-snug text-mist-400">
-                {clip.reason}
-              </p>
+              {clip.reason && (
+                <p className="border-t border-white/8 pt-2.5 text-[0.76rem] leading-snug text-mist-400">
+                  {clip.reason}
+                </p>
+              )}
               <div className="flex flex-wrap gap-1.5">
-                <Badge tone={clip.context_complete ? "good" : "warn"}>
-                  {clip.context_complete ? "contexto fechado" : "contexto incompleto"}
-                </Badge>
-                <Badge>fronteira por {clip.boundary_method === "word" ? "palavra" : "segmento"}</Badge>
-                {clip.face_track && <Badge>{clip.face_track}</Badge>}
+                {clip.context_complete != null && (
+                  <Badge tone={clip.context_complete ? "good" : "warn"}>
+                    {clip.context_complete ? "contexto fechado" : "contexto aberto"}
+                  </Badge>
+                )}
+                {speakerMethod && (
+                  <Badge tone={speakerMethod === "diarization" ? "neutral" : "warn"}>
+                    {SPEAKER_LABELS[speakerMethod] ?? speakerMethod}
+                  </Badge>
+                )}
               </div>
             </section>
 
             <SocialPanel clip={clip} />
-
-            <section className="space-y-2 rounded-2xl border border-white/8 bg-white/3 p-4">
-              <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-                Downloads
-              </h3>
-              <ul className="space-y-1">
-                {Object.entries(clip.artifacts).map(([key, name]) => (
-                  <li key={key}>
-                    <a
-                      href={artifactUrl(jobId, clip.slug, name, true)}
-                      download
-                      className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[0.78rem] text-mist-300 transition-colors hover:bg-white/6 hover:text-white"
-                    >
-                      <span>{FORMAT_LABELS[key] ?? key.replace(/_/g, " ")}</span>
-                      <span className="font-mono text-[0.7rem] text-mist-400">{name}</span>
-                    </a>
-                  </li>
-                ))}
-              </ul>
-            </section>
 
             <section className="space-y-2.5 rounded-2xl border border-white/8 bg-white/3 p-4">
               <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
                 Este corte presta?
               </h3>
               <p className="text-[0.74rem] leading-snug text-mist-400">
-                O veredicto entra como few-shot nos próximos prompts de candidatos e score.
+                O veredicto vai para <code className="text-mist-300">work/feedback.jsonl</code> e
+                entra como few-shot nos próximos prompts de candidatos e score.
               </p>
               <TextInput
                 value={note}
@@ -263,7 +285,7 @@ function WindowCard({
   note,
 }: {
   title: string;
-  window: Clip["windows"]["horizontal_16x9"];
+  window: { start: number; end: number; duration_s: number } | undefined;
   note?: string;
 }) {
   return (
@@ -284,37 +306,13 @@ function WindowCard({
   );
 }
 
-function Transcript({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="rounded-2xl border border-white/8 bg-white/3 p-4">
-      <button
-        onClick={() => setOpen((value) => !value)}
-        className="flex w-full items-center justify-between gap-2 text-[0.78rem] font-semibold text-mist-200"
-        aria-expanded={open}
-      >
-        Transcrição do corte
-        <span className={cx("text-mist-400 transition-transform", open && "rotate-90")} aria-hidden>
-          ▸
-        </span>
-      </button>
-      <p
-        className={cx(
-          "mt-2 text-[0.8rem] leading-relaxed text-mist-300",
-          !open && "line-clamp-3",
-        )}
-      >
-        {text}
-      </p>
-    </div>
-  );
-}
-
 function SocialPanel({ clip }: { clip: Clip }) {
   const [platform, setPlatform] = useState<"yt_short" | "yt_long" | "tiktok">("yt_short");
   const [copied, setCopied] = useState<string | null>(null);
-  const youtube = clip.meta?.youtube;
-  const tiktok = clip.meta?.tiktok;
+  const youtube = clip.youtube ?? {};
+  const tiktok = clip.tiktok ?? {};
+  const hasYoutube = Object.keys(youtube).length > 0;
+  const hasTiktok = Object.keys(tiktok).length > 0;
 
   const copy = async (label: string, value: string) => {
     try {
@@ -326,36 +324,36 @@ function SocialPanel({ clip }: { clip: Clip }) {
     }
   };
 
-  if (!youtube && !tiktok) {
+  if (!hasYoutube && !hasTiktok) {
     return (
       <section className="rounded-2xl border border-white/8 bg-white/3 p-4 text-[0.78rem] text-mist-400">
-        Títulos e hashtags aparecem quando a etapa de meta terminar.
+        Títulos e hashtags aparecem quando o estágio de textos terminar.
       </section>
     );
   }
 
   const options = [
-    ...(youtube ? [{ value: "yt_short" as const, label: "Shorts" }] : []),
-    ...(youtube ? [{ value: "yt_long" as const, label: "YT 16:9" }] : []),
-    ...(tiktok ? [{ value: "tiktok" as const, label: "TikTok" }] : []),
+    ...(hasYoutube ? [{ value: "yt_short" as const, label: "Shorts" }] : []),
+    ...(hasYoutube ? [{ value: "yt_long" as const, label: "YT 16:9" }] : []),
+    ...(hasTiktok ? [{ value: "tiktok" as const, label: "TikTok" }] : []),
   ];
 
   const rows: { label: string; value: string }[] =
     platform === "tiktok"
       ? [
-          { label: "Caption", value: tiktok?.caption ?? "" },
-          { label: "Hashtags", value: (tiktok?.hashtags ?? []).join(" ") },
+          { label: "Caption", value: tiktok.caption ?? "" },
+          { label: "Hashtags", value: (tiktok.hashtags ?? []).join(" ") },
         ]
       : platform === "yt_short"
         ? [
-            { label: "Título", value: youtube?.shorts_title ?? "" },
-            { label: "Descrição", value: youtube?.description ?? "" },
-            { label: "Hashtags", value: (youtube?.hashtags ?? []).join(" ") },
+            { label: "Título", value: youtube.shorts_title ?? youtube.title ?? "" },
+            { label: "Descrição", value: youtube.description ?? "" },
+            { label: "Hashtags", value: (youtube.hashtags ?? []).join(" ") },
           ]
         : [
-            { label: "Título", value: youtube?.long_title ?? youtube?.shorts_title ?? "" },
-            { label: "Descrição", value: youtube?.description ?? "" },
-            { label: "Tags", value: (youtube?.tags ?? []).join(", ") },
+            { label: "Título", value: youtube.long_title ?? youtube.title ?? "" },
+            { label: "Descrição", value: youtube.description ?? "" },
+            { label: "Tags", value: (youtube.tags ?? []).join(", ") },
           ];
 
   return (

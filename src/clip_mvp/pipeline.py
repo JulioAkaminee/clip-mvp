@@ -1,599 +1,857 @@
-"""Orquestrador do job (SPEC 6).
+"""Orquestração do pipeline completo (SPEC §6, §12). Liga todos os módulos.
 
-O pipeline é síncrono e reporta progresso por callbacks (`JobReporter`), o que
-permite rodar tanto pela CLI quanto pela API (worker em thread) sem duplicar
-lógica.
+Cada estágio reporta andamento em um :class:`~clip_mvp.progress.ProgressReporter`,
+que é a única fonte de verdade de progresso para a CLI, a API HTTP e a UI web.
 """
 
 from __future__ import annotations
 
-import shutil
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from typing import Any, Callable
 
-from . import candidates as candidates_mod
-from . import download as download_mod
-from .boundaries import Window
-from .budget import Estimate, estimate as estimate_cost, fit_candidates_to_budget
-from .captions import write_clip_captions
-from .config import ALL_FORMATS, DEFAULT_MIN_SCORE, Settings, get_settings
-from .dedupe import dedupe
-from .diarize import speaker_timeline
-from .face_track import TrackResult, track as track_faces
-from .ffmpeg_utils import duration_of, require_ffmpeg, video_size
-from .meta import build_meta, social_text, write_meta
-from .models import Candidate, SelectionStats
-from .paths import clip_out_dir, job_dir, job_out_dir, slugify
-from .render import (
-    render_horizontal,
-    render_poster,
-    render_vertical_center,
-    render_vertical_facetrack,
-)
+from . import audio as audio_mod
+from . import face_track as face_track_mod
+from . import meta as meta_mod
+from . import render as render_mod
+from . import subtitles as subtitles_mod
+from .budget import apply_budget, estimate_cost
+from .candidates import generate_candidates, resolve_target_range
+from .config import Settings
+from .dedupe import DedupeItem, dedupe_items
+from .diarization import diarize, resolve_speaker_matching_method
+from .download import download_source, probe_metadata
+from .feedback import load_recent_feedback, write_selected_index
+from .models import Candidate, Score, Transcript
+from .openrouter import OpenRouterClient
+from .progress import ClipProgress, ProgressReporter
 from .score import score_candidates
-from .transcribe import transcribe
+from .transcribe import dump_transcript, load_transcript, transcribe_audio
+from .utils import ffprobe_duration
+from .utils import job_dir as make_job_dir
+from .utils import make_job_id, out_clip_dir, read_json, slugify, write_json
 
-STAGES: tuple[tuple[str, str], ...] = (
-    ("download", "Download"),
-    ("transcribe", "Transcrição"),
-    ("candidates", "Candidatos"),
-    ("score", "Score"),
-    ("select", "Seleção"),
-    ("render", "Render + legendas"),
-    ("meta", "Títulos e hashtags"),
-)
-
-
-class JobCanceled(RuntimeError):
-    pass
+DEFAULT_FORMATS = ["face", "9x16", "16x9"]
+DEFAULT_PLATFORMS = ["yt", "tiktok"]
+DEFAULT_CAPTIONS = "both"
 
 
 @dataclass
-class JobOptions:
-    url: str
-    mode: str = "auto"
+class RunOptions:
+    more: bool = False
     count: int | None = None
-    min_score: int = DEFAULT_MIN_SCORE
-    max_score_only: int | None = None
-    formats: tuple[str, ...] = ALL_FORMATS
-    captions: str = "both"
-    platforms: tuple[str, ...] = ("yt", "tiktok")
+    min_score: float | None = None
+    max_score_only: float | None = None
+    formats: list[str] = field(default_factory=lambda: list(DEFAULT_FORMATS))
+    captions: str = DEFAULT_CAPTIONS
+    platforms: list[str] = field(default_factory=lambda: list(DEFAULT_PLATFORMS))
     dry_run: bool = False
-    budget_usd: float | None = None
-    demo: bool | None = None
-
-    def to_dict(self) -> dict:
-        return {
-            "url": self.url,
-            "mode": self.mode,
-            "count": self.count,
-            "min_score": self.min_score,
-            "max_score_only": self.max_score_only,
-            "formats": list(self.formats),
-            "captions": self.captions,
-            "platforms": list(self.platforms),
-            "dry_run": self.dry_run,
-            "budget_usd": self.budget_usd,
-            "demo": self.demo,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "JobOptions":
-        return cls(
-            url=data["url"],
-            mode=data.get("mode", "auto"),
-            count=data.get("count"),
-            min_score=int(data.get("min_score", DEFAULT_MIN_SCORE)),
-            max_score_only=data.get("max_score_only"),
-            formats=tuple(data.get("formats") or ALL_FORMATS),
-            captions=data.get("captions", "both"),
-            platforms=tuple(data.get("platforms") or ("yt", "tiktok")),
-            dry_run=bool(data.get("dry_run")),
-            budget_usd=data.get("budget_usd"),
-            demo=data.get("demo"),
-        )
-
-
-class JobReporter:
-    """Recebe progresso do pipeline. A API e a CLI implementam à sua maneira."""
-
-    def stage(
-        self,
-        key: str,
-        status: str = "running",
-        progress: float | None = None,
-        message: str = "",
-    ) -> None:  # pragma: no cover - interface
-        pass
-
-    def log(self, message: str, level: str = "info") -> None:  # pragma: no cover
-        pass
-
-    def source(self, info: dict) -> None:  # pragma: no cover
-        pass
-
-    def estimate(self, estimate: dict) -> None:  # pragma: no cover
-        pass
-
-    def selection(self, stats: dict) -> None:  # pragma: no cover
-        pass
-
-    def clip(self, clip: dict) -> None:  # pragma: no cover
-        pass
-
-    def check_cancel(self) -> None:  # pragma: no cover
-        pass
+    budget: float | None = None
 
 
 @dataclass
-class JobResult:
+class JobSummary:
     job_id: str
-    clips: list[dict] = field(default_factory=list)
-    selection: dict = field(default_factory=dict)
-    estimate: dict | None = None
-    source: dict = field(default_factory=dict)
+    candidates: int = 0
+    deduped_removed: int = 0
+    selected: int = 0
+    vertical_ok: int = 0
+    vertical_skipped: int = 0
+    min_score: float = 0.0
     dry_run: bool = False
+    cost_estimate: dict[str, Any] | None = None
+    budget_warning: str | None = None
+    clips: list[dict[str, Any]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
-def _is_local_source(url: str) -> Path | None:
-    """Aceita caminho local / file:// (útil para demo e testes offline)."""
-    if url.startswith("file://"):
-        return Path(unquote(urlparse(url).path))
-    if url.startswith(("http://", "https://")):
-        return None
-    candidate = Path(url).expanduser()
-    return candidate if candidate.exists() else None
+def _job_paths(work_dir: Path, job_id: str) -> dict[str, Path]:
+    jdir = make_job_dir(work_dir, job_id)
+    return {
+        "dir": jdir,
+        "video": jdir / "source.mp4",
+        "audio": jdir / "source_audio.wav",
+        "transcript": jdir / "transcript.json",
+        "candidates": jdir / "candidates.json",
+        "diarization": jdir / "diarization.json",
+        "frames": jdir / "frames",
+    }
 
 
-def _acquire_source(
-    options: JobOptions, work: Path, reporter: JobReporter
-) -> download_mod.SourceMedia:
-    local = _is_local_source(options.url)
-    if local is not None:
-        if not local.exists():
-            raise FileNotFoundError(f"arquivo não encontrado: {local}")
-        dest = work / f"source{local.suffix or '.mp4'}"
-        if not dest.exists():
-            shutil.copy2(local, dest)
-        reporter.stage("download", "done", 1.0, f"arquivo local: {local.name}")
-        return download_mod.SourceMedia(
-            path=dest,
-            title=local.stem,
-            duration_s=duration_of(dest),
-            url=options.url,
-        )
-
-    def on_progress(fraction: float, line: str) -> None:
-        reporter.check_cancel()
-        reporter.stage("download", "running", fraction, line[-120:])
-
-    media = download_mod.download(options.url, work, on_progress=on_progress)
-    reporter.stage("download", "done", 1.0, f"{media.title} ({media.duration_s / 60:.1f} min)")
-    return media
-
-
-def _probe_duration(options: JobOptions, reporter: JobReporter) -> tuple[float, dict]:
-    local = _is_local_source(options.url)
-    if local is not None:
-        return duration_of(local), {"title": local.stem, "duration_s": duration_of(local)}
-    info = download_mod.probe_source(options.url)
-    return info["duration_s"], info
-
-
-def dry_run(options: JobOptions, reporter: JobReporter, settings: Settings) -> JobResult:
-    """Estimativa de custo sem baixar nem chamar vision (SPEC 14.4)."""
-    reporter.stage("download", "running", 0.2, "lendo metadados da fonte")
-    duration, info = _probe_duration(options, reporter)
-    reporter.source({**info, "url": options.url})
-    reporter.stage("download", "skipped", 1.0, "dry-run: sem download")
-
-    plan = candidates_mod.plan_count(duration, options.mode, options.count)
-    est = estimate_cost(
-        duration_s=duration,
-        candidates=plan.pool,
-        selected=plan.target_max,
-        budget_usd=options.budget_usd,
+def _ensure_download(
+    url: str,
+    settings: Settings,
+    paths: dict[str, Path],
+    *,
+    on_progress: Callable[[float, str], None] | None = None,
+) -> Path:
+    if paths["video"].exists():
+        if on_progress:
+            on_progress(1.0, "Vídeo já baixado (cache)")
+        return paths["video"]
+    result = download_source(
+        url, paths["dir"], height=settings.download_height, on_progress=on_progress
     )
-    if options.budget_usd is not None and not est.within_budget:
-        allowed, est = fit_candidates_to_budget(
-            duration, plan.pool, plan.target_max, options.budget_usd
-        )
-        reporter.log(
-            f"orçamento US$ {options.budget_usd:.2f}: pool cairia para {allowed} candidatos",
-            "warn",
-        )
-    for key, _ in STAGES[1:]:
-        reporter.stage(key, "skipped", 0.0, "dry-run")
-    reporter.estimate(est.to_dict())
-    reporter.log(
-        f"estimativa: US$ {est.total_usd:.2f} para {duration / 60:.1f} min "
-        f"({plan.pool} candidatos, alvo {plan.target_min}–{plan.target_max} cortes)"
+    if result.video_path != paths["video"]:
+        result.video_path.replace(paths["video"])
+    return paths["video"]
+
+
+def _ensure_audio(video_path: Path, paths: dict[str, Path]) -> Path:
+    if paths["audio"].exists():
+        return paths["audio"]
+    return audio_mod.extract_audio(video_path, paths["audio"])
+
+
+def _ensure_transcript(
+    audio_path: Path,
+    settings: Settings,
+    paths: dict[str, Path],
+    *,
+    client: OpenRouterClient | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> Transcript:
+    if paths["transcript"].exists():
+        return load_transcript(paths["dir"])
+    transcript = transcribe_audio(audio_path, settings, client=client, on_progress=on_progress)
+    dump_transcript(transcript, paths["dir"])
+    return transcript
+
+
+def _ensure_candidates(
+    transcript: Transcript,
+    settings: Settings,
+    paths: dict[str, Path],
+    *,
+    target_hi: int,
+    client: OpenRouterClient | None = None,
+    feedback_examples: list[dict] | None = None,
+    force_regenerate: bool = False,
+) -> list[Candidate]:
+    if paths["candidates"].exists() and not force_regenerate:
+        raw = read_json(paths["candidates"])
+        return [Candidate.model_validate(c) for c in raw]
+
+    candidates = generate_candidates(
+        transcript,
+        settings,
+        target_hi=target_hi,
+        client=client,
+        feedback_examples=feedback_examples,
     )
-    return JobResult(
-        job_id="",
-        estimate=est.to_dict(),
-        source={**info, "url": options.url},
-        dry_run=True,
-        selection={
-            "mode": plan.mode,
-            "target_min": plan.target_min,
-            "target_max": plan.target_max,
-            "candidates": plan.pool,
-            "min_score": options.min_score,
-        },
+    write_json(paths["candidates"], [c.model_dump() for c in candidates])
+    return candidates
+
+
+def _ensure_diarization_method(
+    audio_path: Path,
+    settings: Settings,
+    paths: dict[str, Path],
+    *,
+    client: OpenRouterClient | None = None,
+) -> str:
+    """Diariza (com cache em work/<job_id>/diarization.json, SPEC §14.4) e
+    retorna o método a registrar em meta.json (SPEC §14.6)."""
+    if paths["diarization"].exists():
+        cached = read_json(paths["diarization"])
+        return cached.get("method", "activity_proxy")
+
+    try:
+        diarization = diarize(audio_path, settings, client=client)
+    except Exception:
+        diarization = None
+
+    method = resolve_speaker_matching_method(diarization)
+    write_json(
+        paths["diarization"],
+        {"method": method, "segments": [s.model_dump() for s in diarization.segments] if diarization else []},
+    )
+    return method
+
+
+def _select_clips(
+    scored: list[tuple[Candidate, Score]],
+    *,
+    min_score: float,
+    max_score_only: float | None,
+    count_cap: int,
+) -> tuple[list[tuple[Candidate, Score]], int]:
+    """Aplica limiar + dedupe (por score) + teto (SPEC §3 fluxo interno)."""
+    items = [
+        DedupeItem(item=(c, s), start=c.window_16x9.start, end=c.window_16x9.end, text=c.text_excerpt, score=s.total)
+        for c, s in scored
+    ]
+    dedupe_result = dedupe_items(items)
+    deduped = dedupe_result.kept
+
+    threshold = max_score_only if max_score_only is not None else min_score
+    passing = [(c, s) for c, s in deduped if s.total >= threshold]
+    passing.sort(key=lambda cs: cs[1].total, reverse=True)
+    selected = passing[:count_cap]
+    return selected, dedupe_result.removed_count
+
+
+def make_reporter(settings: Settings, job_id: str, **kwargs: Any) -> ProgressReporter:
+    """Cria um reporter que persiste status/eventos em ``work/<job_id>/``."""
+    jdir = make_job_dir(settings.work_dir, job_id)
+    return ProgressReporter(
+        job_id,
+        status_path=jdir / "status.json",
+        events_path=jdir / "events.jsonl",
+        **kwargs,
     )
 
 
 def run_job(
+    url: str,
+    settings: Settings,
+    options: RunOptions,
+    *,
+    client: OpenRouterClient | None = None,
+    reporter: ProgressReporter | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> JobSummary:
+    job_id = make_job_id(url)
+    return _run_or_resume(
+        job_id,
+        url,
+        settings,
+        options,
+        client=client,
+        is_resume=False,
+        reporter=reporter,
+        cancel_check=cancel_check,
+    )
+
+
+def resume_job(
     job_id: str,
-    options: JobOptions,
-    reporter: JobReporter,
-    settings: Settings | None = None,
-) -> JobResult:
-    settings = settings or get_settings()
-    if options.demo:
-        settings = Settings(**{**settings.__dict__, "demo": True})
-    require_ffmpeg()
-    work = job_dir(job_id)
-    work.mkdir(parents=True, exist_ok=True)
+    settings: Settings,
+    options: RunOptions,
+    *,
+    client: OpenRouterClient | None = None,
+    reporter: ProgressReporter | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> JobSummary:
+    return _run_or_resume(
+        job_id,
+        None,
+        settings,
+        options,
+        client=client,
+        is_resume=True,
+        reporter=reporter,
+        cancel_check=cancel_check,
+    )
+
+
+class JobCanceled(RuntimeError):
+    """Levantada quando o usuário cancela um job em andamento."""
+
+
+def _hint_for(exc: BaseException) -> str:
+    """Dica acionável em PT-BR — a UI nunca deve mostrar só o stack trace."""
+    text = str(exc).lower()
+    if "openrouter_api_key" in text:
+        return "Configure OPENROUTER_API_KEY no .env e rode de novo."
+    if "429" in text or "rate limit" in text:
+        return "Limite de taxa da OpenRouter. Espere um pouco e rode `clip resume <job_id>`."
+    if "yt-dlp" in text or "unavailable" in text:
+        return "Confira se a URL está acessível e se o yt-dlp está atualizado."
+    if "ffmpeg" in text or "ffprobe" in text:
+        return "Verifique se o ffmpeg está instalado (`brew install ffmpeg`)."
+    return "Rode `clip resume <job_id>` para continuar de onde parou (o cache é preservado)."
+
+
+def _run_or_resume(
+    job_id: str,
+    url: str | None,
+    settings: Settings,
+    options: RunOptions,
+    *,
+    client: OpenRouterClient | None,
+    is_resume: bool,
+    reporter: ProgressReporter | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> JobSummary:
+    reporter = reporter or make_reporter(settings, job_id)
+    try:
+        return _execute(
+            job_id,
+            url,
+            settings,
+            options,
+            client=client,
+            is_resume=is_resume,
+            reporter=reporter,
+            cancel_check=cancel_check or (lambda: False),
+        )
+    except JobCanceled:
+        reporter.cancel()
+        raise
+    except Exception as exc:  # noqa: BLE001 - o estado de erro precisa chegar à UI
+        reporter.fail(exc, hint=_hint_for(exc))
+        raise
+
+
+def _execute(
+    job_id: str,
+    url: str | None,
+    settings: Settings,
+    options: RunOptions,
+    *,
+    client: OpenRouterClient | None,
+    is_resume: bool,
+    reporter: ProgressReporter,
+    cancel_check: Callable[[], bool],
+) -> JobSummary:
+    paths = _job_paths(settings.work_dir, job_id)
+    summary = JobSummary(job_id=job_id)
+    client = client or OpenRouterClient(settings)
+
+    def check_cancel() -> None:
+        if cancel_check():
+            raise JobCanceled("job cancelado pelo usuário")
+
+    if is_resume:
+        if not paths["transcript"].exists():
+            raise RuntimeError(
+                f"Job {job_id} não tem transcrição em cache; use `clip \"URL\"` para iniciar do zero."
+            )
+        job_meta_path = paths["dir"] / "job.json"
+        source_url = read_json(job_meta_path).get("source_url", "") if job_meta_path.exists() else ""
+        reporter.skip_stage("download", "Vídeo e áudio reaproveitados do cache")
+    else:
+        assert url is not None
+        source_url = url
+        write_json(paths["dir"] / "job.json", {"source_url": url, "job_id": job_id})
+        # Duração conhecida antes do primeiro byte: sem isso o ETA passaria o
+        # download inteiro sem ter o que estimar.
+        _seed_duration_estimate(url, reporter)
+
+        reporter.start_stage("download", units_total=1)
+        video_path = _ensure_download(
+            url,
+            settings,
+            paths,
+            on_progress=lambda frac, msg: reporter.update("download", frac * 0.9, msg),
+        )
+        reporter.update("download", 0.95, "Extraindo áudio para transcrição…")
+        _ensure_audio(video_path, paths)
+        reporter.finish_stage("download", "Vídeo e áudio prontos")
+
+    video_path = paths["video"]
+    audio_path = paths["audio"]
+
+    # Duração é conhecida sem precisar transcrever (ffprobe no vídeo baixado,
+    # ou a transcrição já cacheada em `resume`). Isso permite que --dry-run e
+    # --budget decidam ANTES de pagar por STT/candidatos/vision (SPEC §14.4).
+    if paths["transcript"].exists():
+        duration_s = load_transcript(paths["dir"]).duration
+    else:
+        duration_s = ffprobe_duration(video_path)
+    reporter.set_source_minutes(duration_s / 60.0)
+
+    min_score = options.min_score if options.min_score is not None else settings.min_score_default
+    summary.min_score = options.max_score_only if options.max_score_only is not None else min_score
+
+    _, target_hi = resolve_target_range(duration_s, more=options.more, count=options.count)
+
+    cost = estimate_cost(duration_s, candidates_pool_hint(target_hi), settings)
+    summary.cost_estimate = cost.model_dump()
 
     if options.dry_run:
-        result = dry_run(options, reporter, settings)
-        result.job_id = job_id
-        return result
-
-    if not settings.ai_enabled:
-        reporter.log(
-            "modo demo: transcrição, candidatos e score são sintéticos "
-            "(defina OPENROUTER_API_KEY para usar a IA real).",
-            "warn",
+        summary.dry_run = True
+        summary.notes.append(
+            "--dry-run: parou antes de STT/candidatos/score/render (SPEC §14.4)."
         )
-
-    # 1. Fonte -----------------------------------------------------------------
-    reporter.stage("download", "running", 0.0, "obtendo fonte")
-    media = _acquire_source(options, work, reporter)
-    reporter.source(media.to_dict())
-    reporter.check_cancel()
-
-    # 2. Transcrição -----------------------------------------------------------
-    reporter.stage("transcribe", "running", 0.0, "transcrevendo (PT-BR)")
-    transcript_obj = transcribe(
-        media.path,
-        work,
-        settings,
-        on_progress=lambda p, m: (
-            reporter.check_cancel(),
-            reporter.stage("transcribe", "running", p, m),
-        )[-1],
-        duration_hint=media.duration_s,
-    )
-    reporter.stage(
-        "transcribe",
-        "done",
-        1.0,
-        f"{len(transcript_obj.segments)} segmentos · fronteira por "
-        f"{'palavra' if transcript_obj.has_word_timestamps else 'segmento'}",
-    )
-    reporter.check_cancel()
-
-    # 3. Candidatos ------------------------------------------------------------
-    plan = candidates_mod.plan_count(transcript_obj.duration, options.mode, options.count)
-    transcript_chars = sum(len(s.text) for s in transcript_obj.segments)
-    est = estimate_cost(
-        transcript_obj.duration,
-        plan.pool,
-        plan.target_max,
-        transcript_chars,
-        options.budget_usd,
-    )
-    if options.budget_usd is not None:
-        allowed, est = fit_candidates_to_budget(
-            transcript_obj.duration,
-            plan.pool,
-            plan.target_max,
-            options.budget_usd,
-            transcript_chars,
+        for stage in ("transcribe", "candidates", "score", "select", "captions", "render", "meta"):
+            reporter.skip_stage(stage, "pulado no --dry-run")
+        reporter.finish(
+            {"summary": _summary_payload(summary)},
+            f"Dry-run: custo estimado ~US$ {cost.total_usd:.3f}",
         )
-        if not est.within_budget:
-            reporter.estimate(est.to_dict())
-            raise RuntimeError(
-                f"orçamento insuficiente: estimativa US$ {est.total_usd:.2f} > "
-                f"US$ {options.budget_usd:.2f}. Aumente --budget ou reduza o vídeo."
+        return summary
+
+    allowed_n, warning = apply_budget(duration_s, cost.n_candidates, options.budget, settings)
+    if warning:
+        summary.budget_warning = warning
+        summary.notes.append(warning)
+    if options.budget is not None and allowed_n <= 0:
+        message = "Orçamento insuficiente; abortando antes de transcrever/gerar candidatos."
+        summary.notes.append(message)
+        for stage in ("transcribe", "candidates", "score", "select", "captions", "render", "meta"):
+            reporter.skip_stage(stage, "orçamento insuficiente")
+        reporter.finish({"summary": _summary_payload(summary)}, message)
+        return summary
+
+    check_cancel()
+    if paths["transcript"].exists():
+        reporter.skip_stage("transcribe", "Transcrição reaproveitada do cache")
+        transcript = load_transcript(paths["dir"])
+    else:
+        expected_chunks = max(1, int(duration_s // 600) + 1)
+        reporter.start_stage("transcribe", units_total=expected_chunks)
+        transcript = _ensure_transcript(
+            audio_path,
+            settings,
+            paths,
+            client=client,
+            on_progress=lambda done, total, msg: (
+                reporter.set_units("transcribe", total)
+                if total != reporter.stages["transcribe"].units_total
+                else None
             )
-        if allowed < plan.pool:
-            reporter.log(est.note or f"pool reduzido para {allowed} candidatos", "warn")
-            plan.pool = allowed
-    reporter.estimate(est.to_dict())
+            or reporter.advance_units("transcribe", done, msg),
+        )
+        reporter.finish_stage(
+            "transcribe",
+            f"Transcrição pronta ({len(transcript.segments)} segmentos"
+            + (", com palavras" if transcript.has_word_timestamps else ", só segmentos")
+            + ")",
+        )
+    if not transcript.has_word_timestamps:
+        summary.notes.append(
+            "STT não retornou timestamps por palavra; usando limites de segmento "
+            "(fronteiras um pouco menos precisas, SPEC §15)."
+        )
 
-    reporter.stage(
-        "candidates",
-        "running",
-        0.0,
-        f"alvo {plan.target_min}–{plan.target_max} cortes · pool {plan.pool}",
-    )
-    pool = candidates_mod.generate(
-        transcript_obj,
+    feedback_examples = load_recent_feedback(settings.work_dir, settings.feedback_examples_n)
+
+    check_cancel()
+    force_regen = is_resume and options.count is not None and not paths["candidates"].exists()
+    if paths["candidates"].exists() and not force_regen:
+        reporter.skip_stage("candidates", "Candidatos reaproveitados do cache")
+    else:
+        reporter.start_stage("candidates", units_total=1)
+    candidates = _ensure_candidates(
+        transcript,
         settings,
-        plan,
-        on_progress=lambda p, m: (
-            reporter.check_cancel(),
-            reporter.stage("candidates", "running", p, m),
-        )[-1],
+        paths,
+        target_hi=target_hi,
+        client=client,
+        feedback_examples=feedback_examples,
+        force_regenerate=force_regen,
     )
-    reporter.stage("candidates", "done", 1.0, f"{len(pool)} candidatos válidos")
-    if not pool:
-        reporter.log("nenhum candidato com contexto fechado foi encontrado", "warn")
+    summary.candidates = len(candidates)
+    if reporter.stages["candidates"].status == "running":
+        reporter.finish_stage(
+            "candidates", f"{len(candidates)} momentos com contexto fechado encontrados"
+        )
 
-    # 4. Score -----------------------------------------------------------------
-    reporter.stage("score", "running", 0.0, "pontuando candidatos")
-    score_candidates(
-        pool,
-        media.path,
-        work,
+    check_cancel()
+    reporter.start_stage("score", units_total=max(1, len(candidates)))
+    scored = score_candidates(
+        candidates,
+        video_path,
         settings,
-        on_progress=lambda p, m: (
-            reporter.check_cancel(),
-            reporter.stage("score", "running", p, m),
-        )[-1],
-    )
-    reporter.stage("score", "done", 1.0, f"{len(pool)} candidatos pontuados")
-    reporter.check_cancel()
-
-    # 5. Seleção (dedupe → limiar → teto) --------------------------------------
-    reporter.stage("select", "running", 0.3, "deduplicando e aplicando limiar")
-    kept, removed = dedupe(pool)
-    for candidate, why in removed:
-        reporter.log(
-            f"dedupe: '{candidate.title[:40]}' removido ({why}, score {candidate.score})",
-            "debug",
-        )
-    floor = max(options.min_score, options.max_score_only or 0)
-    passing = [c for c in kept if c.score >= floor]
-    below = len(kept) - len(passing)
-    passing.sort(key=lambda c: (-c.score, c.horizontal.start))
-    selected = passing[: plan.target_max]
-    selected.sort(key=lambda c: c.horizontal.start)
-
-    stats = SelectionStats(
-        mode=plan.mode,
-        candidates=len(pool),
-        selected=len(selected),
-        deduped=len(removed),
-        below_threshold=below,
-        min_score=floor,
-        target_min=plan.target_min,
-        target_max=plan.target_max,
-        vertical_ok=sum(1 for c in selected if c.vertical),
-        vertical_skipped=sum(1 for c in selected if not c.vertical),
-        reason=_selection_reason(plan, selected, below, len(removed), options),
-    )
-    reporter.selection(stats.to_dict())
-    reporter.stage(
-        "select",
-        "done",
-        1.0,
-        f"selected={stats.selected} candidates={stats.candidates} "
-        f"deduped={stats.deduped} vertical_ok={stats.vertical_ok} "
-        f"vertical_skipped={stats.vertical_skipped}",
-    )
-    reporter.log(stats.reason)
-
-    # 6. Render + legendas -----------------------------------------------------
-    out_root = job_out_dir(job_id)
-    out_root.mkdir(parents=True, exist_ok=True)
-    clips: list[dict] = []
-    reporter.stage("render", "running", 0.0, f"renderizando {len(selected)} cortes")
-    used_slugs: set[str] = set()
-    for index, candidate in enumerate(selected):
-        reporter.check_cancel()
-        candidate.slug = _unique_slug(candidate, index, used_slugs)
-        clip_dir = clip_out_dir(job_id, candidate.score, candidate.slug)
-        clip_dir.mkdir(parents=True, exist_ok=True)
-        reporter.stage(
-            "render",
-            "running",
-            index / max(1, len(selected)),
-            f"corte {index + 1}/{len(selected)} · {candidate.title[:48]}",
-        )
-        clip = _render_clip(
-            candidate=candidate,
-            clip_dir=clip_dir,
-            media=media,
-            transcript_obj=transcript_obj,
-            options=options,
-            settings=settings,
-            stats=stats,
-            reporter=reporter,
-        )
-        clips.append(clip)
-        reporter.clip(clip)
-    reporter.stage("render", "done", 1.0, f"{len(clips)} cortes renderizados")
-
-    # 7. Meta (títulos/hashtags) ----------------------------------------------
-    reporter.stage("meta", "running", 0.0, "gerando títulos e hashtags")
-    for index, (candidate, clip) in enumerate(zip(selected, clips)):
-        reporter.check_cancel()
-        reporter.stage(
-            "meta", "running", index / max(1, len(clips)), f"meta {index + 1}/{len(clips)}"
-        )
-        social = social_text(candidate, settings, options.platforms)
-        meta = build_meta(
-            candidate=candidate,
-            source_url=options.url,
-            source_title=media.title,
-            stats=stats,
-            settings=settings,
-            exports=clip["artifacts"],
-            social=social,
-            face_track_method=clip.get("face_track"),
-            captions_mode=options.captions,
-        )
-        write_meta(Path(clip["dir"]) / "meta.json", meta)
-        clip["meta"] = meta
-        clip["artifacts"]["meta"] = "meta.json"
-        reporter.clip(clip)
-    reporter.stage("meta", "done", 1.0, f"{len(clips)} meta.json escritos")
-
-    return JobResult(
-        job_id=job_id,
-        clips=clips,
-        selection=stats.to_dict(),
-        estimate=est.to_dict(),
-        source=media.to_dict(),
-    )
-
-
-def _unique_slug(candidate: Candidate, index: int, used: set[str]) -> str:
-    base = candidate.slug or slugify(candidate.title) or f"corte-{index + 1}"
-    slug = base
-    suffix = 2
-    while slug in used:
-        slug = f"{base}-{suffix}"
-        suffix += 1
-    used.add(slug)
-    return slug
-
-
-def _selection_reason(
-    plan: candidates_mod.CountPlan,
-    selected: list[Candidate],
-    below: int,
-    deduped: int,
-    options: JobOptions,
-) -> str:
-    parts = [
-        f"modo {plan.mode}: {len(selected)} cortes (alvo {plan.target_min}–{plan.target_max})"
-    ]
-    if deduped:
-        parts.append(f"{deduped} removidos por dedupe")
-    if below:
-        parts.append(f"{below} abaixo do limiar {options.min_score}")
-    if plan.mode == "count" and options.count and len(selected) < options.count:
-        parts.append(
-            f"não havia {options.count} momentos com contexto fechado acima do limiar — "
-            "entreguei só os que passaram"
-        )
-    if plan.mode == "more" and len(selected) < plan.target_min:
-        parts.append("o vídeo não tinha mais momentos fortes para dar --more")
-    return "; ".join(parts)
-
-
-def _render_clip(
-    candidate: Candidate,
-    clip_dir: Path,
-    media: download_mod.SourceMedia,
-    transcript_obj,
-    options: JobOptions,
-    settings: Settings,
-    stats: SelectionStats,
-    reporter: JobReporter,
-) -> dict:
-    burn_vertical = options.captions in {"burn", "both"}
-    sidecar = options.captions in {"sidecar", "both"}
-
-    caption_window: Window = candidate.vertical or candidate.horizontal
-    caption_paths = write_clip_captions(
-        clip_dir,
-        transcript_obj,
-        horizontal=(candidate.horizontal.start, candidate.horizontal.end),
-        vertical=(
-            (candidate.vertical.start, candidate.vertical.end) if candidate.vertical else None
+        client=client,
+        feedback_examples=feedback_examples,
+        frames_dir=paths["frames"],
+        use_vision=allowed_n > 0 or options.budget is None,
+        on_progress=lambda done, total, cand, score: reporter.advance_units(
+            "score", done, f"Avaliado {done}/{total} — {cand.title[:40]}: {score.total:.0f}"
         ),
     )
-    vertical_ass = caption_paths.get("ass_vertical")
+    best = max((s.total for _, s in scored), default=0.0)
+    reporter.finish_stage("score", f"{len(scored)} avaliados — melhor nota: {best:.0f}")
 
-    artifacts: dict[str, str] = {}
-    if sidecar:
-        artifacts["captions_srt"] = "captions.srt"
-        if vertical_ass:
-            artifacts["captions_ass"] = vertical_ass.name
+    check_cancel()
+    reporter.start_stage("select", units_total=1)
+    count_cap = options.count if options.count is not None else target_hi
+    selected, removed = _select_clips(
+        scored,
+        min_score=min_score,
+        max_score_only=options.max_score_only,
+        count_cap=count_cap,
+    )
+    summary.deduped_removed = removed
 
-    face_method: str | None = None
-    formats = set(options.formats)
-
-    if candidate.vertical and "vertical_center" in formats:
-        result = render_vertical_center(
-            media.path,
-            candidate.vertical,
-            clip_dir / "vertical_center.mp4",
-            ass_name=vertical_ass.name if (burn_vertical and vertical_ass) else None,
-            work_dir=clip_dir,
+    if not selected:
+        message = (
+            f"Nenhum candidato passou do limiar (min_score={min_score}); "
+            "qualidade > quantidade (SPEC §3). Nenhum clip exportado."
         )
-        artifacts["vertical_center"] = result.path.name
+        summary.notes.append(message)
+        reporter.finish_stage("select", message)
+        for stage in ("captions", "render", "meta"):
+            reporter.skip_stage(stage, "nenhum corte passou do limiar")
+        reporter.finish({"summary": _summary_payload(summary)}, message)
+        return summary
 
-    if candidate.vertical and "vertical_facetrack" in formats:
-        width, _height = video_size(media.path)
-        turns = speaker_timeline(
-            transcript_obj, candidate.vertical.start, candidate.vertical.end
-        )
-        tracking: TrackResult = track_faces(
-            media.path,
-            candidate.vertical.start,
-            candidate.vertical.end,
-            frame_width=width or 1280,
-            turns=turns,
-        )
-        face_method = tracking.method if tracking.available else "center_fallback"
-        if not tracking.available:
-            reporter.log(
-                "face track indisponível (MediaPipe ausente ou sem rosto): "
-                "usando center crop no vertical_facetrack",
-                "warn",
-            )
-        result = render_vertical_facetrack(
-            media.path,
-            candidate.vertical,
-            clip_dir / "vertical_facetrack.mp4",
-            tracking,
-            ass_name=vertical_ass.name if (burn_vertical and vertical_ass) else None,
-            work_dir=clip_dir,
-        )
-        artifacts["vertical_facetrack"] = result.path.name
-        face_method = result.face_track or face_method
-        for leftover in clip_dir.glob("*_track.cmd"):
-            leftover.unlink(missing_ok=True)
+    reporter.finish_stage(
+        "select",
+        f"selected={len(selected)}, candidates={summary.candidates}, deduped={removed}",
+    )
 
-    if "horizontal_16x9" in formats:
-        result = render_horizontal(
-            media.path,
-            candidate.horizontal,
-            clip_dir / "horizontal_16x9.mp4",
-            ass_name="captions_16x9.ass" if options.captions == "burn" else None,
-            work_dir=clip_dir,
-        )
-        artifacts["horizontal_16x9"] = result.path.name
+    slugs = _unique_slugs(selected)
+    reporter.register_clips(
+        [
+            ClipProgress(slug=slugs[cand.id], score=round(score.total), status="pending")
+            for cand, score in selected
+        ]
+    )
 
-    poster_at = caption_window.start + min(2.0, caption_window.duration / 2)
+    check_cancel()
+    speaker_method = _ensure_diarization_method(audio_path, settings, paths, client=client)
+
+    selection_meta = {
+        "mode": "count" if options.count is not None else ("more" if options.more else "auto"),
+        "candidates": summary.candidates,
+        "selected": len(selected),
+        "min_score": min_score,
+    }
+
+    # As três fases por clipe são separadas para que a UI mostre um estágio de
+    # cada vez e para que render e textos rodem em paralelo controlado.
+    check_cancel()
+    reporter.start_stage("captions", units_total=len(selected))
+    captions_by_clip: dict[str, dict[str, Any]] = {}
+    for i, (candidate, score) in enumerate(selected, 1):
+        clip_dir = out_clip_dir(settings.out_dir, round(score.total), slugs[candidate.id])
+        captions_by_clip[candidate.id] = _build_clip_captions(
+            candidate, transcript, clip_dir, options
+        )
+        reporter.advance_units("captions", i, f"Legendas {i}/{len(selected)} — {slugs[candidate.id]}")
+    reporter.finish_stage("captions", f"Legendas prontas para {len(selected)} cortes")
+
+    check_cancel()
+    _render_selected(
+        selected,
+        slugs=slugs,
+        captions_by_clip=captions_by_clip,
+        video_path=video_path,
+        settings=settings,
+        options=options,
+        reporter=reporter,
+    )
+
+    check_cancel()
+    selected_index = _write_selected_meta(
+        selected,
+        slugs=slugs,
+        source_url=source_url,
+        settings=settings,
+        options=options,
+        selection_meta=selection_meta,
+        speaker_method=speaker_method,
+        client=client,
+        reporter=reporter,
+        summary=summary,
+    )
+
+    write_selected_index(settings.work_dir, job_id, selected_index)
+    summary.selected = len(selected)
+    summary.notes.append(
+        f"selected={summary.selected}, candidates={summary.candidates}, "
+        f"deduped={summary.deduped_removed}, vertical_ok={summary.vertical_ok}, "
+        f"vertical_skipped={summary.vertical_skipped}"
+    )
+    reporter.finish(
+        {"summary": _summary_payload(summary)},
+        f"{summary.selected} cortes prontos em {settings.out_dir}/",
+    )
+    return summary
+
+
+def _summary_payload(summary: JobSummary) -> dict[str, Any]:
+    return {
+        "job_id": summary.job_id,
+        "candidates": summary.candidates,
+        "selected": summary.selected,
+        "deduped_removed": summary.deduped_removed,
+        "vertical_ok": summary.vertical_ok,
+        "vertical_skipped": summary.vertical_skipped,
+        "min_score": summary.min_score,
+        "dry_run": summary.dry_run,
+        "cost_estimate": summary.cost_estimate,
+        "notes": list(summary.notes),
+        "clips": list(summary.clips),
+        "out_dirs": [c["out_dir"] for c in summary.clips],
+    }
+
+
+def _unique_slugs(selected: list[tuple[Candidate, Score]]) -> dict[str, str]:
+    """Slug único por clipe: dois momentos podem gerar o mesmo título."""
+    seen: dict[str, int] = {}
+    mapping: dict[str, str] = {}
+    for candidate, _score in selected:
+        base = slugify(candidate.title)
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        mapping[candidate.id] = base if count == 0 else f"{base}-{count + 1}"
+    return mapping
+
+
+def _seed_duration_estimate(url: str, reporter: ProgressReporter) -> None:
     try:
-        render_poster(media.path, poster_at, clip_dir / "poster.jpg")
-        artifacts["poster"] = "poster.jpg"
-    except Exception:
+        info = probe_metadata(url)
+        if info.get("duration"):
+            reporter.set_source_minutes(float(info["duration"]) / 60.0)
+    except Exception:  # noqa: BLE001 - metadados são só um chute inicial do ETA
         pass
 
-    if not sidecar:
-        (clip_dir / "captions.srt").unlink(missing_ok=True)
-        if vertical_ass:
-            vertical_ass.unlink(missing_ok=True)
-    (clip_dir / "captions_16x9.ass").unlink(missing_ok=True)
+
+def _render_selected(
+    selected: list[tuple[Candidate, Score]],
+    *,
+    slugs: dict[str, str],
+    captions_by_clip: dict[str, dict[str, Any]],
+    video_path: Path,
+    settings: Settings,
+    options: RunOptions,
+    reporter: ProgressReporter,
+) -> None:
+    """Renderiza todos os formatos de todos os clipes, com progresso por clipe."""
+    want_face = "face" in options.formats
+    want_center = "9x16" in options.formats
+    want_horizontal = "16x9" in options.formats
+
+    units = 0
+    for candidate, _score in selected:
+        if want_horizontal:
+            units += 1
+        if candidate.window_9x16 is not None:
+            units += int(want_center) + int(want_face)
+    reporter.start_stage("render", units_total=max(1, units))
+
+    def render_one(candidate: Candidate, score: Score) -> None:
+        slug = slugs[candidate.id]
+        clip_dir = out_clip_dir(settings.out_dir, round(score.total), slug)
+        caption_paths = captions_by_clip.get(candidate.id, {})
+        reporter.update_clip(slug, status="running", message="Renderizando…")
+
+        if candidate.window_9x16 is None:
+            reporter.update_clip(
+                slug,
+                vertical_skipped=candidate.vertical_skip_reason or "context_exceeds_90s",
+                message="Contexto passa de 90s — só 16:9",
+            )
+
+        if want_horizontal:
+            _render_format(
+                reporter,
+                slug,
+                "horizontal_16x9",
+                lambda: render_mod.render_horizontal_16x9(
+                    video_path,
+                    candidate.window_16x9,
+                    clip_dir / "horizontal_16x9.mp4",
+                    ass_path=caption_paths.get("ass_16x9"),
+                ),
+            )
+
+        if candidate.window_9x16 is not None:
+            if want_center:
+                _render_format(
+                    reporter,
+                    slug,
+                    "vertical_center",
+                    lambda: render_mod.render_vertical_center(
+                        video_path,
+                        candidate.window_9x16,
+                        clip_dir / "vertical_center.mp4",
+                        ass_path=caption_paths.get("ass_9x16"),
+                    ),
+                )
+            if want_face:
+                _render_format(
+                    reporter,
+                    slug,
+                    "vertical_facetrack",
+                    lambda: face_track_mod.render_vertical_facetrack(
+                        video_path,
+                        candidate.window_9x16,
+                        clip_dir / "vertical_facetrack.mp4",
+                        ass_path=caption_paths.get("ass_9x16"),
+                    ),
+                )
+
+        reporter.update_clip(slug, status="done", message="Renderizado")
+
+    # ffmpeg e MediaPipe já saturam CPU; render_workers baixo evita swap no i5.
+    workers = max(1, min(settings.render_workers, len(selected)))
+    if workers == 1:
+        for candidate, score in selected:
+            render_one(candidate, score)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(render_one, candidate, score): candidate
+                for candidate, score in selected
+            }
+            for future in as_completed(futures):
+                future.result()
+
+    reporter.finish_stage(
+        "render", f"{reporter.clips_done}/{len(selected)} cortes renderizados"
+    )
+
+
+def _render_format(
+    reporter: ProgressReporter, slug: str, format_name: str, action: Callable[[], Any]
+) -> None:
+    reporter.update_clip(slug, format_name=format_name, format_status="running")
+    try:
+        action()
+    except Exception as exc:  # noqa: BLE001 - um formato quebrado não mata o clipe
+        reporter.update_clip(
+            slug, format_name=format_name, format_status="error", message=str(exc)[:120]
+        )
+    else:
+        reporter.update_clip(slug, format_name=format_name, format_status="done")
+    finally:
+        stage = reporter.stages["render"]
+        reporter.advance_units(
+            "render",
+            min(stage.units_total, stage.units_done + 1),
+            f"Renderizando… {int(stage.units_done) + 1}/{int(stage.units_total)} arquivos",
+        )
+
+
+def _write_selected_meta(
+    selected: list[tuple[Candidate, Score]],
+    *,
+    slugs: dict[str, str],
+    source_url: str,
+    settings: Settings,
+    options: RunOptions,
+    selection_meta: dict[str, Any],
+    speaker_method: str,
+    client: OpenRouterClient,
+    reporter: ProgressReporter,
+    summary: JobSummary,
+) -> list[dict[str, Any]]:
+    """Gera títulos/hashtags e escreve meta.json de cada clipe (SPEC §10)."""
+    reporter.start_stage("meta", units_total=len(selected))
+
+    def build(candidate: Candidate, score: Score) -> dict[str, Any]:
+        return _write_clip_meta(
+            candidate,
+            score,
+            slug=slugs[candidate.id],
+            source_url=source_url,
+            settings=settings,
+            selection_meta=selection_meta,
+            speaker_method=speaker_method,
+            client=client,
+        )
+
+    results: dict[str, dict[str, Any]] = {}
+    workers = max(1, min(settings.network_workers, len(selected)))
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(build, c, s): c for c, s in selected}
+        for future in as_completed(futures):
+            candidate = futures[future]
+            results[candidate.id] = future.result()
+            done += 1
+            reporter.advance_units(
+                "meta", done, f"Textos {done}/{len(selected)} — {slugs[candidate.id]}"
+            )
+
+    reporter.finish_stage("meta", f"Títulos e hashtags prontos para {len(selected)} cortes")
+
+    selected_index: list[dict[str, Any]] = []
+    for candidate, _score in selected:
+        clip_info = results[candidate.id]
+        selected_index.append(clip_info)
+        summary.clips.append(clip_info)
+        if clip_info["vertical_skipped"]:
+            summary.vertical_skipped += 1
+        else:
+            summary.vertical_ok += 1
+    return selected_index
+
+
+def candidates_pool_hint(target_hi: int) -> int:
+    from .candidates import candidate_pool_size
+
+    return candidate_pool_size(target_hi)
+
+
+def _build_clip_captions(
+    candidate: Candidate,
+    transcript: Transcript,
+    clip_dir: Path,
+    options: RunOptions,
+) -> dict[str, Any]:
+    """Escreve SRT (sidecar) e ASS (burn-in) do clipe — SPEC §10, §14.5.
+
+    Roda antes do render porque o burn-in consome o .ass gerado aqui.
+    """
+    words = transcript.all_words()
+    burn_in = options.captions in ("burn", "both")
+    paths: dict[str, Any] = {}
+
+    def cues_for(start: float, end: float):
+        if words:
+            return subtitles_mod.build_cues_from_words(words, start, end)
+        return subtitles_mod.build_cues_from_segments(transcript.segments, start, end)
+
+    cues_16x9 = cues_for(candidate.window_16x9.start, candidate.window_16x9.end)
+    subtitles_mod.write_srt(cues_16x9, clip_dir / "captions.srt")
+    if burn_in:
+        ass_16x9 = clip_dir / "captions_16x9.ass"
+        subtitles_mod.write_ass(
+            cues_16x9, ass_16x9, *render_mod.HORIZONTAL_SIZE, is_vertical=False
+        )
+        paths["ass_16x9"] = ass_16x9
+
+    if candidate.window_9x16 is not None:
+        cues_9x16 = cues_for(candidate.window_9x16.start, candidate.window_9x16.end)
+        subtitles_mod.write_srt(cues_9x16, clip_dir / "captions_9x16.srt")
+        if burn_in:
+            ass_9x16 = clip_dir / "captions_9x16.ass"
+            subtitles_mod.write_ass(
+                cues_9x16, ass_9x16, *render_mod.VERTICAL_SIZE, is_vertical=True
+            )
+            paths["ass_9x16"] = ass_9x16
+
+    return paths
+
+
+def _write_clip_meta(
+    candidate: Candidate,
+    score: Score,
+    *,
+    slug: str,
+    source_url: str,
+    settings: Settings,
+    selection_meta: dict[str, Any],
+    speaker_method: str,
+    client: OpenRouterClient,
+) -> dict[str, Any]:
+    """Gera os textos sociais e grava meta.json (SPEC §7)."""
+    clip_dir = out_clip_dir(settings.out_dir, round(score.total), slug)
+
+    vertical_skipped = candidate.vertical_skip_reason
+    if candidate.window_9x16 is None and vertical_skipped is None:
+        vertical_skipped = "context_exceeds_90s"
+
+    try:
+        social_copy = meta_mod.generate_social_copy(candidate, settings, client=client)
+    except Exception:  # noqa: BLE001 - o job não pode travar por causa de copy
+        social_copy = {"youtube": {}, "tiktok": {}}
+
+    meta_dict = meta_mod.build_meta(
+        source_url=source_url,
+        candidate=candidate,
+        score=score,
+        window_9x16=candidate.window_9x16,
+        window_16x9=candidate.window_16x9,
+        vertical_skipped=vertical_skipped,
+        selection=selection_meta,
+        social_copy=social_copy,
+        speaker_matching_method=speaker_method,
+    )
+    write_json(clip_dir / "meta.json", meta_dict)
 
     return {
-        "slug": candidate.slug,
-        "dir": str(clip_dir),
-        "title": candidate.title,
-        "score": candidate.score,
-        "breakdown": candidate.breakdown.to_dict(),
-        "reason": candidate.reason,
-        "context_complete": candidate.context_complete,
-        "boundary_method": candidate.horizontal.method,
-        "transcript_text": candidate.transcript_text,
-        "windows": {
-            "horizontal_16x9": candidate.horizontal.to_dict(),
-            "vertical_9x16": candidate.vertical.to_dict() if candidate.vertical else None,
-        },
-        "vertical_skipped": candidate.vertical_skipped,
-        "face_track": face_method,
-        "artifacts": artifacts,
-        "created_at": time.time(),
+        "slug": slug,
+        "score": round(score.total),
+        "reason": score.reason,
+        "out_dir": str(clip_dir),
+        "vertical_skipped": vertical_skipped,
     }

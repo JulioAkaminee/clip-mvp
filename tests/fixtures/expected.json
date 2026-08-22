@@ -1,33 +1,7 @@
 {
-  "descricao": "Expectativas mínimas da fixture BR (SPEC 14.8). Rode com `clip test` ou `pytest`.",
-  "fonte": {
-    "arquivo_local": "tests/fixtures/demo_480s.mp4",
-    "como_gerar": "ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=24:duration=480 -f lavfi -i sine=frequency=220:duration=480 -c:v libx264 -preset ultrafast -crf 30 -pix_fmt yuv420p -c:a aac -shortest tests/fixtures/demo_480s.mp4",
-    "observacao": "Sem OPENROUTER_API_KEY o pipeline usa a transcrição sintética PT-BR de src/clip_mvp/demo.py, o que mantém o teste determinístico e offline. Com chave, troque por uma URL de podcast BR curto.",
-    "url_opcional": ""
-  },
-  "expectativas": {
-    "min_clips_com_contexto_fechado": 1,
-    "min_clips_9x16_ate_90s": 1,
-    "vertical_max_s": 90,
-    "pad_min_ms": 200,
-    "pad_max_ms": 400,
-    "proibido_corte_no_meio_de_palavra": true,
-    "artefatos_por_corte": [
-      "horizontal_16x9.mp4",
-      "vertical_center.mp4",
-      "vertical_facetrack.mp4",
-      "captions.srt",
-      "meta.json"
-    ],
-    "meta_json_obrigatorio": [
-      "score",
-      "breakdown",
-      "windows",
-      "context_complete",
-      "selection",
-      "youtube",
-      "tiktok"
-    ]
-  }
+  "description": "Expectativas minimas para o fixture BR (transcript_pt_br.json + sample_video.mp4), SPEC \u00a714.8.",
+  "min_candidates_context_complete": 1,
+  "requires_at_least_one_vertical_9x16_le_90s": true,
+  "max_vertical_9x16_duration_s": 90,
+  "no_mid_word_cuts": true
 }

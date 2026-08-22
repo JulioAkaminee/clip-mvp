@@ -1,333 +1,279 @@
-"""CLI (SPEC 11).
-
-    clip "URL"                       # auto
-    clip "URL" --more
-    clip "URL" --count 12
-    clip "URL" --dry-run --budget 2
-    clip resume <job_id> --more
-    clip rate <job_id> <slug> good
-    clip serve                       # API + UI web local
-"""
+"""CLI (typer) do clip-mvp — SPEC §11, §12 passo 1."""
 
 from __future__ import annotations
 
-import json
 import sys
-import time
 from pathlib import Path
+from typing import Optional
 
 import typer
+from rich.console import Console
 
-from .config import ALL_FORMATS, DEFAULT_MIN_SCORE, VERSION, get_settings
-from .feedback import load_ratings, rate as rate_clip
-from .jobstate import JobRecord, StateReporter, create_record
-from .pipeline import JobOptions, run_job
-from .paths import job_out_dir
+from .config import get_settings
+from .console import make_progress_sink
+from .feedback import rate_clip as _rate_clip
+from .models import Window
+from .pipeline import JobCanceled, RunOptions, make_reporter, resume_job, run_job
+from .progress import format_duration
 
-cli = typer.Typer(
-    add_completion=False,
-    help="Cortes automáticos de vídeos longos (YouTube Shorts / TikTok / 16:9).",
-    no_args_is_help=True,
+app = typer.Typer(
+    name="clip",
+    help="Cortes automáticos a partir de link (YouTube/Twitch/etc), com IA via OpenRouter.",
+    no_args_is_help=False,
 )
+console = Console()
 
-FORMAT_ALIASES = {
-    "face": "vertical_facetrack",
-    "facetrack": "vertical_facetrack",
-    "9x16": "vertical_center",
-    "vertical": "vertical_center",
-    "center": "vertical_center",
-    "16x9": "horizontal_16x9",
-    "horizontal": "horizontal_16x9",
-}
+_KNOWN_COMMANDS = {"run", "resume", "rate", "status", "serve", "test", "cut", "--help", "-h"}
 
 
-class ConsoleReporter(StateReporter):
-    """Progresso legível no terminal + `work/<job>/job.json` para a UI web."""
-
-    def __init__(self, record: JobRecord, verbose: bool = False):
-        super().__init__(record)
-        self.verbose = verbose
-        self._last_stage = ""
-
-    def stage(self, key, status="running", progress=None, message=""):
-        super().stage(key, status, progress, message)
-        if status == "running" and key == self._last_stage and not self.verbose:
-            if progress is not None:
-                bar = _bar(progress)
-                typer.echo(f"\r  {bar} {message[:70]:<70}", nl=False)
-            return
-        if self._last_stage and key != self._last_stage:
-            typer.echo("")
-        self._last_stage = key
-        icon = {"running": "▶", "done": "✓", "skipped": "–", "error": "✗"}.get(status, "·")
-        typer.echo(f"{icon} {key}: {message}")
-
-    def log(self, message, level="info"):
-        super().log(message, level)
-        if level == "debug" and not self.verbose:
-            return
-        prefix = {"warn": "! ", "error": "✗ ", "debug": "· "}.get(level, "  ")
-        typer.echo(f"{prefix}{message}")
-
-    def estimate(self, estimate):
-        super().estimate(estimate)
-        typer.echo(
-            f"  custo estimado: US$ {estimate['total_usd']:.3f}"
-            + (
-                f" (orçamento US$ {estimate['budget_usd']:.2f})"
-                if estimate.get("budget_usd")
-                else ""
-            )
-        )
-
-    def selection(self, stats):
-        super().selection(stats)
-        typer.echo(
-            f"  selected={stats['selected']} candidates={stats['candidates']} "
-            f"deduped={stats['deduped']} vertical_ok={stats['vertical_ok']} "
-            f"vertical_skipped={stats['vertical_skipped']}"
-        )
-
-    def clip(self, clip):
-        super().clip(clip)
-        if self.verbose:
-            typer.echo(f"  → {clip['score']:>3} {clip['slug']}")
+def _parse_formats(value: str) -> list[str]:
+    return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def _bar(progress: float, width: int = 18) -> str:
-    filled = int(max(0.0, min(1.0, progress)) * width)
-    return "[" + "█" * filled + "·" * (width - filled) + "]"
+def _print_summary(summary, *, elapsed: float | None = None) -> None:
+    console.print(f"[bold]job_id[/bold]: {summary.job_id}")
+    if summary.dry_run:
+        console.print("[yellow]--dry-run[/yellow]: estimativa de custo (nenhuma chamada cara foi feita)")
+        if summary.cost_estimate:
+            console.print(summary.cost_estimate)
+        return
+    if elapsed is not None:
+        console.print(f"[bold green]Pronto em {format_duration(elapsed)}[/bold green]")
+    if summary.budget_warning:
+        console.print(f"[yellow]{summary.budget_warning}[/yellow]")
+    for note in summary.notes:
+        console.print(f"- {note}")
+    for clip in summary.clips:
+        skip = f" (vertical_skipped={clip['vertical_skipped']})" if clip["vertical_skipped"] else ""
+        console.print(f"  [green]{clip['score']}[/green] {clip['slug']}{skip} -> {clip['out_dir']}")
 
 
-def _parse_formats(raw: str) -> tuple[str, ...]:
-    formats: list[str] = []
-    for token in raw.split(","):
-        token = token.strip().lower()
-        if not token:
-            continue
-        name = FORMAT_ALIASES.get(token, token)
-        if name not in ALL_FORMATS:
-            raise typer.BadParameter(f"formato desconhecido: {token}")
-        if name not in formats:
-            formats.append(name)
-    if not formats:
-        raise typer.BadParameter("escolha pelo menos um formato")
-    return tuple(formats)
-
-
-def _execute(record: JobRecord, verbose: bool):
-    """Roda o pipeline mantendo `job.json` coerente para a UI web."""
-    reporter = ConsoleReporter(record, verbose=verbose)
-    record.status = "running"
-    record.started_at = time.time()
-    record.save()
+def _run_with_progress(runner, settings, job_id: str, *, quiet: bool, plain: bool):
+    """Executa um job desenhando o progresso ao vivo (barra, estágios, ETA)."""
+    reporter = make_reporter(settings, job_id)
+    sink = make_progress_sink(quiet=quiet, plain=plain)
+    reporter.add_sink(sink)
+    sink.start()
     try:
-        result = run_job(record.id, record.options, reporter)
-    except Exception as exc:  # noqa: BLE001
-        record.status = "error"
-        record.error = str(exc) or exc.__class__.__name__
-        record.finished_at = time.time()
-        record.save()
-        typer.echo("")
-        typer.secho(f"erro: {record.error}", fg=typer.colors.RED)
-        raise typer.Exit(code=1) from exc
-    record.status = "done"
-    record.finished_at = time.time()
-    record.clips = result.clips or record.clips
-    record.selection = result.selection or record.selection
-    record.estimate = result.estimate or record.estimate
-    record.source = result.source or record.source
-    record.save()
-    return result
+        summary = runner(reporter)
+    except JobCanceled:
+        sink.stop()
+        console.print("[yellow]Job cancelado.[/yellow]")
+        raise typer.Exit(code=130)
+    except Exception as exc:  # noqa: BLE001 - erro precisa virar mensagem, não stack trace
+        sink.stop()
+        error = reporter.snapshot().get("error") or {}
+        console.print(f"\n[red]Erro em {error.get('stage_label', '?')}:[/red] {exc}")
+        if error.get("hint"):
+            console.print(f"[yellow]{error['hint']}[/yellow]")
+        console.print(f"[blue]job_id:[/blue] {job_id}")
+        raise typer.Exit(code=1)
+    sink.stop()
+    _print_summary(summary, elapsed=reporter.snapshot().get("elapsed_seconds"))
+    return summary
 
 
-@cli.command("run")
-def run(
-    url: str = typer.Argument(..., help="URL do vídeo (ou caminho de arquivo local)"),
-    more: bool = typer.Option(False, "--more", help="~+50% cortes vs. o auto"),
-    count: int | None = typer.Option(None, "--count", help="Força até N cortes"),
-    min_score: int = typer.Option(DEFAULT_MIN_SCORE, "--min-score", help="Limiar de score"),
-    max_score_only: int | None = typer.Option(
-        None, "--max-score-only", help="Só cortes com score >= N"
+@app.command("run")
+def run_cmd(
+    url: str = typer.Argument(..., help="URL do vídeo-fonte (YouTube/Twitch/etc)."),
+    more: bool = typer.Option(False, "--more", help="Pede ~+50% de cortes vs. o auto."),
+    count: Optional[int] = typer.Option(None, "--count", help="Força até N cortes (sujeito ao limiar)."),
+    min_score: Optional[float] = typer.Option(None, "--min-score", help="Afrouxa/aperta o limiar (default 60)."),
+    max_score_only: Optional[float] = typer.Option(
+        None, "--max-score-only", help="Só clips com score >= valor informado."
     ),
-    formats: str = typer.Option("face,9x16,16x9", "--formats"),
+    formats: str = typer.Option("face,9x16,16x9", "--formats", help="Subconjunto de: face,9x16,16x9."),
     captions: str = typer.Option("both", "--captions", help="burn|sidecar|both"),
-    platforms: str = typer.Option("yt,tiktok", "--platforms"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Só estima custo OpenRouter"),
-    budget: float | None = typer.Option(None, "--budget", help="Teto de custo em USD"),
-    demo: bool = typer.Option(False, "--demo", help="Roda sem OpenRouter (dados sintéticos)"),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    platforms: str = typer.Option("yt,tiktok", "--platforms", help="Subconjunto de: yt,tiktok"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Estima custo OpenRouter e para antes do passo caro."),
+    budget: Optional[float] = typer.Option(None, "--budget", help="Orçamento em USD; reduz candidatos ou aborta."),
+    quiet: bool = typer.Option(False, "--quiet", help="Sem barra de progresso."),
+    plain: bool = typer.Option(False, "--plain", help="Progresso em linhas simples (bom para log/CI)."),
 ) -> None:
-    """Roda o pipeline completo em uma URL."""
-    options = JobOptions(
-        url=url,
-        mode="count" if count else ("more" if more else "auto"),
+    """Roda o pipeline completo para uma URL nova (SPEC §11)."""
+    from .utils import make_job_id
+
+    settings = get_settings()
+    options = RunOptions(
+        more=more,
         count=count,
         min_score=min_score,
         max_score_only=max_score_only,
         formats=_parse_formats(formats),
         captions=captions,
-        platforms=tuple(p.strip() for p in platforms.split(",") if p.strip()),
+        platforms=_parse_formats(platforms),
         dry_run=dry_run,
-        budget_usd=budget,
-        demo=demo or None,
+        budget=budget,
     )
-    record = create_record(options)
-    job_id = record.id
-    typer.echo(f"job {job_id}")
-    result = _execute(record, verbose)
-    typer.echo("")
-    if result.dry_run:
-        typer.secho("dry-run: nada foi baixado nem renderizado.", fg=typer.colors.YELLOW)
-        raise typer.Exit(code=0)
-    typer.secho(
-        f"{len(result.clips)} cortes em {job_out_dir(job_id)}", fg=typer.colors.GREEN
+    job_id = make_job_id(url)
+    _run_with_progress(
+        lambda reporter: run_job(url, settings, options, reporter=reporter),
+        settings,
+        job_id,
+        quiet=quiet,
+        plain=plain,
     )
-    for clip in result.clips:
-        vertical = clip["windows"].get("vertical_9x16")
-        vertical_info = (
-            f"9:16 {vertical['duration_s']:.0f}s"
-            if vertical
-            else f"9:16 descartado ({clip.get('vertical_skipped')})"
-        )
-        typer.echo(
-            f"  {clip['score']:>3}  {clip['slug']}  "
-            f"16:9 {clip['windows']['horizontal_16x9']['duration_s']:.0f}s · {vertical_info}"
-        )
 
 
-@cli.command("resume")
-def resume(
-    job_id: str = typer.Argument(..., help="ID do job em work/"),
+@app.command("resume")
+def resume_cmd(
+    job_id: str = typer.Argument(..., help="job_id retornado por uma execução anterior."),
     more: bool = typer.Option(False, "--more"),
-    count: int | None = typer.Option(None, "--count"),
-    min_score: int | None = typer.Option(None, "--min-score"),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    count: Optional[int] = typer.Option(None, "--count"),
+    min_score: Optional[float] = typer.Option(None, "--min-score"),
+    max_score_only: Optional[float] = typer.Option(None, "--max-score-only"),
+    formats: str = typer.Option("face,9x16,16x9", "--formats"),
+    captions: str = typer.Option("both", "--captions"),
+    platforms: str = typer.Option("yt,tiktok", "--platforms"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    budget: Optional[float] = typer.Option(None, "--budget"),
+    quiet: bool = typer.Option(False, "--quiet"),
+    plain: bool = typer.Option(False, "--plain"),
 ) -> None:
-    """Re-roda um job usando transcrição/scores já em `work/<job_id>/`."""
-    record = JobRecord.load(job_id)
-    if record is None:
-        source_path = get_settings().work_dir / job_id / "source.json"
-        if not source_path.exists():
-            typer.secho(f"job {job_id} não encontrado em work/", fg=typer.colors.RED)
-            raise typer.Exit(code=1)
-        data = json.loads(source_path.read_text(encoding="utf-8"))
-        record = JobRecord(id=job_id, options=JobOptions(url=data.get("url", "")))
-
-    record.options.mode = "count" if count else ("more" if more else "auto")
-    record.options.count = count
-    record.options.dry_run = False
-    if min_score is not None:
-        record.options.min_score = min_score
-    record.clips = []
-    record.selection = None
-    record.error = None
-    record.resumed_from = job_id
-    record.reset_stages()
-    typer.echo(f"resume {job_id} (modo {record.options.mode})")
-    result = _execute(record, verbose)
-    typer.echo("")
-    typer.secho(f"{len(result.clips)} cortes em {job_out_dir(job_id)}", fg=typer.colors.GREEN)
+    """Reusa transcrição + candidatos já em work/<job_id>/ (sem re-download) — SPEC §3."""
+    settings = get_settings()
+    options = RunOptions(
+        more=more,
+        count=count,
+        min_score=min_score,
+        max_score_only=max_score_only,
+        formats=_parse_formats(formats),
+        captions=captions,
+        platforms=_parse_formats(platforms),
+        dry_run=dry_run,
+        budget=budget,
+    )
+    _run_with_progress(
+        lambda reporter: resume_job(job_id, settings, options, reporter=reporter),
+        settings,
+        job_id,
+        quiet=quiet,
+        plain=plain,
+    )
 
 
-@cli.command("rate")
-def rate(
+@app.command("rate")
+def rate_cmd(
     job_id: str = typer.Argument(...),
     clip_slug: str = typer.Argument(...),
     verdict: str = typer.Argument(..., help="good|bad"),
-    note: str = typer.Option("", "--note"),
+    note: Optional[str] = typer.Option(None, "--note"),
 ) -> None:
-    """Marca um corte como good/bad (vira few-shot nos próximos prompts)."""
-    if verdict not in {"good", "bad"}:
-        raise typer.BadParameter("verdict deve ser good ou bad")
-    score, title, reason = 0, clip_slug, ""
-    for meta_path in job_out_dir(job_id).glob(f"*_{clip_slug}/meta.json"):
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        score = int(meta.get("score") or 0)
-        title = meta.get("title") or clip_slug
-        reason = meta.get("reason") or ""
-        break
-    rate_clip(
-        job_id=job_id,
-        clip_slug=clip_slug,
-        verdict=verdict,
-        score=score,
-        reason=reason,
-        title=title,
-        note=note,
-    )
-    typer.secho(f"feedback salvo: {clip_slug} = {verdict}", fg=typer.colors.GREEN)
+    """`clip rate <job_id> <clip_slug> good|bad` — feedback few-shot (SPEC §14.7)."""
+    if verdict not in ("good", "bad"):
+        console.print("[red]verdict deve ser 'good' ou 'bad'[/red]")
+        raise typer.Exit(code=1)
+    settings = get_settings()
+    record = _rate_clip(settings.work_dir, job_id, clip_slug, verdict, note=note or "")
+    console.print(f"Feedback registrado: {record}")
 
 
-@cli.command("feedback")
-def feedback(limit: int = typer.Option(20, "--limit")) -> None:
-    """Lista os últimos veredictos gravados."""
-    ratings = load_ratings(limit=limit)
-    if not ratings:
-        typer.echo("sem feedback ainda (use `clip rate`)")
-        return
-    for entry in ratings:
-        mark = "+" if entry.verdict == "good" else "-"
-        typer.echo(f"{mark} {entry.job_id} {entry.clip_slug} (score {entry.score}) {entry.note}")
-
-
-@cli.command("serve")
-def serve(
-    host: str = typer.Option("127.0.0.1", "--host"),
-    port: int = typer.Option(8000, "--port"),
-    reload: bool = typer.Option(False, "--reload"),
+@app.command("status")
+def status_cmd(
+    job_id: Optional[str] = typer.Argument(None, help="job_id; vazio lista os últimos jobs."),
+    watch: bool = typer.Option(False, "--watch", help="Acompanha até o job terminar."),
 ) -> None:
-    """Sobe a API + UI web local."""
-    import uvicorn
+    """Mostra estágio, percentual e minutos restantes de um job (SPEC §11)."""
+    import json
+    import time
 
     settings = get_settings()
-    dist = settings.root / "web" / "dist"
-    typer.echo(f"clip-mvp {VERSION} → http://{host}:{port}")
-    if not (dist / "index.html").exists():
-        typer.secho(
-            "UI não buildada: rode `cd web && npm install && npm run build` "
-            "(ou `npm run dev` para hot reload em :5173).",
-            fg=typer.colors.YELLOW,
+    work_dir = Path(settings.work_dir)
+
+    if job_id is None:
+        if not work_dir.exists():
+            console.print("Nenhum job em work/.")
+            return
+        for path in sorted(work_dir.iterdir(), reverse=True)[:20]:
+            status_path = path / "status.json"
+            if not status_path.is_file():
+                continue
+            data = json.loads(status_path.read_text("utf-8"))
+            console.print(
+                f"{data['job_id']}  {data['status']:9} {data['percent']:5.1f}%  "
+                f"{data['stage_label']}"
+            )
+        return
+
+    status_path = work_dir / job_id / "status.json"
+    while True:
+        if not status_path.is_file():
+            console.print(f"[yellow]job {job_id} ainda não registrou progresso[/yellow]")
+            raise typer.Exit(code=1)
+        data = json.loads(status_path.read_text("utf-8"))
+        console.print(
+            f"{data['percent']:5.1f}%  {data['stage_label']}  {data['eta_text']}  "
+            f"({data['clips_done']}/{data['clips_total']} cortes)"
         )
-    uvicorn.run(
-        "clip_mvp.api.app:get_app",
-        host=host,
-        port=port,
-        reload=reload,
-        factory=True,
-        log_level="info",
-    )
+        if not watch or data["status"] in {"done", "error", "canceled"}:
+            if data["status"] == "error" and data.get("error"):
+                console.print(f"[red]{data['error']['message']}[/red]")
+                console.print(f"[yellow]{data['error'].get('hint', '')}[/yellow]")
+            break
+        time.sleep(2)
 
 
-@cli.command("test")
-def test_fixture(
-    path: Path = typer.Option(
-        None, "--fixture", help="Vídeo local de teste (default: tests/fixtures/expected.json)"
-    ),
+@app.command("serve")
+def serve_cmd(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port"),
 ) -> None:
-    """Roda a fixture BR e valida as expectativas mínimas (SPEC 14.8)."""
-    import subprocess
+    """Sobe a API + UI web com progresso ao vivo e minutos restantes."""
+    try:
+        import uvicorn
+    except ImportError:
+        console.print(
+            "[red]Instale os extras da API:[/red] pip install 'fastapi>=0.111' 'uvicorn>=0.30'"
+        )
+        raise typer.Exit(code=1)
 
-    root = get_settings().root
-    cmd = [sys.executable, "-m", "pytest", "-q", str(root / "tests")]
-    if path:
-        cmd.extend(["--fixture-video", str(path)])
-    raise typer.Exit(code=subprocess.call(cmd, cwd=root))
+    from .server import WEB_DIST, create_app
+
+    settings = get_settings()
+    console.print(f"[bold green]UI em http://{host}:{port}[/bold green]")
+    if not (WEB_DIST / "index.html").is_file():
+        console.print(
+            "[yellow]UI não buildada:[/yellow] rode "
+            "[bold]cd web && npm install && npm run build[/bold] "
+            "(ou [bold]npm run dev[/bold] para hot reload em :5173)."
+        )
+    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
 
 
-@cli.command("version")
-def version() -> None:
-    typer.echo(VERSION)
+@app.command("cut")
+def cut_cmd(
+    video: Path = typer.Argument(..., help="Caminho do vídeo local."),
+    start: float = typer.Argument(...),
+    end: float = typer.Argument(...),
+    out: Path = typer.Argument(...),
+) -> None:
+    """Corte manual por timestamp (utilitário de baixo nível, SPEC §12 passo 1)."""
+    from .render import cut_raw
+
+    cut_raw(video, Window(start=start, end=end), out)
+    console.print(f"Cortado: {out}")
+
+
+@app.command("test")
+def test_cmd() -> None:
+    """Roda a suíte de testes (pytest) usando as fixtures BR (SPEC §14.8)."""
+    import pytest
+
+    repo_root = Path(__file__).resolve().parents[2]
+    code = pytest.main([str(repo_root / "tests"), "-q"])
+    raise typer.Exit(code=code)
 
 
 def main() -> None:
-    """`clip "URL"` funciona sem digitar `run`."""
-    argv = sys.argv[1:]
-    known = {"run", "resume", "rate", "feedback", "serve", "test", "version", "--help", "-h"}
-    if argv and argv[0] not in known and not argv[0].startswith("-"):
-        sys.argv.insert(1, "run")
-    cli()
+    """Entrypoint do console script `clip`. Permite tanto `clip "URL"`
+    (equivalente a `clip run "URL"`) quanto os subcomandos explícitos
+    (`resume`, `rate`, `test`, `cut`) — SPEC §11."""
+    args = sys.argv[1:]
+    if args and args[0] not in _KNOWN_COMMANDS and not args[0].startswith("-"):
+        args = ["run", *args]
+        sys.argv = [sys.argv[0], *args]
+    app()
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

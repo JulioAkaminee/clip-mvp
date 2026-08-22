@@ -1,113 +1,73 @@
-"""Loop de feedback `clip rate` → few-shot nos prompts (SPEC 14.7)."""
+"""`clip rate good|bad` → work/feedback.jsonl → few-shot nos prompts (SPEC §14.7)."""
 
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Literal
 
-from .config import Settings, get_settings
+from .utils import now_iso, read_json
 
-MAX_FEW_SHOT = 6
-
-
-@dataclass
-class Rating:
-    job_id: str
-    clip_slug: str
-    verdict: str
-    score: int = 0
-    reason: str = ""
-    title: str = ""
-    note: str = ""
-    created_at: float = 0.0
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+Verdict = Literal["good", "bad"]
 
 
-def rate(
+def _selected_entry(work_dir: Path, job_id: str, clip_slug: str) -> dict[str, Any] | None:
+    selected_path = Path(work_dir) / job_id / "selected.json"
+    if not selected_path.exists():
+        return None
+    for item in read_json(selected_path):
+        if item.get("slug") == clip_slug:
+            return item
+    return None
+
+
+def rate_clip(
+    work_dir: Path,
     job_id: str,
     clip_slug: str,
-    verdict: str,
-    score: int = 0,
-    reason: str = "",
-    title: str = "",
+    verdict: Verdict,
+    *,
     note: str = "",
-    settings: Settings | None = None,
-) -> Rating:
-    if verdict not in {"good", "bad"}:
-        raise ValueError("verdict deve ser 'good' ou 'bad'")
-    settings = settings or get_settings()
-    entry = Rating(
-        job_id=job_id,
-        clip_slug=clip_slug,
-        verdict=verdict,
-        score=score,
-        reason=reason,
-        title=title,
-        note=note,
-        created_at=time.time(),
-    )
-    path = settings.feedback_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
-    return entry
+) -> dict[str, Any]:
+    """Registra o veredito do usuário para um clip em `work/feedback.jsonl`
+    (SPEC §14.7). Não falha se o job/slug não for encontrado — grava o que
+    tiver disponível, já que o feedback pode ser sobre um clip antigo."""
+    entry = _selected_entry(work_dir, job_id, clip_slug)
+
+    record = {
+        "timestamp": now_iso(),
+        "job_id": job_id,
+        "slug": clip_slug,
+        "score": entry.get("score") if entry else None,
+        "reason": entry.get("reason") if entry else None,
+        "verdict": verdict,
+        "note": note or "",
+    }
+
+    feedback_path = Path(work_dir) / "feedback.jsonl"
+    feedback_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(feedback_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return record
 
 
-def load_ratings(settings: Settings | None = None, limit: int | None = None) -> list[Rating]:
-    settings = settings or get_settings()
-    path = settings.feedback_path
+def load_recent_feedback(work_dir: Path, n: int = 6) -> list[dict[str, Any]]:
+    """Carrega os `n` registros de feedback mais recentes, para injeção
+    few-shot nos prompts de candidatos/score (SPEC §14.7)."""
+    path = Path(work_dir) / "feedback.jsonl"
     if not path.exists():
         return []
-    ratings: list[Rating] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        ratings.append(
-            Rating(
-                job_id=data.get("job_id", ""),
-                clip_slug=data.get("clip_slug", ""),
-                verdict=data.get("verdict", "good"),
-                score=int(data.get("score") or 0),
-                reason=data.get("reason", ""),
-                title=data.get("title", ""),
-                note=data.get("note", ""),
-                created_at=float(data.get("created_at") or 0.0),
-            )
-        )
-    ratings.sort(key=lambda r: r.created_at, reverse=True)
-    return ratings[:limit] if limit else ratings
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    records = [json.loads(ln) for ln in lines]
+    return records[-n:]
 
 
-def ratings_for_job(job_id: str, settings: Settings | None = None) -> dict[str, Rating]:
-    """Último veredicto por clip do job."""
-    out: dict[str, Rating] = {}
-    for rating in reversed(load_ratings(settings)):
-        if rating.job_id == job_id:
-            out[rating.clip_slug] = rating
-    return out
+def write_selected_index(work_dir: Path, job_id: str, entries: list[dict[str, Any]]) -> Path:
+    """Grava work/<job_id>/selected.json: índice slug -> score/reason/out_dir,
+    usado por `clip rate` para localizar o clip sem precisar escanear out/."""
+    from .utils import write_json
 
-
-def few_shot_block(settings: Settings | None = None, limit: int = MAX_FEW_SHOT) -> str:
-    """Exemplos recentes good/bad para injetar nos prompts (PT-BR)."""
-    ratings = load_ratings(settings, limit=limit)
-    if not ratings:
-        return ""
-    good = [r for r in ratings if r.verdict == "good"]
-    bad = [r for r in ratings if r.verdict == "bad"]
-    lines = ["MEMÓRIA DE FEEDBACK DO USUÁRIO (use para calibrar o gosto do canal):"]
-    for label, group in (("APROVADOS", good), ("REPROVADOS", bad)):
-        if not group:
-            continue
-        lines.append(f"{label}:")
-        for r in group:
-            detail = f" — nota do usuário: {r.note}" if r.note else ""
-            lines.append(f"- \"{r.title or r.clip_slug}\" (score {r.score}): {r.reason}{detail}")
-    return "\n".join(lines)
+    path = Path(work_dir) / job_id / "selected.json"
+    write_json(path, entries)
+    return path

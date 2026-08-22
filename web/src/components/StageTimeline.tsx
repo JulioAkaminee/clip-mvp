@@ -1,23 +1,24 @@
-import { STAGE_HINTS } from "../lib/format";
-import type { Stage } from "../lib/types";
+import { STAGE_HINTS, formatElapsed } from "../lib/format";
+import type { StageState } from "../lib/types";
 import { ProgressBar, cx } from "./ui";
 
 const ICONS: Record<string, string> = {
   pending: "·",
-  running: "",
   done: "✓",
   skipped: "–",
   error: "✗",
 };
 
-export function StageTimeline({ stages }: { stages: Stage[] }) {
+/** Lista de estágios do backend, com percentual e tempo de cada um. */
+export function StageTimeline({ stages }: { stages: StageState[] }) {
   return (
     <ol className="space-y-1">
       {stages.map((stage) => {
         const active = stage.status === "running";
+        const units = stage.units_total > 1 && (active || stage.status === "done");
         return (
           <li
-            key={stage.key}
+            key={stage.name}
             className={cx(
               "rounded-xl border px-3.5 py-2.5 transition-colors",
               active
@@ -47,14 +48,39 @@ export function StageTimeline({ stages }: { stages: Stage[] }) {
                   ICONS[stage.status]
                 )}
               </span>
-              <span className="flex-1 text-[0.82rem] font-medium text-mist-200">{stage.label}</span>
-              <span className="max-w-[55%] truncate text-right text-[0.72rem] text-mist-400">
-                {stage.message || STAGE_HINTS[stage.key] || ""}
+
+              <span className="flex-1 truncate text-[0.82rem] font-medium text-mist-200">
+                {stage.label}
+                {stage.status === "skipped" && (
+                  <span className="ml-2 text-[0.72rem] font-normal text-mist-400">
+                    (cache)
+                  </span>
+                )}
               </span>
+
+              {units && (
+                <span className="shrink-0 font-mono text-[0.7rem] text-mist-400">
+                  {Math.round(stage.units_done)}/{Math.round(stage.units_total)}
+                </span>
+              )}
+              {stage.elapsed_seconds != null && stage.status !== "pending" && (
+                <span className="w-14 shrink-0 text-right font-mono text-[0.7rem] text-mist-400">
+                  {formatElapsed(stage.elapsed_seconds)}
+                </span>
+              )}
             </div>
+
+            {(active || stage.message) && (
+              <p
+                className="mt-1 truncate pl-8 text-[0.72rem] text-mist-400"
+                title={stage.message || STAGE_HINTS[stage.name]}
+              >
+                {stage.message || STAGE_HINTS[stage.name] || ""}
+              </p>
+            )}
             {active && (
               <div className="mt-2 pl-8">
-                <ProgressBar value={stage.progress} active />
+                <ProgressBar value={stage.percent / 100} active />
               </div>
             )}
           </li>

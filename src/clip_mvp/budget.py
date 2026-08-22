@@ -1,119 +1,65 @@
-"""Estimativa de custo OpenRouter — `--dry-run` / `--budget` (SPEC 14.4).
-
-Os preços são aproximações configuráveis por env; o objetivo é dar ordem de
-grandeza *antes* do passo caro (score com vision).
-"""
+"""Estimativa de custo OpenRouter + --dry-run / --budget (SPEC §14.4)."""
 
 from __future__ import annotations
 
-import os
-from dataclasses import asdict, dataclass
-
-STT_USD_PER_MIN = float(os.environ.get("CLIP_MVP_COST_STT_PER_MIN", "0.006"))
-CANDIDATES_USD_PER_1K_TOKENS = float(os.environ.get("CLIP_MVP_COST_TEXT_PER_1K", "0.0004"))
-VISION_USD_PER_CANDIDATE = float(os.environ.get("CLIP_MVP_COST_VISION_PER_CLIP", "0.0035"))
-META_USD_PER_CLIP = float(os.environ.get("CLIP_MVP_COST_META_PER_CLIP", "0.0008"))
-
-CHARS_PER_TOKEN = 4.0
+from .config import Settings
+from .models import CostEstimate
 
 
-@dataclass
-class CostLine:
-    step: str
-    detail: str
-    usd: float
-
-
-@dataclass
-class Estimate:
-    duration_s: float
-    candidates: int
-    selected: int
-    lines: list[CostLine]
-    total_usd: float
-    within_budget: bool = True
-    budget_usd: float | None = None
-    note: str = ""
-
-    def to_dict(self) -> dict:
-        return {
-            "duration_s": round(self.duration_s, 1),
-            "candidates": self.candidates,
-            "selected": self.selected,
-            "lines": [asdict(line) for line in self.lines],
-            "total_usd": round(self.total_usd, 4),
-            "within_budget": self.within_budget,
-            "budget_usd": self.budget_usd,
-            "note": self.note,
-        }
-
-
-def estimate(
-    duration_s: float,
-    candidates: int,
-    selected: int,
-    transcript_chars: int | None = None,
-    budget_usd: float | None = None,
-) -> Estimate:
-    minutes = max(0.0, duration_s) / 60.0
-    # ~140 palavras/min ≈ 6 chars/palavra quando não temos a transcrição ainda.
-    chars = transcript_chars if transcript_chars is not None else int(minutes * 140 * 6)
-    tokens = chars / CHARS_PER_TOKEN
-
-    lines = [
-        CostLine("stt", f"{minutes:.1f} min de áudio", minutes * STT_USD_PER_MIN),
-        CostLine(
-            "candidatos",
-            f"~{tokens / 1000:.1f}k tokens de transcrição",
-            (tokens / 1000.0) * CANDIDATES_USD_PER_1K_TOKENS,
-        ),
-        CostLine(
-            "score (vision)",
-            f"{candidates} candidatos × 3 frames",
-            candidates * VISION_USD_PER_CANDIDATE,
-        ),
-        CostLine(
-            "meta (títulos/hashtags)",
-            f"{selected} cortes × YT + TikTok",
-            selected * META_USD_PER_CLIP,
-        ),
-    ]
-    total = sum(line.usd for line in lines)
-    est = Estimate(
-        duration_s=duration_s,
-        candidates=candidates,
-        selected=selected,
-        lines=lines,
-        total_usd=total,
-        budget_usd=budget_usd,
+def estimate_cost(duration_s: float, n_candidates: int, settings: Settings) -> CostEstimate:
+    """Estima custo (USD) de STT + candidatos (texto) + score (vision), ANTES
+    do passo caro de vision. Valores aproximados/configuráveis via .env —
+    servem só para decisão de orçamento, não são cobrança real (SPEC §14.4)."""
+    stt_minutes = duration_s / 60.0
+    stt_usd = stt_minutes * settings.cost_stt_usd_per_min
+    text_usd = n_candidates * settings.cost_text_usd_per_candidate
+    vision_usd = n_candidates * settings.frames_per_score * settings.cost_vision_usd_per_frame
+    total = stt_usd + text_usd + vision_usd
+    return CostEstimate(
+        stt_minutes=round(stt_minutes, 2),
+        stt_usd=round(stt_usd, 4),
+        n_candidates=n_candidates,
+        text_usd=round(text_usd, 4),
+        vision_usd=round(vision_usd, 4),
+        total_usd=round(total, 4),
     )
-    if budget_usd is not None:
-        est.within_budget = total <= budget_usd
-        if not est.within_budget:
-            est.note = (
-                f"estimativa US$ {total:.2f} acima do orçamento US$ {budget_usd:.2f}"
-            )
-    return est
 
 
-def fit_candidates_to_budget(
+def max_candidates_for_budget(duration_s: float, budget_usd: float, settings: Settings) -> int:
+    """Maior nº de candidatos que cabe no orçamento (dado o custo fixo de STT).
+    Retorna 0 se nem o STT sozinho couber no orçamento."""
+    stt_minutes = duration_s / 60.0
+    stt_usd = stt_minutes * settings.cost_stt_usd_per_min
+    remaining = budget_usd - stt_usd
+    if remaining <= 0:
+        return 0
+    per_candidate = settings.cost_text_usd_per_candidate + (
+        settings.frames_per_score * settings.cost_vision_usd_per_frame
+    )
+    if per_candidate <= 0:
+        return 10**9
+    return max(0, int(remaining // per_candidate))
+
+
+def apply_budget(
     duration_s: float,
-    candidates: int,
-    selected: int,
-    budget_usd: float,
-    transcript_chars: int | None = None,
-    min_candidates: int = 4,
-) -> tuple[int, Estimate]:
-    """Reduz o nº de candidatos até caber no orçamento (SPEC 14.4).
+    n_candidates: int,
+    budget_usd: float | None,
+    settings: Settings,
+) -> tuple[int, str | None]:
+    """Reduz `n_candidates` para caber no orçamento, ou retorna aviso claro se
+    nem 1 candidato couber (SPEC §14.4). Retorna (n_candidates_permitido, aviso)."""
+    if budget_usd is None:
+        return n_candidates, None
 
-    Devolve `(candidatos_permitidos, estimativa)`. Se nem o piso couber, a
-    estimativa volta com `within_budget=False` para o job abortar com mensagem.
-    """
-    n = candidates
-    est = estimate(duration_s, n, selected, transcript_chars, budget_usd)
-    while not est.within_budget and n > min_candidates:
-        n -= 1
-        est = estimate(duration_s, n, min(selected, n), transcript_chars, budget_usd)
-    if est.within_budget and n < candidates:
-        est.note = f"candidatos reduzidos de {candidates} para {n} pelo orçamento"
-    return n, est
+    allowed = max_candidates_for_budget(duration_s, budget_usd, settings)
+    if allowed <= 0:
+        return 0, (
+            f"Orçamento de ${budget_usd:.2f} não cobre nem a transcrição estimada "
+            f"(~${duration_s / 60.0 * settings.cost_stt_usd_per_min:.2f}). Abortando."
+        )
+    if allowed < n_candidates:
+        return allowed, (
+            f"Orçamento de ${budget_usd:.2f} reduz candidatos de {n_candidates} para {allowed}."
+        )
+    return n_candidates, None

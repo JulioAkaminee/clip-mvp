@@ -1,156 +1,122 @@
-"""Configuração central (env + defaults da SPEC)."""
+"""Configuração central do clip-mvp: carrega .env e expõe defaults da SPEC."""
 
 from __future__ import annotations
 
 import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-try:  # python-dotenv é opcional em runtime
-    from dotenv import load_dotenv
-except Exception:  # pragma: no cover
+from dotenv import load_dotenv
 
-    def load_dotenv(*_args, **_kwargs):  # type: ignore[misc]
-        return False
+# Carrega .env do diretório de trabalho atual (cwd) e, como fallback, da raiz do repo.
+load_dotenv()
 
-
-VERSION = "0.1.0"
-
-# --- Regras duras da SPEC (não são configuráveis pelo usuário) ---------------
-VERTICAL_MAX_S = 90.0
-"""9:16 nunca passa de 1:30 (SPEC 2)."""
-
-PAD_MIN_S = 0.200
-PAD_MAX_S = 0.400
-"""Folga aplicada antes do start / depois do end (SPEC 14.1)."""
-
-DEFAULT_MIN_SCORE = 60
-SAFE_AREA_BOTTOM = 0.20
-"""9:16: evitar os ~20% inferiores (UI TikTok/Shorts) — SPEC 14.5."""
-
-ALL_FORMATS = ("vertical_facetrack", "vertical_center", "horizontal_16x9")
-ALL_PLATFORMS = ("yt", "tiktok")
-CAPTION_MODES = ("burn", "sidecar", "both")
-
-# Faixa alvo de cortes por duração da fonte (SPEC 3)
-TARGET_RANGES: tuple[tuple[float, int, int], ...] = (
-    (10 * 60, 2, 4),
-    (30 * 60, 3, 6),
-    (90 * 60, 5, 10),
-    (float("inf"), 8, 15),
-)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
-def target_range(duration_s: float) -> tuple[int, int]:
-    """Faixa (min, max) de cortes finais sugerida para a duração da fonte."""
-    for limit, lo, hi in TARGET_RANGES:
-        if duration_s < limit:
-            return lo, hi
-    return TARGET_RANGES[-1][1], TARGET_RANGES[-1][2]
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
-def _root_dir() -> Path:
-    env = os.environ.get("CLIP_MVP_HOME")
-    if env:
-        return Path(env).expanduser().resolve()
-    # src/clip_mvp/config.py -> raiz do repo
-    return Path(__file__).resolve().parents[2]
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 @dataclass
 class Settings:
-    root: Path = field(default_factory=_root_dir)
-    openrouter_api_key: str = ""
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    stt_model: str = "openai/whisper-1"
-    candidate_model: str = "google/gemini-2.5-flash"
-    score_model: str = "google/gemini-2.5-flash"
-    meta_model: str = "google/gemini-2.5-flash"
-    demo: bool = False
-    """Modo demo: sem chamadas OpenRouter (transcrição/candidatos/score sintéticos)."""
+    """Configuração resolvida a partir de variáveis de ambiente (.env)."""
 
-    @property
-    def work_dir(self) -> Path:
-        return self.root / "work"
-
-    @property
-    def out_dir(self) -> Path:
-        return self.root / "out"
-
-    @property
-    def feedback_path(self) -> Path:
-        return self.work_dir / "feedback.jsonl"
-
-    @property
-    def has_api_key(self) -> bool:
-        return bool(self.openrouter_api_key.strip())
-
-    @property
-    def ai_enabled(self) -> bool:
-        """IA real só roda com chave e fora do modo demo."""
-        return self.has_api_key and not self.demo
-
-    def ensure_dirs(self) -> None:
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-_cached: Settings | None = None
-
-
-def get_settings(refresh: bool = False) -> Settings:
-    global _cached
-    if _cached is not None and not refresh:
-        return _cached
-    root = _root_dir()
-    load_dotenv(root / ".env", override=False)
-    settings = Settings(
-        root=root,
-        openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
-        openrouter_base_url=os.environ.get(
-            "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-        ),
-        stt_model=os.environ.get("OPENROUTER_STT_MODEL", "openai/whisper-1"),
-        candidate_model=os.environ.get(
-            "OPENROUTER_CANDIDATE_MODEL", "google/gemini-2.5-flash"
-        ),
-        score_model=os.environ.get("OPENROUTER_SCORE_MODEL", "google/gemini-2.5-flash"),
-        meta_model=os.environ.get(
-            "OPENROUTER_META_MODEL",
-            os.environ.get("OPENROUTER_CANDIDATE_MODEL", "google/gemini-2.5-flash"),
-        ),
-        demo=_env_flag("CLIP_MVP_DEMO"),
+    openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
+    openrouter_base_url: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL)
     )
-    settings.ensure_dirs()
-    _cached = settings
-    return settings
+
+    stt_model: str = field(default_factory=lambda: os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-1"))
+    candidate_model: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_CANDIDATE_MODEL", "google/gemini-2.5-flash")
+    )
+    score_model: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_SCORE_MODEL", "google/gemini-2.5-flash")
+    )
+    meta_model: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_META_MODEL", os.getenv("OPENROUTER_CANDIDATE_MODEL", "google/gemini-2.5-flash"))
+    )
+
+    # Regras de fronteira / padding (SPEC §2.5, §14.1)
+    pad_ms_min: int = field(default_factory=lambda: _env_int("CLIP_PAD_MS_MIN", 200))
+    pad_ms_max: int = field(default_factory=lambda: _env_int("CLIP_PAD_MS_MAX", 400))
+
+    # Duração máxima do vertical (SPEC §2)
+    vertical_max_s: float = field(default_factory=lambda: _env_float("CLIP_VERTICAL_MAX_S", 90.0))
+
+    # Score (SPEC §3, §8)
+    min_score_default: float = field(default_factory=lambda: _env_float("CLIP_MIN_SCORE", 60.0))
+
+    # Custos estimados (USD) para --dry-run / --budget (SPEC §14.4). Valores aproximados,
+    # configuráveis via .env; usados apenas para estimativa, não são cobrança real.
+    cost_stt_usd_per_min: float = field(default_factory=lambda: _env_float("CLIP_COST_STT_USD_PER_MIN", 0.006))
+    cost_text_usd_per_candidate: float = field(
+        default_factory=lambda: _env_float("CLIP_COST_TEXT_USD_PER_CANDIDATE", 0.001)
+    )
+    cost_vision_usd_per_frame: float = field(
+        default_factory=lambda: _env_float("CLIP_COST_VISION_USD_PER_FRAME", 0.003)
+    )
+    frames_per_score: int = field(default_factory=lambda: _env_int("CLIP_FRAMES_PER_SCORE", 3))
+
+    # Penalidades determinísticas do score (SPEC §8). Contexto aberto tem teto
+    # duro; cortes muito curtos raramente entregam arco completo, então também
+    # levam um teto (0 desliga a regra).
+    truncated_score_cap: float = field(
+        default_factory=lambda: _env_float("CLIP_TRUNCATED_SCORE_CAP", 45.0)
+    )
+    min_duration_full_arc_s: float = field(
+        default_factory=lambda: _env_float("CLIP_MIN_DURATION_FULL_ARC_S", 12.0)
+    )
+    short_clip_score_cap: float = field(
+        default_factory=lambda: _env_float("CLIP_SHORT_CLIP_SCORE_CAP", 70.0)
+    )
+
+    # Diretórios (SPEC §5)
+    work_dir: Path = field(default_factory=lambda: Path(os.getenv("CLIP_WORK_DIR", "work")))
+    out_dir: Path = field(default_factory=lambda: Path(os.getenv("CLIP_OUT_DIR", "out")))
+
+    # Download (SPEC §6: 720p)
+    download_height: int = field(default_factory=lambda: _env_int("CLIP_DOWNLOAD_HEIGHT", 720))
+
+    # Feedback few-shot (SPEC §14.7)
+    feedback_examples_n: int = field(default_factory=lambda: _env_int("CLIP_FEEDBACK_EXAMPLES_N", 6))
+
+    # Paralelismo. O alvo é um MacBook i5 4-core 16GB: chamadas de rede
+    # (STT/score/meta) paralelizam bem, mas ffmpeg e MediaPipe competem por CPU
+    # e RAM — subir demais o render faz a máquina entrar em swap e ficar mais
+    # lenta que rodando serial.
+    network_workers: int = field(default_factory=lambda: _env_int("CLIP_NETWORK_WORKERS", 3))
+    render_workers: int = field(
+        default_factory=lambda: _env_int(
+            "CLIP_RENDER_WORKERS", max(1, min(2, (os.cpu_count() or 4) // 2))
+        )
+    )
+
+    def require_api_key(self) -> str:
+        if not self.openrouter_api_key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY não configurada. Copie .env.example para .env e "
+                "preencha sua chave da OpenRouter."
+            )
+        return self.openrouter_api_key
 
 
-def tool_status() -> dict[str, bool]:
-    """Dependências locais disponíveis (usado no /api/health e na UI)."""
-    try:
-        import mediapipe  # noqa: F401
-
-        mediapipe_ok = True
-    except Exception:
-        mediapipe_ok = False
-    try:
-        import yt_dlp  # noqa: F401
-
-        ytdlp_ok = True
-    except Exception:
-        ytdlp_ok = bool(shutil.which("yt-dlp"))
-    return {
-        "ffmpeg": bool(shutil.which("ffmpeg")),
-        "ffprobe": bool(shutil.which("ffprobe")),
-        "yt_dlp": ytdlp_ok,
-        "mediapipe": mediapipe_ok,
-    }
+def get_settings() -> Settings:
+    return Settings()

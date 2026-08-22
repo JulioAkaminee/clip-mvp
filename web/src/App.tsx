@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./lib/api";
-import type { AppConfig, Health, Job } from "./lib/types";
-import { useJobStream } from "./hooks/useJobStream";
+import type { AppConfig, Health, JobListItem } from "./lib/types";
+import { useJobProgress } from "./hooks/useJobProgress";
 import { JobView } from "./components/JobView";
 import { NewJobForm } from "./components/NewJobForm";
 import { Sidebar } from "./components/Sidebar";
 import { Button, Card } from "./components/ui";
 
+const JOBS_POLL_MS = 4000;
+
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobs, setJobs] = useState<JobListItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
 
@@ -35,18 +37,20 @@ export default function App() {
         setBootError(err instanceof Error ? err.message : String(err));
       }
       const list = await refreshJobs();
-      const running = list.find((job) => job.status === "running" || job.status === "queued");
-      setSelectedId(running?.id ?? null);
+      const active = list.find((job) => job.status === "running" || job.status === "queued");
+      setSelectedId(active?.job_id ?? null);
     })();
   }, [refreshJobs]);
 
-  const { job, connected, reload } = useJobStream(selectedId, () => void refreshJobs());
+  const { progress, clips, log, live, applyRating, reload } = useJobProgress(selectedId, () =>
+    void refreshJobs(),
+  );
 
-  // Mantém a lista lateral fresca enquanto há job na fila ou rodando.
+  // Mantém a lista lateral (percentual e ETA de cada job) fresca.
   useEffect(() => {
-    const hasActive = jobs.some((item) => item.status === "running" || item.status === "queued");
+    const hasActive = jobs.some((job) => job.status === "running" || job.status === "queued");
     if (!hasActive) return;
-    const timer = window.setInterval(() => void refreshJobs(), 5000);
+    const timer = window.setInterval(() => void refreshJobs(), JOBS_POLL_MS);
     return () => window.clearInterval(timer);
   }, [jobs, refreshJobs]);
 
@@ -89,20 +93,20 @@ export default function App() {
             </Card>
           )}
 
-          {selectedId === null || job === null ? (
+          {selectedId === null || progress === null ? (
             <NewJobForm config={config} health={health} onCreated={onCreated} />
           ) : (
             <JobView
-              job={job}
-              connected={connected}
+              key={progress.job_id}
+              progress={progress}
+              clips={clips}
+              log={log}
+              live={live}
               onChanged={() => {
                 void reload();
                 void refreshJobs();
               }}
-              onDeleted={() => {
-                setSelectedId(null);
-                void refreshJobs();
-              }}
+              onRated={applyRating}
             />
           )}
         </main>

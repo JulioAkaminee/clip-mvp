@@ -1,110 +1,251 @@
-"""Fronteira de corte: SPEC 2 e 14.1 (o requisito mais duro do produto)."""
+"""Testes de fronteira de corte: nunca cortar no meio de palavra (SPEC §2.5, §14.1)."""
 
-from clip_mvp.boundaries import MIN_VERTICAL_S, Window, fit_vertical, snap_window
-from clip_mvp.config import PAD_MAX_S, PAD_MIN_S, VERTICAL_MAX_S
-from clip_mvp.transcript import SENTENCE_END, Segment, Transcript, Word
+from __future__ import annotations
 
+import pytest
 
-def _words(text: str, start: float, step: float = 0.4) -> list[Word]:
-    out = []
-    t = start
-    for token in text.split():
-        out.append(Word(start=t, end=t + step * 0.8, text=token))
-        t += step
-    return out
+from clip_mvp.boundaries import (
+    fit_vertical_window,
+    crosses_word_midpoint,
+    snap_to_segment_boundaries,
+    snap_to_word_boundaries,
+    snap_window,
+)
+from clip_mvp.models import Segment, Word
 
-
-def _transcript(sentences: list[str], gap: float = 0.5) -> Transcript:
-    segments: list[Segment] = []
-    t = 1.0
-    for sentence in sentences:
-        words = _words(sentence, t)
-        segments.append(
-            Segment(start=words[0].start, end=words[-1].end, text=sentence, words=words)
-        )
-        t = words[-1].end + gap
-    return Transcript(duration=t + 5.0, segments=segments)
-
-
-def test_nunca_corta_no_meio_de_palavra(transcript):
-    """Start/end sempre caem fora do intervalo de qualquer palavra."""
-    window = snap_window(transcript, 120.7, 168.3)
-    for word in transcript.words:
-        assert not (word.start < window.start < word.end), "start caiu dentro de uma palavra"
-        assert not (word.start < window.end < word.end), "end caiu dentro de uma palavra"
+WORDS = [
+    Word(start=0.0, end=0.25, text="Cê"),
+    Word(start=0.3, end=0.55, text="já"),
+    Word(start=0.6, end=1.1, text="tentou"),
+    Word(start=1.15, end=1.6, text="aquele"),
+    Word(start=1.65, end=2.1, text="treino"),
+    Word(start=2.15, end=2.6, text="novo?"),
+    Word(start=3.2, end=3.45, text="Sim,"),
+    Word(start=3.5, end=3.7, text="mas"),
+    Word(start=3.75, end=4.1, text="doeu"),
+]
 
 
-def test_snap_expande_ate_fechar_a_frase():
-    data = _transcript(
-        [
-            "Primeira pergunta do host aqui.",
-            "Resposta começa e continua",
-            "e só termina agora com ponto.",
-            "Outro assunto totalmente diferente.",
-        ]
+def test_snap_start_inside_word_moves_to_word_start():
+    # 0.8 cai dentro de "tentou" (0.6-1.1) -> deve empurrar start para 0.6
+    result = snap_to_word_boundaries(
+        0.8, 3.9, WORDS, pad_before_s=0.0, pad_after_s=0.0, expand_to_context=False
     )
-    # Pedido termina no meio da resposta (segunda frase, sem pontuação forte).
-    requested_end = data.segments[1].end
-    window = snap_window(data, data.segments[1].start, requested_end)
-    assert window.context_complete
-    assert window.end >= data.segments[2].end
-    assert SENTENCE_END.search(data.segments[2].text)
+    assert result.snapped_start is True
+    assert result.start == 0.6
 
 
-def test_pad_dentro_da_faixa_da_spec():
-    data = _transcript(["Uma frase completa aqui.", "Outra frase completa aqui."])
-    first = data.segments[0]
-    window = snap_window(data, first.start + 0.05, first.end)
-    pad_before = first.start - window.start
-    assert 0 <= pad_before <= PAD_MAX_S + 1e-6
-    assert PAD_MIN_S <= PAD_MAX_S  # sanidade da constante
-    assert window.start >= 0.0
-
-
-def test_pad_nao_invade_palavra_vizinha():
-    data = _transcript(["Frase um curta.", "Frase dois curta."], gap=0.05)
-    window = snap_window(data, data.segments[1].start, data.segments[1].end)
-    assert window.start >= data.segments[0].end - 1e-6
-
-
-def test_vertical_respeita_teto_de_90s(transcript):
-    long_window = snap_window(transcript, 60.0, 260.0)
-    assert long_window.duration > VERTICAL_MAX_S
-    fitted = fit_vertical(transcript, long_window)
-    if fitted is not None:
-        assert fitted.duration <= VERTICAL_MAX_S
-        assert fitted.context_complete
-        assert fitted.duration >= MIN_VERTICAL_S
-
-
-def test_vertical_descartado_quando_contexto_nao_fecha_em_90s():
-    """Frase única de mais de 90s: melhor não exportar 9:16 do que truncar."""
-    long_sentence = " ".join(["palavra"] * 400) + "."
-    data = _transcript([long_sentence])
-    window = snap_window(data, data.segments[0].start, data.segments[0].end)
-    assert window.duration > VERTICAL_MAX_S
-    assert fit_vertical(data, window) is None
-
-
-def test_fit_vertical_mantem_o_fecho_do_contexto():
-    data = _transcript(
-        [
-            "Setup bem longo que ocupa muito tempo da conversa toda.",
-            "Mais setup ainda para estourar o limite de noventa segundos.",
-            "A punchline vem aqui no final e fecha o raciocínio.",
-        ]
+def test_snap_end_inside_word_extends_to_word_end():
+    # 3.9 cai dentro de "doeu" (3.75-4.1) -> deve estender end para 4.1
+    result = snap_to_word_boundaries(
+        0.6, 3.9, WORDS, pad_before_s=0.0, pad_after_s=0.0, expand_to_context=False
     )
-    window = Window(start=data.segments[0].start, end=data.segments[-1].end, context_complete=True)
-    fitted = fit_vertical(data, window, max_duration=window.duration - 1.0)
-    assert fitted is not None
-    assert abs(fitted.end - window.end) < 1.0, "o fecho (punchline) tem que ficar no 9:16"
+    assert result.snapped_end is True
+    assert result.end == 4.1
 
 
-def test_fallback_para_segmentos_sem_word_timestamps():
-    data = _transcript(["Uma frase completa.", "Outra frase completa."])
-    for segment in data.segments:
-        segment.words = []
-    assert not data.has_word_timestamps
-    window = snap_window(data, 0.0, data.segments[0].end)
-    assert window.method == "segment"
-    assert window.duration > 0
+def test_snap_exact_word_boundaries_no_snap_needed():
+    result = snap_to_word_boundaries(
+        0.6, 3.45, WORDS, pad_before_s=0.0, pad_after_s=0.0, expand_to_context=False
+    )
+    assert result.snapped_start is False
+    assert result.snapped_end is False
+
+
+def test_padding_applied_after_snap_within_200_400ms_range():
+    """A folga é limitada ao silêncio disponível.
+
+    Aqui só há 50ms de silêncio antes de "tentou" e depois de "Sim,", então a
+    folga encolhe: aplicar os 300ms cheios incluiria as palavras vizinhas
+    inteiras ("já" e "mas") no corte.
+    """
+    result = snap_to_word_boundaries(
+        0.6, 3.45, WORDS, pad_before_s=0.3, pad_after_s=0.3, expand_to_context=False
+    )
+    assert result.start == 0.55
+    assert result.end == 3.5
+    assert crosses_word_midpoint(result.start, result.end, WORDS) is False
+    assert 0.2 <= result.pad_before_s <= 0.4
+    assert 0.2 <= result.pad_after_s <= 0.4
+
+
+def test_full_padding_is_used_when_there_is_room():
+    # gap de 0.6s antes de "Sim," (3.2) -> cabe a folga cheia de 0.4s
+    result = snap_to_word_boundaries(
+        3.2, 3.45, WORDS, pad_before_s=0.4, pad_after_s=0.4, expand_to_context=False
+    )
+    assert result.start == pytest.approx(2.8, abs=0.01)
+
+
+def test_padding_never_goes_below_zero():
+    result = snap_to_word_boundaries(0.05, 0.2, WORDS, pad_before_s=0.4, pad_after_s=0.4)
+    assert result.start == 0.0
+
+
+def test_padding_never_exceeds_media_duration():
+    result = snap_to_word_boundaries(3.75, 4.1, WORDS, pad_before_s=0.4, pad_after_s=0.4, media_duration=4.2)
+    assert result.end == 4.2
+
+
+def test_resulting_window_never_crosses_word_midpoint():
+    # Propositalmente cai no meio de duas palavras diferentes.
+    result = snap_to_word_boundaries(0.8, 3.9, WORDS, pad_before_s=0.2, pad_after_s=0.2)
+    assert crosses_word_midpoint(result.start, result.end, WORDS) is False
+
+
+def test_crosses_word_midpoint_detects_bad_cut():
+    assert crosses_word_midpoint(0.8, 2.0, WORDS) is True
+    assert crosses_word_midpoint(0.6, 1.1, WORDS) is False
+
+
+SEGMENTS = [
+    Segment(id=0, start=0.0, end=2.6, text="Cê já tentou aquele treino novo?", words=[]),
+    Segment(id=1, start=3.2, end=6.9, text="Sim, mas doeu tanto...", words=[]),
+]
+
+
+def test_segment_fallback_expands_to_segment_boundaries():
+    # start cai no meio do segmento 0, end cai no meio do segmento 1.
+    result = snap_to_segment_boundaries(1.0, 4.0, SEGMENTS, pad_before_s=0.0, pad_after_s=0.0)
+    assert result.start == 0.0
+    assert result.end == 6.9
+
+
+def test_snap_window_prefers_words_over_segments():
+    result = snap_window(
+        0.8,
+        3.9,
+        words=WORDS,
+        segments=SEGMENTS,
+        pad_before_s=0.0,
+        pad_after_s=0.0,
+        expand_to_context=False,
+    )
+    assert result.start == 0.6
+    assert result.end == 4.1
+
+
+def test_snap_window_falls_back_to_segments_without_words():
+    result = snap_window(1.0, 4.0, words=[], segments=SEGMENTS, pad_before_s=0.0, pad_after_s=0.0)
+    assert result.start == 0.0
+    assert result.end == 6.9
+
+
+# --------------------------------------------------------------------------
+# Fechamento de contexto (SPEC §2.1-§2.3): o snap por palavra sozinho ainda
+# entrega corte que começa/termina no meio da ideia.
+# --------------------------------------------------------------------------
+
+CONTEXT_WORDS = [
+    Word(start=0.0, end=0.4, text="Todo"),
+    Word(start=0.45, end=0.8, text="mundo"),
+    Word(start=0.85, end=1.2, text="erra"),
+    Word(start=1.25, end=1.7, text="nisso."),
+    Word(start=2.2, end=2.5, text="Eu"),
+    Word(start=2.55, end=2.9, text="perdi"),
+    Word(start=2.95, end=3.4, text="oitenta"),
+    Word(start=3.45, end=3.7, text="mil"),
+    Word(start=3.75, end=4.3, text="reais."),
+    Word(start=4.8, end=5.1, text="Foi"),
+    Word(start=5.15, end=5.4, text="feio."),
+]
+
+
+def test_expands_start_to_beginning_of_utterance():
+    """Começar em "oitenta" é começar no meio da frase — deve recuar até "Eu"."""
+    result = snap_to_word_boundaries(2.95, 4.3, CONTEXT_WORDS, pad_before_s=0.2, pad_after_s=0.4)
+    assert result.starts_on_sentence is True
+    assert result.start <= 2.2
+
+
+def test_expands_end_until_sentence_closes():
+    """Terminar em "oitenta" corta a ideia — deve seguir até "reais."."""
+    result = snap_to_word_boundaries(2.2, 3.4, CONTEXT_WORDS, pad_before_s=0.2, pad_after_s=0.4)
+    assert result.ends_on_sentence is True
+    assert result.end >= 4.3
+    assert result.context_complete is True
+
+
+def test_expansion_can_be_disabled_for_primitive_snapping():
+    result = snap_to_word_boundaries(
+        2.95, 3.4, CONTEXT_WORDS, pad_before_s=0.0, pad_after_s=0.0, expand_to_context=False
+    )
+    assert result.start == 2.95
+    assert result.end == 3.4
+
+
+def test_context_incomplete_when_nothing_closes():
+    open_words = [
+        Word(start=0.0, end=0.3, text="e"),
+        Word(start=0.35, end=0.6, text="aí"),
+        Word(start=0.65, end=1.0, text="ele"),
+    ]
+    result = snap_to_word_boundaries(0.0, 1.0, open_words, pad_before_s=0.2, pad_after_s=0.4)
+    assert result.ends_on_sentence is False
+    assert result.context_complete is False
+
+
+def test_padding_never_swallows_neighbour_word():
+    """A folga usa o silêncio disponível; nunca puxa a palavra vizinha inteira."""
+    # gap entre "nisso." (1.7) e "Eu" (2.2) é 0.5s
+    result = snap_to_word_boundaries(
+        2.2, 4.3, CONTEXT_WORDS, pad_before_s=0.4, pad_after_s=0.4, expand_to_context=False
+    )
+    assert result.start >= 1.7, "a folga entrou na palavra anterior"
+    assert crosses_word_midpoint(result.start, result.end, CONTEXT_WORDS) is False
+
+
+def test_pad_is_clamped_to_a_small_gap():
+    # gap entre "mil" (3.7) e "reais." (3.75) é 0.05s: a folga não pode passar disso
+    result = snap_to_word_boundaries(
+        3.75, 4.3, CONTEXT_WORDS, pad_before_s=0.2, pad_after_s=0.4, expand_to_context=False
+    )
+    assert result.start >= 3.7
+
+
+# --------------------------------------------------------------------------
+# Encaixe do 9:16 em 90s (SPEC §2): encolher antes de descartar
+# --------------------------------------------------------------------------
+
+
+def _long_words(n: int = 120, *, sentence_every: int = 10) -> list[Word]:
+    words = []
+    t = 0.0
+    for i in range(n):
+        terminal = "." if i % sentence_every == sentence_every - 1 else ""
+        words.append(Word(start=t, end=t + 0.8, text=f"palavra{i}{terminal}"))
+        t += 1.0
+    return words
+
+
+def test_window_already_under_90s_passes_through():
+    result, skipped = fit_vertical_window(2.2, 5.4, CONTEXT_WORDS, max_duration_s=90.0)
+    assert skipped is None
+    assert result is not None
+    assert result.duration_s <= 90.0
+
+
+def test_long_context_shrinks_to_sentence_aligned_subwindow():
+    words = _long_words()
+    result, skipped = fit_vertical_window(0.0, 119.8, words, max_duration_s=90.0)
+    assert skipped is None, "deveria encolher em vez de descartar"
+    assert result is not None
+    assert result.duration_s <= 90.0
+    assert result.ends_on_sentence is True
+    assert result.starts_on_sentence is True, "deve preferir começar em início de fala"
+
+
+def test_skips_vertical_when_no_closed_context_fits():
+    # 100s de fala sem nenhuma pontuação terminal: impossível fechar em 90s
+    words = _long_words(100, sentence_every=1000)
+    result, skipped = fit_vertical_window(0.0, 99.8, words, max_duration_s=90.0)
+    assert result is None
+    assert skipped == "context_exceeds_90s"
+
+
+def test_fitted_window_never_exceeds_the_cap():
+    words = _long_words()
+    for end in (95.0, 105.0, 119.8):
+        result, _ = fit_vertical_window(0.0, end, words, max_duration_s=90.0)
+        if result is not None:
+            assert result.duration_s <= 90.0

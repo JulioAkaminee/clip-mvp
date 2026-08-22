@@ -1,134 +1,100 @@
-"""Download da fonte via yt-dlp (vídeo 720p + áudio)."""
+"""Download de vídeo-fonte via yt-dlp (SPEC §4, §6)."""
 
 from __future__ import annotations
 
-import json
-import re
-import shutil
-import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .ffmpeg_utils import duration_of
-
-PROGRESS_RE = re.compile(r"(\d{1,3}(?:\.\d)?)%")
-
-
-class DownloadError(RuntimeError):
-    pass
+from .utils import ffprobe_duration
 
 
 @dataclass
-class SourceMedia:
-    path: Path
+class DownloadResult:
+    video_path: Path
+    info_path: Path
     title: str
     duration_s: float
-    url: str
-    uploader: str = ""
-    thumbnail: str = ""
-
-    def to_dict(self) -> dict:
-        return {
-            "path": str(self.path),
-            "title": self.title,
-            "duration_s": self.duration_s,
-            "url": self.url,
-            "uploader": self.uploader,
-            "thumbnail": self.thumbnail,
-        }
+    source_url: str
 
 
-def _yt_dlp_cmd() -> list[str]:
-    exe = shutil.which("yt-dlp")
-    if exe:
-        return [exe]
-    return [sys.executable, "-m", "yt_dlp"]
+def probe_metadata(url: str) -> dict:
+    """Lê metadados sem baixar — dá ao ETA uma duração antes do primeiro byte."""
+    import yt_dlp
+
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+        return ydl.extract_info(url, download=False) or {}
 
 
-def probe_source(url: str, timeout: float = 90.0) -> dict:
-    """Metadados sem baixar (título, duração) — usado pelo `--dry-run`."""
-    cmd = [*_yt_dlp_cmd(), "--no-warnings", "--dump-single-json", "--no-playlist", url]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise DownloadError(
-            f"yt-dlp não conseguiu ler a URL: {(proc.stderr or '').strip().splitlines()[-1:] or ''}"
-        )
-    data = json.loads(proc.stdout or "{}")
-    return {
-        "title": data.get("title") or "video",
-        "duration_s": float(data.get("duration") or 0.0),
-        "uploader": data.get("uploader") or "",
-        "thumbnail": data.get("thumbnail") or "",
+def download_source(
+    url: str,
+    job_dir: Path,
+    *,
+    height: int = 720,
+    on_progress: Callable[[float, str], None] | None = None,
+) -> DownloadResult:
+    """Baixa vídeo (até `height`p) + salva metadata (info.json) em `job_dir`.
+
+    Import de `yt_dlp` é feito dentro da função para manter o import do
+    pacote leve e permitir mockar em testes sem a dependência de rede.
+
+    ``on_progress(fração, mensagem)`` recebe o andamento do download para
+    alimentar a barra de progresso e o ETA.
+    """
+    import yt_dlp
+
+    job_dir = Path(job_dir)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    out_template = str(job_dir / "source.%(ext)s")
+
+    def hook(status: dict) -> None:
+        if on_progress is None:
+            return
+        if status.get("status") == "downloading":
+            total = status.get("total_bytes") or status.get("total_bytes_estimate") or 0
+            done = status.get("downloaded_bytes") or 0
+            if total:
+                fraction = min(1.0, done / total)
+                on_progress(fraction, f"Baixando vídeo… {fraction * 100:.0f}%")
+        elif status.get("status") == "finished":
+            on_progress(1.0, "Download concluído, juntando faixas…")
+
+    ydl_opts = {
+        # O `/best` final é a rede de segurança: fontes cujo formato não expõe
+        # `height` (arquivo direto, extractor genérico) seriam filtradas para
+        # fora e o job abortaria no download em vez de baixar o que existe.
+        "format": f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+        "outtmpl": out_template,
+        "merge_output_format": "mp4",
+        "writeinfojson": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        # retoma download parcial em vez de recomeçar do zero
+        "continuedl": True,
+        "progress_hooks": [hook],
     }
 
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        video_path = Path(ydl.prepare_filename(info))
+        if video_path.suffix != ".mp4":
+            candidate = video_path.with_suffix(".mp4")
+            if candidate.exists():
+                video_path = candidate
 
-def download(
-    url: str,
-    dest_dir: Path,
-    on_progress: Callable[[float, str], None] | None = None,
-    max_height: int = 720,
-) -> SourceMedia:
-    """Baixa a fonte em <=720p (SPEC 15: economizar disco no Mac)."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    existing = sorted(dest_dir.glob("source.*"))
-    meta_path = dest_dir / "source.json"
-    if existing and meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        return SourceMedia(
-            path=Path(meta["path"]),
-            title=meta.get("title", "video"),
-            duration_s=float(meta.get("duration_s") or 0.0),
-            url=url,
-            uploader=meta.get("uploader", ""),
-            thumbnail=meta.get("thumbnail", ""),
-        )
+    info_path = job_dir / "source.info.json"
+    duration = info.get("duration") or 0.0
+    if not duration and video_path.exists():
+        try:
+            duration = ffprobe_duration(video_path)
+        except Exception:
+            duration = 0.0
 
-    info = probe_source(url)
-    output_template = str(dest_dir / "source.%(ext)s")
-    cmd = [
-        *_yt_dlp_cmd(),
-        "--no-warnings",
-        "--no-playlist",
-        "--newline",
-        "-f",
-        f"bv*[height<={max_height}]+ba/b[height<={max_height}]/bv*+ba/b",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        output_template,
-        url,
-    ]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    return DownloadResult(
+        video_path=video_path,
+        info_path=info_path,
+        title=info.get("title", ""),
+        duration_s=float(duration),
+        source_url=url,
     )
-    tail: list[str] = []
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        tail.append(line)
-        tail[:] = tail[-30:]
-        match = PROGRESS_RE.search(line)
-        if match and on_progress:
-            on_progress(min(1.0, float(match.group(1)) / 100.0), line)
-    code = proc.wait()
-    if code != 0:
-        raise DownloadError("falha no download:\n" + "\n".join(tail[-8:]))
-
-    files = [p for p in dest_dir.glob("source.*") if p.suffix.lower() != ".json"]
-    if not files:
-        raise DownloadError("yt-dlp terminou mas nenhum arquivo foi criado")
-    path = max(files, key=lambda p: p.stat().st_size)
-    media = SourceMedia(
-        path=path,
-        title=info["title"],
-        duration_s=info["duration_s"] or duration_of(path),
-        url=url,
-        uploader=info["uploader"],
-        thumbnail=info["thumbnail"],
-    )
-    meta_path.write_text(
-        json.dumps(media.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return media

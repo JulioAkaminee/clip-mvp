@@ -1,16 +1,10 @@
 import { useState } from "react";
 import { api } from "../lib/api";
-import {
-  CAPTION_LABELS,
-  FORMAT_LABELS,
-  formatDuration,
-  formatUsd,
-} from "../lib/format";
+import { CAPTION_LABELS, FORMAT_OPTION_LABELS } from "../lib/format";
 import type {
   AppConfig,
   CaptionMode,
-  Estimate,
-  FormatName,
+  FormatKey,
   Health,
   JobRequest,
   Mode,
@@ -28,14 +22,14 @@ import {
   cx,
 } from "./ui";
 
-const ALL_FORMATS: FormatName[] = ["vertical_facetrack", "vertical_center", "horizontal_16x9"];
+const ALL_FORMATS: FormatKey[] = ["face", "9x16", "16x9"];
 
 interface FormState {
   url: string;
   mode: Mode;
   count: number;
   minScore: number;
-  formats: FormatName[];
+  formats: FormatKey[];
   captions: CaptionMode;
   platforms: Platform[];
   budget: string;
@@ -57,7 +51,7 @@ const INITIAL: FormState = {
 function toRequest(form: FormState, dryRun: boolean): JobRequest {
   return {
     url: form.url.trim(),
-    mode: form.mode,
+    more: form.mode === "more",
     count: form.mode === "count" ? form.count : null,
     min_score: form.minScore,
     max_score_only: null,
@@ -65,7 +59,7 @@ function toRequest(form: FormState, dryRun: boolean): JobRequest {
     captions: form.captions,
     platforms: form.platforms,
     dry_run: dryRun,
-    budget_usd: form.useBudget ? Number(form.budget) || null : null,
+    budget: form.useBudget ? Number(form.budget) || null : null,
   };
 }
 
@@ -78,29 +72,33 @@ export function NewJobForm({
   health: Health | null;
   onCreated: (jobId: string) => void;
 }) {
-  const [form, setForm] = useState<FormState>(INITIAL);
-  const [estimate, setEstimate] = useState<Estimate | null>(null);
-  const [busy, setBusy] = useState<"none" | "estimate" | "create">("none");
+  const [form, setForm] = useState<FormState>({
+    ...INITIAL,
+    minScore: config?.default_min_score ?? INITIAL.minScore,
+  });
+  const [busy, setBusy] = useState<"none" | "dry" | "create">("none");
   const [error, setError] = useState<string | null>(null);
 
   const patch = (changes: Partial<FormState>) => setForm((current) => ({ ...current, ...changes }));
 
   const submit = async (dryRun: boolean) => {
     if (!form.url.trim()) {
-      setError("Cole a URL do vídeo (ou o caminho de um arquivo local).");
+      setError("Cole a URL do vídeo (YouTube, Twitch, …).");
+      return;
+    }
+    if (form.useBudget && !(Number(form.budget) > 0)) {
+      setError("O orçamento precisa ser um valor em dólar maior que zero (ex: 2.00).");
+      return;
+    }
+    if (form.formats.length === 0) {
+      setError("Escolha pelo menos um formato de export.");
       return;
     }
     setError(null);
-    setBusy(dryRun ? "estimate" : "create");
+    setBusy(dryRun ? "dry" : "create");
     try {
-      if (dryRun) {
-        setEstimate(await api.estimate(toRequest(form, true)));
-      } else {
-        const job = await api.createJob(toRequest(form, false));
-        onCreated(job.id);
-        setForm((current) => ({ ...current, url: "" }));
-        setEstimate(null);
-      }
+      const { job_id } = await api.createJob(toRequest(form, dryRun));
+      onCreated(job_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -108,7 +106,8 @@ export function NewJobForm({
     }
   };
 
-  const targetRange = config?.target_ranges ?? [];
+  const verticalMax = config?.vertical_max_s ?? 90;
+  const pad = config?.pad_ms ?? [200, 400];
 
   return (
     <div className="mx-auto w-full max-w-3xl space-y-5 fade-up">
@@ -120,17 +119,13 @@ export function NewJobForm({
         <p className="max-w-xl text-[0.86rem] leading-relaxed text-mist-400">
           A IA decide <strong className="text-mist-200">quais</strong> e{" "}
           <strong className="text-mist-200">quantos</strong> momentos valem corte, sempre fechando o
-          contexto da conversa. O 9:16 nunca passa de {config?.vertical_max_s ?? 90}s; o 16:9 tem a
-          duração que o arco pedir.
+          contexto da conversa. O 9:16 nunca passa de {verticalMax}s; o 16:9 tem a duração que o arco
+          pedir. Fronteira por palavra com folga de {pad[0]}–{pad[1]}ms.
         </p>
       </header>
 
       <Card className="space-y-5">
-        <Field
-          label="Link do vídeo"
-          hint="YouTube, Twitch ou caminho de arquivo local"
-          htmlFor="job-url"
-        >
+        <Field label="Link do vídeo" hint="YouTube, Twitch e o que o yt-dlp suportar" htmlFor="job-url">
           <div className="flex flex-col gap-2 sm:flex-row">
             <TextInput
               id="job-url"
@@ -155,17 +150,14 @@ export function NewJobForm({
         </Field>
 
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field
-            label="Quantidade de cortes"
-            hint={form.mode === "auto" ? "a IA decide" : undefined}
-          >
+          <Field label="Quantidade de cortes" hint={form.mode === "auto" ? "a IA decide" : undefined}>
             <Segmented<Mode>
               value={form.mode}
               onChange={(mode) => patch({ mode })}
               options={[
                 { value: "auto", label: "Auto", hint: "A IA escolhe N pela densidade do vídeo" },
                 { value: "more", label: "+50%", hint: "--more: pede ~50% mais cortes" },
-                { value: "count", label: "Fixo", hint: "--count N (só se passarem do limiar)" },
+                { value: "count", label: "Fixo", hint: "--count N (só os que passarem do limiar)" },
               ]}
             />
             {form.mode === "count" && (
@@ -177,6 +169,7 @@ export function NewJobForm({
                   value={form.count}
                   onChange={(event) => patch({ count: Number(event.target.value) })}
                   className="flex-1 accent-brand-500"
+                  aria-label="quantidade de cortes"
                 />
                 <span className="w-14 rounded-lg bg-white/6 py-1 text-center font-mono text-[0.8rem] text-mist-200">
                   {form.count}
@@ -195,6 +188,7 @@ export function NewJobForm({
                 value={form.minScore}
                 onChange={(event) => patch({ minScore: Number(event.target.value) })}
                 className="flex-1 accent-brand-500"
+                aria-label="limiar de score"
               />
               <span className="w-14 rounded-lg bg-white/6 py-1 text-center font-mono text-[0.8rem] text-mist-200">
                 {form.minScore}
@@ -220,7 +214,7 @@ export function NewJobForm({
                   })
                 }
               >
-                {FORMAT_LABELS[format]}
+                {config?.format_labels?.[format] ?? FORMAT_OPTION_LABELS[format]}
               </CheckPill>
             ))}
           </div>
@@ -238,8 +232,7 @@ export function NewJobForm({
               }))}
             />
             <p className="pt-1 text-[0.7rem] text-mist-400">
-              No 9:16 o burn-in respeita a safe area (fora dos{" "}
-              {Math.round((config?.safe_area_bottom ?? 0.2) * 100)}% de baixo).
+              No 9:16 o burn-in fica fora dos ~20% de baixo (UI do TikTok/Shorts).
             </p>
           </Field>
 
@@ -269,26 +262,33 @@ export function NewJobForm({
             checked={form.useBudget}
             onChange={(useBudget) => patch({ useBudget })}
             label="Limitar custo OpenRouter"
-            hint="reduz candidatos ou aborta se a estimativa estourar"
+            hint="reduz o nº de candidatos ou aborta antes do passo caro"
           />
           <div className={cx("flex items-center gap-2", !form.useBudget && "opacity-40")}>
             <span className="text-[0.8rem] text-mist-400">US$</span>
-            <TextInput
-              value={form.budget}
-              onChange={(event) => patch({ budget: event.target.value })}
-              disabled={!form.useBudget}
-              inputMode="decimal"
-              className="w-24 text-center font-mono"
-            />
+            <span className="inline-block w-24">
+              <TextInput
+                value={form.budget}
+                onChange={(event) => patch({ budget: event.target.value })}
+                disabled={!form.useBudget}
+                inputMode="decimal"
+                aria-label="orçamento em dólar"
+                aria-invalid={form.useBudget && !(Number(form.budget) > 0)}
+                className={cx(
+                  "text-center font-mono",
+                  form.useBudget && !(Number(form.budget) > 0) && "border-red-400/60",
+                )}
+              />
+            </span>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-3 border-t border-white/8 pt-4">
-          <Button onClick={() => void submit(true)} loading={busy === "estimate"}>
+          <Button onClick={() => void submit(true)} loading={busy === "dry"}>
             Estimar custo (dry-run)
           </Button>
           <p className="text-[0.75rem] text-mist-400">
-            Lê só os metadados da fonte: nada é baixado, transcrito ou renderizado.
+            Baixa o vídeo, mede a duração e para antes de transcrever, pontuar e renderizar.
           </p>
         </div>
 
@@ -297,16 +297,20 @@ export function NewJobForm({
             {error}
           </p>
         )}
+        {health && !health.openrouter_key && (
+          <p className="rounded-xl border border-amber-300/25 bg-amber-300/8 px-3.5 py-2.5 text-[0.8rem] text-amber-100">
+            Sem <code>OPENROUTER_API_KEY</code> no <code>.env</code> o job falha na transcrição —
+            configure a chave antes de gerar cortes.
+          </p>
+        )}
       </Card>
-
-      {estimate && <EstimateCard estimate={estimate} />}
 
       <Card className="space-y-3">
         <h3 className="text-[0.78rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
           Como a IA escolhe a quantidade
         </h3>
         <ul className="grid gap-1.5 text-[0.8rem] text-mist-300 sm:grid-cols-2">
-          {targetRange.map((range) => (
+          {(config?.target_ranges ?? []).map((range) => (
             <li key={`${range.from_min}-${range.to_min}`} className="flex justify-between gap-3">
               <span className="text-mist-400">
                 {range.to_min ? `${range.from_min}–${range.to_min} min` : `> ${range.from_min} min`}
@@ -326,42 +330,5 @@ export function NewJobForm({
         )}
       </Card>
     </div>
-  );
-}
-
-function EstimateCard({ estimate }: { estimate: Estimate }) {
-  const title = (estimate.source?.["title"] as string | undefined) ?? "fonte";
-  return (
-    <Card className="space-y-4 fade-up">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-semibold text-white">Estimativa de custo</h3>
-          <p className="text-[0.78rem] text-mist-400">
-            {title} · {formatDuration(estimate.duration_s)} · {estimate.candidates} candidatos ·
-            alvo {estimate.selected} cortes
-          </p>
-        </div>
-        <div className="text-right">
-          <div className="font-mono text-xl text-white">{formatUsd(estimate.total_usd)}</div>
-          {estimate.budget_usd != null && (
-            <Badge tone={estimate.within_budget ? "good" : "bad"}>
-              {estimate.within_budget ? "dentro do orçamento" : "acima do orçamento"}
-            </Badge>
-          )}
-        </div>
-      </div>
-      <ul className="divide-y divide-white/6 text-[0.8rem]">
-        {estimate.lines.map((line) => (
-          <li key={line.step} className="flex items-center justify-between gap-3 py-1.5">
-            <span className="text-mist-300">{line.step}</span>
-            <span className="flex items-center gap-3">
-              <span className="text-mist-400">{line.detail}</span>
-              <span className="w-20 text-right font-mono text-mist-200">{formatUsd(line.usd)}</span>
-            </span>
-          </li>
-        ))}
-      </ul>
-      {estimate.note && <p className="text-[0.78rem] text-amber-200">{estimate.note}</p>}
-    </Card>
   );
 }

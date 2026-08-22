@@ -260,12 +260,32 @@ export function StatusDot({ status }: { status: string }) {
   return <span className={cx("size-2 shrink-0 rounded-full", tones[status] ?? "bg-ink-600")} />;
 }
 
-export function ProgressBar({ value, active }: { value: number; active?: boolean }) {
+export function ProgressBar({
+  value,
+  active,
+  tone = "brand",
+}: {
+  value: number;
+  active?: boolean;
+  tone?: "brand" | "done" | "error";
+}) {
+  const tones = {
+    brand: "from-brand-600 to-brand-400",
+    done: "from-lime-600 to-lime-300",
+    error: "from-red-600 to-red-400",
+  };
   return (
-    <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/8">
+    <div
+      className="h-1.5 w-full overflow-hidden rounded-full bg-white/8"
+      role="progressbar"
+      aria-valuenow={Math.round(value * 100)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+    >
       <div
         className={cx(
-          "relative h-full rounded-full bg-gradient-to-r from-brand-600 to-brand-400 transition-[width] duration-300",
+          "relative h-full rounded-full bg-gradient-to-r transition-[width] duration-300",
+          tones[tone],
           active && "progress-shimmer",
         )}
         style={{ width: `${Math.max(2, Math.min(100, value * 100))}%` }}

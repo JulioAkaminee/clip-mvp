@@ -1,0 +1,56 @@
+{
+  "language": "pt",
+  "duration": 12.0,
+  "source": "fixture",
+  "has_word_timestamps": true,
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 2.6,
+      "text": "C\u00ea j\u00e1 tentou aquele treino novo?",
+      "words": [
+        {"start": 0.0, "end": 0.25, "text": "C\u00ea"},
+        {"start": 0.3, "end": 0.55, "text": "j\u00e1"},
+        {"start": 0.6, "end": 1.1, "text": "tentou"},
+        {"start": 1.15, "end": 1.6, "text": "aquele"},
+        {"start": 1.65, "end": 2.1, "text": "treino"},
+        {"start": 2.15, "end": 2.6, "text": "novo?"}
+      ]
+    },
+    {
+      "id": 1,
+      "start": 3.2,
+      "end": 6.9,
+      "text": "Sim, mas doeu tanto que eu n\u00e3o conseguia nem rir depois.",
+      "words": [
+        {"start": 3.2, "end": 3.45, "text": "Sim,"},
+        {"start": 3.5, "end": 3.7, "text": "mas"},
+        {"start": 3.75, "end": 4.1, "text": "doeu"},
+        {"start": 4.15, "end": 4.5, "text": "tanto"},
+        {"start": 4.55, "end": 4.7, "text": "que"},
+        {"start": 4.75, "end": 4.9, "text": "eu"},
+        {"start": 4.95, "end": 5.2, "text": "n\u00e3o"},
+        {"start": 5.25, "end": 5.9, "text": "conseguia"},
+        {"start": 5.95, "end": 6.15, "text": "nem"},
+        {"start": 6.2, "end": 6.45, "text": "rir"},
+        {"start": 6.5, "end": 6.9, "text": "depois."}
+      ]
+    },
+    {
+      "id": 2,
+      "start": 7.0,
+      "end": 9.8,
+      "text": "Foi hil\u00e1rio, s\u00e9rio, melhor risada da semana.",
+      "words": [
+        {"start": 7.0, "end": 7.2, "text": "Foi"},
+        {"start": 7.25, "end": 7.8, "text": "hil\u00e1rio,"},
+        {"start": 7.85, "end": 8.2, "text": "s\u00e9rio,"},
+        {"start": 8.25, "end": 8.6, "text": "melhor"},
+        {"start": 8.65, "end": 9.1, "text": "risada"},
+        {"start": 9.15, "end": 9.25, "text": "da"},
+        {"start": 9.3, "end": 9.8, "text": "semana."}
+      ]
+    }
+  ]
+}

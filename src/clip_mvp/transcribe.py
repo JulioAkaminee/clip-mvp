@@ -1,116 +1,192 @@
-"""Transcrição PT-BR via OpenRouter (chunks ~10 min, word timestamps)."""
+"""STT via OpenRouter (Whisper) — verbose_json / word timestamps (SPEC §14.1)."""
 
 from __future__ import annotations
 
+import math
+import shutil
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-from . import demo as demo_mod
-from .audio import extract_audio, split_audio
 from .config import Settings
-from .ffmpeg_utils import duration_of
+from .models import Segment, Transcript, Word
 from .openrouter import OpenRouterClient
-from .transcript import Segment, Transcript, Word
+from .utils import ffprobe_duration, run_ffmpeg, write_json
 
-ProgressFn = Callable[[float, str], None]
-
-
-def transcribe(
-    source: Path,
-    work_dir: Path,
-    settings: Settings,
-    on_progress: ProgressFn | None = None,
-    duration_hint: float | None = None,
-) -> Transcript:
-    """Devolve a transcrição, com cache em `work/<job>/transcript.json`."""
-    cache = work_dir / "transcript.json"
-    if cache.exists():
-        if on_progress:
-            on_progress(1.0, "transcrição em cache reaproveitada")
-        return Transcript.load(cache)
-
-    duration = duration_hint or duration_of(source)
-
-    if not settings.ai_enabled:
-        transcript = demo_mod.build_transcript(duration, seed=source.name)
-        if on_progress:
-            on_progress(1.0, "transcrição sintética (modo demo, sem OpenRouter)")
-        transcript.save(cache)
-        return transcript
-
-    if on_progress:
-        on_progress(0.05, "extraindo áudio normalizado para STT")
-    audio_path = extract_audio(source, work_dir / "audio.mp3", normalize=True)
-    chunks = split_audio(audio_path, work_dir / "audio_chunks")
-
-    client = OpenRouterClient(settings)
-    segments: list[Segment] = []
-    for i, (chunk, offset) in enumerate(chunks):
-        if on_progress:
-            on_progress(
-                0.1 + 0.9 * (i / max(1, len(chunks))),
-                f"STT chunk {i + 1}/{len(chunks)}",
-            )
-        payload = client.transcribe(chunk, settings.stt_model, language="pt")
-        segments.extend(_parse_stt(payload, offset))
-
-    segments.sort(key=lambda s: s.start)
-    transcript = Transcript(
-        duration=duration,
-        segments=segments,
-        language="pt",
-        stt_model=settings.stt_model,
-        diarization=any(s.speaker for s in segments),
-    )
-    transcript.save(cache)
-    if on_progress:
-        on_progress(1.0, f"{len(segments)} segmentos transcritos")
-    return transcript
+CHUNK_SECONDS_DEFAULT = 600  # ~10 min, SPEC §6
 
 
-def _parse_stt(payload: dict, offset: float) -> list[Segment]:
-    """Normaliza `verbose_json` (com fallback quando não há word timestamps)."""
-    raw_words = payload.get("words") or []
-    words = [
+def _split_audio(audio_path: Path, chunk_seconds: int, tmp_dir: Path) -> list[tuple[Path, float]]:
+    """Divide o áudio em pedaços de `chunk_seconds`, retornando (path, offset_s)."""
+    duration = ffprobe_duration(audio_path)
+    if duration <= chunk_seconds:
+        return [(audio_path, 0.0)]
+
+    n_chunks = math.ceil(duration / chunk_seconds)
+    chunks: list[tuple[Path, float]] = []
+    for i in range(n_chunks):
+        offset = i * chunk_seconds
+        chunk_path = tmp_dir / f"chunk_{i:03d}.wav"
+        run_ffmpeg(
+            [
+                "-i",
+                str(audio_path),
+                "-ss",
+                str(offset),
+                "-t",
+                str(chunk_seconds),
+                "-ac",
+                "1",
+                str(chunk_path),
+            ]
+        )
+        chunks.append((chunk_path, float(offset)))
+    return chunks
+
+
+def _parse_verbose_json(raw: dict[str, Any], offset_s: float, id_start: int) -> list[Segment]:
+    """Converte a resposta verbose_json (Whisper) em Segments com Words,
+    aplicando o offset do chunk. Tolerante a formatos levemente diferentes
+    entre providers na OpenRouter (SPEC §15)."""
+    raw_segments = raw.get("segments") or []
+    raw_words = raw.get("words") or []
+
+    words_all = [
         Word(
-            start=float(w.get("start", 0.0)) + offset,
-            end=float(w.get("end", w.get("start", 0.0))) + offset,
-            text=str(w.get("word") or w.get("text") or "").strip(),
+            start=float(w.get("start", 0.0)) + offset_s,
+            end=float(w.get("end", 0.0)) + offset_s,
+            text=str(w.get("word", w.get("text", ""))).strip(),
         )
         for w in raw_words
-        if str(w.get("word") or w.get("text") or "").strip()
     ]
 
-    raw_segments = payload.get("segments") or []
-    if not raw_segments:
-        text = (payload.get("text") or "").strip()
-        if not text:
-            return []
-        end = words[-1].end if words else offset
-        return [Segment(start=offset, end=end, text=text, words=words)]
-
     segments: list[Segment] = []
-    for raw in raw_segments:
-        start = float(raw.get("start", 0.0)) + offset
-        end = float(raw.get("end", start)) + offset
-        seg_words = [w for w in words if w.start >= start - 0.05 and w.end <= end + 0.05]
-        if not seg_words and raw.get("words"):
-            seg_words = [
-                Word(
-                    start=float(w.get("start", start)) + offset,
-                    end=float(w.get("end", start)) + offset,
-                    text=str(w.get("word") or w.get("text") or "").strip(),
+    if raw_segments:
+        for i, seg in enumerate(raw_segments):
+            seg_start = float(seg.get("start", 0.0)) + offset_s
+            seg_end = float(seg.get("end", seg_start)) + offset_s
+            seg_words = [w for w in words_all if seg_start - 0.05 <= w.start <= seg_end + 0.05]
+            segments.append(
+                Segment(
+                    id=id_start + i,
+                    start=seg_start,
+                    end=seg_end,
+                    text=str(seg.get("text", "")).strip(),
+                    words=seg_words,
                 )
-                for w in raw["words"]
-                if str(w.get("word") or w.get("text") or "").strip()
-            ]
+            )
+    elif words_all:
+        # Sem segmentos, mas com palavras: cria um único segmento cobrindo tudo.
+        text = raw.get("text", "") or " ".join(w.text for w in words_all)
         segments.append(
             Segment(
-                start=start,
-                end=end,
-                text=(raw.get("text") or "").strip(),
-                speaker=raw.get("speaker") or raw.get("speaker_id"),
-                words=seg_words,
+                id=id_start,
+                start=words_all[0].start,
+                end=words_all[-1].end,
+                text=text.strip(),
+                words=words_all,
             )
         )
+    elif raw.get("text"):
+        segments.append(
+            Segment(
+                id=id_start,
+                start=offset_s,
+                end=offset_s,
+                text=str(raw["text"]).strip(),
+                words=[],
+            )
+        )
+
     return segments
+
+
+def transcribe_audio(
+    audio_path: Path,
+    settings: Settings,
+    *,
+    client: OpenRouterClient | None = None,
+    language: str = "pt",
+    chunk_seconds: int = CHUNK_SECONDS_DEFAULT,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> Transcript:
+    """Transcreve o áudio completo (com chunking ~10min) via OpenRouter Whisper.
+
+    Os chunks são enviados em paralelo limitado: STT é espera de rede, e um
+    podcast de 1h vira 6 chamadas que não precisam ser sequenciais.
+
+    `client` pode ser injetado (ex.: em testes) para evitar chamadas de rede.
+    ``on_progress(concluídos, total, mensagem)`` alimenta a barra e o ETA.
+    """
+    client = client or OpenRouterClient(settings)
+    audio_path = Path(audio_path)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="clip_mvp_stt_"))
+    try:
+        chunks = _split_audio(audio_path, chunk_seconds, tmp_dir)
+        total = len(chunks)
+        results: dict[int, dict[str, Any]] = {}
+        done = 0
+
+        if on_progress:
+            on_progress(0, total, f"Transcrevendo… 0/{total} blocos")
+
+        def work(index: int) -> tuple[int, dict[str, Any]]:
+            chunk_path, _offset = chunks[index]
+            return index, client.transcribe(chunk_path, language=language)
+
+        workers = max(1, min(settings.network_workers, total))
+        if workers == 1 or total == 1:
+            for i in range(total):
+                results[i] = work(i)[1]
+                done += 1
+                if on_progress:
+                    on_progress(done, total, f"Transcrevendo… {done}/{total} blocos")
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(work, i) for i in range(total)]
+                for future in as_completed(futures):
+                    index, raw = future.result()
+                    results[index] = raw
+                    done += 1
+                    if on_progress:
+                        on_progress(done, total, f"Transcrevendo… {done}/{total} blocos")
+
+        # remonta na ordem cronológica: a ordem de conclusão do pool é arbitrária
+        all_segments: list[Segment] = []
+        next_id = 0
+        for i in range(total):
+            raw = results.get(i)
+            if raw is None:
+                continue
+            segs = _parse_verbose_json(raw, chunks[i][1], next_id)
+            all_segments.extend(segs)
+            next_id += len(segs)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    duration = all_segments[-1].end if all_segments else 0.0
+    has_words = any(seg.words for seg in all_segments)
+
+    return Transcript(
+        language=language,
+        duration=duration,
+        segments=all_segments,
+        source="openrouter_whisper",
+        has_word_timestamps=has_words,
+    )
+
+
+def dump_transcript(transcript: Transcript, job_dir: Path) -> Path:
+    """Salva a transcrição em work/<job_id>/transcript.json (SPEC §5)."""
+    path = Path(job_dir) / "transcript.json"
+    write_json(path, transcript.model_dump())
+    return path
+
+
+def load_transcript(job_dir: Path) -> Transcript:
+    from .utils import read_json
+
+    path = Path(job_dir) / "transcript.json"
+    return Transcript.model_validate(read_json(path))

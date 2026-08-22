@@ -1,84 +1,102 @@
-"""Dedupe de momentos (SPEC 14.3).
-
-* overlap temporal > 50% → mantém o de maior score;
-* mesma punchline / texto muito parecido → mantém o de maior score.
-"""
+"""Deduplicação de candidatos por overlap temporal ou punchline repetida (SPEC §3, §14.3)."""
 
 from __future__ import annotations
 
-import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
+from typing import Generic, TypeVar
 
-from .models import Candidate
+T = TypeVar("T")
 
-OVERLAP_THRESHOLD = 0.50
-TEXT_SIMILARITY_THRESHOLD = 0.72
-PUNCHLINE_WORDS = 18
-MIN_CHARS_FOR_TEXT_MATCH = 120
-"""Trechos curtos se parecem por acidente; só comparamos texto de verdade."""
+TEXT_SIMILARITY_THRESHOLD = 0.82
+OVERLAP_RATIO_THRESHOLD = 0.5
+
+#: Similaridade de texto só é confiável com vocabulário suficiente: dois
+#: trechos de 3 palavras ("Isso mudou tudo.") batem quase 100% por acaso e não
+#: são o mesmo momento. Abaixo disso, só o overlap temporal decide. Na prática
+#: um excerpt real de corte tem dezenas de palavras, então o piso só barra
+#: casos degenerados.
+MIN_WORDS_FOR_TEXT_MATCH = 6
 
 
-def overlap_ratio(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
-    """Fração do menor intervalo coberta pela interseção."""
-    inter = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+def temporal_overlap_ratio(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    """Overlap relativo à janela mais curta (0..1). Ex.: se B está totalmente
+    contido em A, overlap=1.0 mesmo que A seja bem maior — é isso que captura
+    "mesmo momento, janela redundante" (SPEC §3/§14.3: overlap temporal >50%)."""
+    inter_start = max(a_start, b_start)
+    inter_end = min(a_end, b_end)
+    inter = max(0.0, inter_end - inter_start)
     shortest = min(a_end - a_start, b_end - b_start)
     if shortest <= 0:
         return 0.0
     return inter / shortest
 
 
-def _normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9áàâãéêíóôõúç ]+", " ", (text or "").lower()).strip()
+def text_similarity(a: str, b: str, *, min_words: int = 1) -> float:
+    """Similaridade 0..1 entre dois trechos.
 
-
-def _punchline(text: str) -> str:
-    words = _normalize(text).split()
-    return " ".join(words[-PUNCHLINE_WORDS:])
-
-
-def text_similarity(a: str, b: str) -> float:
-    na, nb = _normalize(a), _normalize(b)
-    if not na or not nb:
+    ``min_words`` protege contra falso positivo: textos curtos demais não têm
+    vocabulário suficiente para que a semelhança signifique "mesma ideia".
+    """
+    a_norm = (a or "").strip().lower()
+    b_norm = (b or "").strip().lower()
+    if not a_norm or not b_norm:
         return 0.0
-    return SequenceMatcher(None, na, nb).ratio()
+    if len(a_norm.split()) < min_words or len(b_norm.split()) < min_words:
+        return 0.0
+    return SequenceMatcher(None, a_norm, b_norm).ratio()
 
 
-def is_duplicate(a: Candidate, b: Candidate) -> tuple[bool, str]:
-    ratio = overlap_ratio(
-        a.horizontal.start, a.horizontal.end, b.horizontal.start, b.horizontal.end
-    )
-    if ratio > OVERLAP_THRESHOLD:
-        return True, f"overlap_{int(ratio * 100)}pct"
-
-    text_a, text_b = a.transcript_text or "", b.transcript_text or ""
-    if min(len(text_a), len(text_b)) < MIN_CHARS_FOR_TEXT_MATCH:
-        return False, ""
-    if text_similarity(text_a, text_b) >= TEXT_SIMILARITY_THRESHOLD:
-        return True, "texto_similar"
-    punch_a, punch_b = _punchline(text_a), _punchline(text_b)
-    if min(len(punch_a.split()), len(punch_b.split())) >= 8:
-        if text_similarity(punch_a, punch_b) >= 0.8:
-            return True, "mesma_punchline"
-    return False, ""
+@dataclass
+class DedupeItem(Generic[T]):
+    item: T
+    start: float
+    end: float
+    text: str
+    score: float
 
 
-def dedupe(candidates: list[Candidate]) -> tuple[list[Candidate], list[tuple[Candidate, str]]]:
-    """Retorna (mantidos, removidos com motivo), preservando o maior score."""
-    ordered = sorted(candidates, key=lambda c: (-c.score, c.horizontal.start))
-    kept: list[Candidate] = []
-    removed: list[tuple[Candidate, str]] = []
+@dataclass
+class DedupeResult(Generic[T]):
+    kept: list[T]
+    removed_count: int
+    removed_reasons: list[str]
+
+
+def dedupe_items(
+    items: list[DedupeItem[T]],
+    *,
+    overlap_threshold: float = OVERLAP_RATIO_THRESHOLD,
+    text_threshold: float = TEXT_SIMILARITY_THRESHOLD,
+) -> DedupeResult[T]:
+    """Remove itens redundantes: overlap temporal > threshold OU texto muito
+    similar (mesma punchline/ideia). Mantém sempre o de maior score. Ordena
+    por score desc para decidir quem "vence" primeiro (SPEC §3/§14.3)."""
+    ordered = sorted(items, key=lambda d: d.score, reverse=True)
+    kept: list[DedupeItem[T]] = []
+    removed_count = 0
+    removed_reasons: list[str] = []
+
     for candidate in ordered:
-        duplicate_of: Candidate | None = None
-        reason = ""
-        for winner in kept:
-            dup, why = is_duplicate(candidate, winner)
-            if dup:
-                duplicate_of, reason = winner, why
+        duplicate_of = None
+        reason = None
+        for keeper in kept:
+            overlap = temporal_overlap_ratio(candidate.start, candidate.end, keeper.start, keeper.end)
+            if overlap > overlap_threshold:
+                duplicate_of = keeper
+                reason = f"overlap={overlap:.2f}"
                 break
-        if duplicate_of is None:
-            kept.append(candidate)
-        else:
-            candidate.dedupe_of = duplicate_of.id
-            removed.append((candidate, reason))
-    kept.sort(key=lambda c: c.horizontal.start)
-    return kept, removed
+            sim = text_similarity(
+                candidate.text, keeper.text, min_words=MIN_WORDS_FOR_TEXT_MATCH
+            )
+            if sim > text_threshold:
+                duplicate_of = keeper
+                reason = f"text_similarity={sim:.2f}"
+                break
+        if duplicate_of is not None:
+            removed_count += 1
+            removed_reasons.append(reason or "duplicate")
+            continue
+        kept.append(candidate)
+
+    return DedupeResult(kept=[k.item for k in kept], removed_count=removed_count, removed_reasons=removed_reasons)

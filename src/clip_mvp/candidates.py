@@ -1,233 +1,211 @@
-"""Candidatos + decisão de N (SPEC 3).
-
-A IA decide **quais** e **quantos** momentos valem corte; `--more` e `--count`
-só mexem no alvo, nunca forçam a criação de corte ruim. Todas as janelas
-devolvidas pelo LLM passam pela validação determinística de `boundaries`.
-"""
+"""Geração de candidatos a corte + decisão automática de N (SPEC §3, §14.1)."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable
+from importlib import resources
+from typing import Any
 
-from .boundaries import Window, fit_vertical, snap_window
-from .config import Settings, VERTICAL_MAX_S, target_range
-from .feedback import few_shot_block
-from .models import Candidate
+from .boundaries import fit_vertical_window, snap_window
+from .config import Settings
+from .models import Candidate, Transcript, Window
 from .openrouter import OpenRouterClient
-from .paths import slugify
-from .transcript import Transcript, transcript_as_prompt_lines
 
-ProgressFn = Callable[[float, str], None]
-
-MIN_CLIP_S = 12.0
-CANDIDATE_POOL_FACTOR = 2.5
-"""Pool amplo: ~2–3× a faixa alvo (SPEC 3)."""
-
-PROMPTS_DIR = Path(__file__).parent / "prompts"
+# Heurística de faixa alvo de cortes finais por duração da fonte (SPEC §3).
+_AUTO_RANGE_TABLE: list[tuple[float, tuple[int, int]]] = [
+    (10 * 60, (2, 4)),
+    (30 * 60, (3, 6)),
+    (90 * 60, (5, 10)),
+    (math.inf, (8, 15)),
+]
 
 
-@dataclass
-class CountPlan:
-    mode: str
-    target_min: int
-    target_max: int
-    pool: int
-
-    def to_dict(self) -> dict:
-        return {
-            "mode": self.mode,
-            "target_min": self.target_min,
-            "target_max": self.target_max,
-            "pool": self.pool,
-        }
+def auto_count_range(duration_s: float) -> tuple[int, int]:
+    """Faixa alvo (min, max) de cortes finais, conforme a tabela da SPEC §3."""
+    for ceiling, rng in _AUTO_RANGE_TABLE:
+        if duration_s < ceiling:
+            return rng
+    return _AUTO_RANGE_TABLE[-1][1]
 
 
-def plan_count(
+def resolve_target_range(
     duration_s: float,
-    mode: str = "auto",
+    *,
+    more: bool = False,
     count: int | None = None,
-    pool_cap: int = 40,
-) -> CountPlan:
-    """Faixa alvo + tamanho do pool de candidatos."""
-    lo, hi = target_range(duration_s)
-    if mode == "more":
+) -> tuple[int, int]:
+    """Resolve a faixa alvo final considerando --more / --count (SPEC §3).
+
+    `--count N` força um teto de N (ainda sujeito ao limiar de score: nunca
+    inventa clip fraco). `--more` pede ~+50% do que o auto escolheria.
+    """
+    lo, hi = auto_count_range(duration_s)
+    if count is not None:
+        return (1, max(1, count))
+    if more:
         lo = max(1, math.ceil(lo * 1.5))
         hi = max(lo, math.ceil(hi * 1.5))
-    elif mode == "count" and count:
-        lo, hi = max(1, min(count, count)), max(1, count)
-    pool = min(pool_cap, max(6, math.ceil(hi * CANDIDATE_POOL_FACTOR)))
-    return CountPlan(mode=mode, target_min=lo, target_max=hi, pool=pool)
+    return (lo, hi)
 
 
-def generate(
+def candidate_pool_size(target_hi: int) -> int:
+    """LLM gera ~2-3x a faixa alvo de candidatos amplos (SPEC §3.1)."""
+    return max(6, math.ceil(target_hi * 2.5))
+
+
+def _load_prompt(name: str) -> str:
+    return resources.files("clip_mvp.prompts").joinpath(name).read_text(encoding="utf-8")
+
+
+def _transcript_excerpt_for_prompt(transcript: Transcript, max_chars: int = 12000) -> str:
+    lines = []
+    for seg in transcript.segments:
+        lines.append(f"[{seg.start:.1f}-{seg.end:.1f}] {seg.text}")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n... (truncado)"
+    return text
+
+
+def _format_feedback_examples(examples: list[dict[str, Any]] | None) -> str:
+    if not examples:
+        return ""
+    parts = ["\nExemplos de feedback anterior do usuário (few-shot, use para calibrar gosto):"]
+    for ex in examples:
+        verdict = ex.get("verdict", "?")
+        reason = ex.get("reason", "")
+        note = ex.get("note", "")
+        parts.append(f"- [{verdict}] score={ex.get('score')} reason={reason!r} nota_usuario={note!r}")
+    return "\n".join(parts)
+
+
+def _parse_candidate(raw: dict[str, Any], idx: int) -> Candidate | None:
+    w16 = raw.get("window_16x9")
+    if not w16:
+        return None
+    w9 = raw.get("window_9x16")
+    return Candidate(
+        id=f"cand_{idx:03d}",
+        title=str(raw.get("title", f"Momento {idx + 1}"))[:200],
+        text_excerpt=str(raw.get("text_excerpt", ""))[:2000],
+        window_9x16=Window(start=float(w9["start"]), end=float(w9["end"])) if w9 else None,
+        window_16x9=Window(start=float(w16["start"]), end=float(w16["end"])),
+        context_complete=bool(raw.get("context_complete", True)),
+        llm_notes=str(raw.get("llm_notes", ""))[:1000],
+        vertical_skip_reason=raw.get("vertical_skip_reason"),
+    )
+
+
+def generate_candidates(
     transcript: Transcript,
     settings: Settings,
-    plan: CountPlan,
-    on_progress: ProgressFn | None = None,
+    *,
+    target_hi: int,
+    client: OpenRouterClient | None = None,
+    feedback_examples: list[dict[str, Any]] | None = None,
 ) -> list[Candidate]:
-    if settings.ai_enabled:
-        raw = _llm_candidates(transcript, settings, plan, on_progress)
-    else:
-        raw = _demo_candidates(transcript, plan)
-        if on_progress:
-            on_progress(0.9, f"{len(raw)} candidatos heurísticos (modo demo)")
-    candidates = [c for c in (_normalize(transcript, item, i) for i, item in enumerate(raw)) if c]
-    candidates.sort(key=lambda c: c.horizontal.start)
-    if on_progress:
-        on_progress(1.0, f"{len(candidates)} candidatos com contexto validado")
+    """Chama o modelo de candidatos na OpenRouter e retorna candidatos com
+    janelas já ajustadas por fronteira de palavra + padding (SPEC §14.1)."""
+    client = client or OpenRouterClient(settings)
+    pool_size = candidate_pool_size(target_hi)
+
+    system = _load_prompt("candidates_pt.md")
+    user = (
+        f"Duração total do vídeo: {transcript.duration:.1f}s.\n"
+        f"Gere aproximadamente {pool_size} candidatos amplos e diversos.\n\n"
+        f"Transcrição (formato [inicio-fim] texto):\n{_transcript_excerpt_for_prompt(transcript)}"
+        f"{_format_feedback_examples(feedback_examples)}"
+    )
+
+    result = client.chat_json(model=settings.candidate_model, system=system, user=user)
+    raw_candidates = result.get("candidates", [])
+
+    words = transcript.all_words()
+    pad_before = settings.pad_ms_min / 1000.0
+    pad_after = settings.pad_ms_max / 1000.0
+
+    candidates: list[Candidate] = []
+    for i, raw in enumerate(raw_candidates):
+        cand = _parse_candidate(raw, i)
+        if cand is None:
+            continue
+        cand.window_16x9 = _snap(cand.window_16x9, words, transcript, pad_before, pad_after)
+        cand.context_complete = cand.context_complete and _closes_context(
+            cand.window_16x9, words, transcript, pad_before, pad_after
+        )
+        _resolve_vertical(cand, words, transcript, settings, pad_before, pad_after)
+        candidates.append(cand)
+
     return candidates
 
 
-# --- LLM ---------------------------------------------------------------------
-def _llm_candidates(
+def _resolve_vertical(
+    cand: Candidate,
+    words,
     transcript: Transcript,
     settings: Settings,
-    plan: CountPlan,
-    on_progress: ProgressFn | None,
-) -> list[dict]:
-    prompt = (PROMPTS_DIR / "candidates_pt.md").read_text(encoding="utf-8")
-    prompt = (
-        prompt.replace("{n_candidates}", str(plan.pool))
-        .replace("{target_min}", str(plan.target_min))
-        .replace("{target_max}", str(plan.target_max))
+    pad_before: float,
+    pad_after: float,
+) -> None:
+    """Define a janela 9:16 respeitando o teto de 90s (SPEC §2).
+
+    Quando o contexto fechado passa de 90s a spec permite encolher, desde que
+    a janela menor ainda feche contexto; só descartamos o vertical se não
+    houver nenhuma sub-janela válida. Descartar direto jogaria fora Shorts
+    perfeitamente exportáveis.
+    """
+    proposed = cand.window_9x16 or cand.window_16x9
+    if not words:
+        snapped = _snap(proposed, words, transcript, pad_before, pad_after)
+        if snapped.duration_s > settings.vertical_max_s:
+            cand.window_9x16 = None
+            cand.vertical_skip_reason = "context_exceeds_90s"
+        else:
+            cand.window_9x16 = snapped
+        return
+
+    fitted, skip_reason = fit_vertical_window(
+        proposed.start,
+        proposed.end,
+        words,
+        max_duration_s=settings.vertical_max_s,
+        pad_before_s=pad_before,
+        pad_after_s=pad_after,
+        media_duration=transcript.duration or None,
     )
-    feedback = few_shot_block(settings)
-    user = (
-        f"Duração da fonte: {transcript.duration / 60:.1f} min.\n"
-        f"Limite do 9:16: {VERTICAL_MAX_S:.0f}s.\n\n"
-        f"{feedback}\n\nTRANSCRIÇÃO COM TIMESTAMPS:\n"
-        f"{transcript_as_prompt_lines(transcript)}"
+    if fitted is None:
+        cand.window_9x16 = None
+        cand.vertical_skip_reason = skip_reason or "context_exceeds_90s"
+        return
+
+    cand.window_9x16 = Window(start=fitted.start, end=fitted.end)
+    cand.vertical_skip_reason = None
+
+
+def _closes_context(
+    window: Window, words, transcript: Transcript, pad_before: float, pad_after: float
+) -> bool:
+    """Revalida o fechamento de contexto de forma determinística."""
+    result = snap_window(
+        window.start,
+        window.end,
+        words=words,
+        segments=transcript.segments,
+        pad_before_s=pad_before,
+        pad_after_s=pad_after,
+        media_duration=transcript.duration or None,
     )
-    if on_progress:
-        on_progress(0.2, f"pedindo {plan.pool} candidatos ao LLM")
-    client = OpenRouterClient(settings)
-    data = client.chat_json(
-        settings.candidate_model,
-        [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.5,
-        max_tokens=6000,
+    return result.context_complete
+
+
+def _snap(window: Window, words, transcript: Transcript, pad_before: float, pad_after: float) -> Window:
+    result = snap_window(
+        window.start,
+        window.end,
+        words=words,
+        segments=transcript.segments,
+        pad_before_s=pad_before,
+        pad_after_s=pad_after,
+        media_duration=transcript.duration or None,
     )
-    items = data.get("candidates") or data.get("items") or []
-    if on_progress:
-        on_progress(0.9, f"LLM devolveu {len(items)} candidatos")
-    return [item for item in items if isinstance(item, dict)]
-
-
-# --- Heurística offline (modo demo) ------------------------------------------
-def _demo_candidates(transcript: Transcript, plan: CountPlan) -> list[dict]:
-    segments = transcript.segments
-    if not segments:
-        return []
-    wanted = plan.pool
-    step = max(2, len(segments) // max(1, wanted))
-    items: list[dict] = []
-    index = 0
-    while index < len(segments) and len(items) < wanted:
-        block: list = []
-        cursor = index
-        target = 45.0 + 25.0 * ((len(items) % 3))
-        while cursor < len(segments):
-            block.append(segments[cursor])
-            cursor += 1
-            if block[-1].end - block[0].start >= target:
-                break
-        # O turno tem que fechar: se o mesmo falante continua, o bloco continua.
-        while cursor < len(segments) and segments[cursor].speaker == block[-1].speaker:
-            block.append(segments[cursor])
-            cursor += 1
-        if not block:
-            break
-        start, end = block[0].start, block[-1].end
-        if end - start >= MIN_CLIP_S:
-            single_speaker = len({s.speaker for s in block if s.speaker}) == 1
-            vertical: dict | None
-            if end - start > VERTICAL_MAX_S and single_speaker:
-                # Monólogo: o raciocínio só fecha no fim → não cabe em 9:16.
-                vertical = None
-            else:
-                v_start = start
-                for seg in block:
-                    if end - seg.start <= VERTICAL_MAX_S - 6:
-                        v_start = seg.start
-                        break
-                vertical = {"start": v_start, "end": end}
-            items.append(
-                {
-                    "id": f"c{len(items) + 1}",
-                    "title": _short_title(block[0].text),
-                    "reason": "Bloco com pergunta, resposta e fecho no último trecho.",
-                    "horizontal": {"start": start, "end": end},
-                    "vertical": vertical,
-                    "context_complete": True,
-                }
-            )
-        index += step
-    return items
-
-
-def _short_title(text: str, max_len: int = 66) -> str:
-    text = (text or "corte").strip().rstrip(".,;:")
-    if len(text) <= max_len:
-        return text
-    return text[:max_len].rsplit(" ", 1)[0]
-
-
-# --- Validação determinística ------------------------------------------------
-def _normalize(transcript: Transcript, raw: dict, index: int) -> Candidate | None:
-    horizontal_raw = raw.get("horizontal") or raw.get("window") or {}
-    try:
-        h_start = float(horizontal_raw.get("start"))
-        h_end = float(horizontal_raw.get("end"))
-    except (TypeError, ValueError):
-        return None
-    if h_end <= h_start:
-        return None
-
-    horizontal = snap_window(transcript, h_start, h_end)
-    if horizontal.duration < MIN_CLIP_S:
-        return None
-
-    vertical, skipped = _vertical_window(transcript, raw, horizontal)
-    title = (raw.get("title") or "corte").strip()
-    candidate = Candidate(
-        id=str(raw.get("id") or f"c{index + 1}"),
-        title=title,
-        reason=(raw.get("reason") or "").strip(),
-        horizontal=horizontal,
-        vertical=vertical,
-        transcript_text=transcript.text_between(horizontal.start, horizontal.end),
-        context_complete=horizontal.context_complete and bool(raw.get("context_complete", True)),
-        vertical_skipped=skipped,
-        slug=slugify(title),
-    )
-    return candidate
-
-
-def _vertical_window(
-    transcript: Transcript, raw: dict, horizontal: Window
-) -> tuple[Window | None, str | None]:
-    """Aplica o teto de 90s sem nunca truncar frase (SPEC 2)."""
-    raw_vertical = raw.get("vertical")
-    if raw_vertical is None:
-        # A IA sinalizou que o contexto mínimo não cabe em 9:16: só 16:9.
-        return None, "context_exceeds_90s"
-
-    try:
-        v_start = float(raw_vertical.get("start"))
-        v_end = float(raw_vertical.get("end"))
-    except (TypeError, ValueError):
-        return None, "vertical_window_invalida"
-    if v_end <= v_start:
-        return None, "vertical_window_invalida"
-
-    snapped = snap_window(transcript, v_start, v_end, max_duration=VERTICAL_MAX_S)
-    window = fit_vertical(transcript, snapped) or fit_vertical(transcript, horizontal)
-    if window is None or window.duration > VERTICAL_MAX_S or not window.context_complete:
-        return None, "context_exceeds_90s"
-    return window, None
+    return Window(start=result.start, end=result.end)

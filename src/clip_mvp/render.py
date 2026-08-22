@@ -1,242 +1,137 @@
-"""Render dos exports com ffmpeg (SPEC 6 e 7).
+"""Render dos formatos de saída: 9:16 center, 16:9, (+ 9:16 facetrack em face_track.py).
 
-Todo export sai com áudio normalizado (loudnorm) e `+faststart` para tocar
-direto no player do navegador. Face tracking só entra no `vertical_facetrack`.
+SPEC §1, §5, §7, §14.2, §14.5.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
-from .audio import LOUDNORM_FILTER
-from .boundaries import Window
-from .face_track import TrackResult
-from .ffmpeg_utils import run, video_size
+from .audio import LOUDNORM_I, LOUDNORM_LRA, LOUDNORM_TP
+from .models import Window
+from .utils import run_ffmpeg
 
-VERTICAL_W, VERTICAL_H = 1080, 1920
-HORIZONTAL_W, HORIZONTAL_H = 1280, 720
-VIDEO_ARGS = [
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-crf",
-    "21",
-    "-pix_fmt",
-    "yuv420p",
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
-    "-ar",
-    "48000",
-    "-movflags",
-    "+faststart",
-]
+VERTICAL_SIZE = (1080, 1920)
+HORIZONTAL_SIZE = (1920, 1080)
+
+LOUDNORM_FILTER = f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
 
 
-@dataclass
-class RenderResult:
-    path: Path
-    format: str
-    duration_s: float
-    burned_captions: bool
-    face_track: str | None = None
-
-
-def _base_cmd(source: Path, window: Window) -> list[str]:
+def _seek_args(video_path: Path, window: Window) -> list[str]:
+    """Seek híbrido: -ss grosseiro antes do -i (rápido) + -ss fino depois
+    (preciso), evitando decodificar o vídeo inteiro até o ponto de corte."""
+    pre_seek = max(0.0, window.start - 2.0)
+    offset = window.start - pre_seek
+    duration = max(0.05, window.end - window.start)
     return [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
         "-ss",
-        f"{window.start:.3f}",
-        "-t",
-        f"{window.duration:.3f}",
+        f"{pre_seek:.3f}",
         "-i",
-        str(source),
+        str(video_path),
+        "-ss",
+        f"{offset:.3f}",
+        "-t",
+        f"{duration:.3f}",
     ]
 
 
-def _audio_filter() -> list[str]:
-    return ["-af", f"asetpts=PTS-STARTPTS,{LOUDNORM_FILTER}"]
-
-
-def _crop_size(width: int, height: int) -> tuple[int, int]:
-    """Maior recorte 9:16 que cabe na fonte (par, para yuv420p)."""
-    crop_w = min(width, int(height * 9 / 16))
-    crop_h = min(height, int(crop_w * 16 / 9))
-    return crop_w - (crop_w % 2), crop_h - (crop_h % 2)
-
-
-def render_horizontal(
-    source: Path,
-    window: Window,
-    out_path: Path,
-    ass_name: str | None = None,
-    work_dir: Path | None = None,
-) -> RenderResult:
-    """16:9 com trim limpo, sem face tracking; legenda opcional (lower third)."""
-    work_dir = work_dir or out_path.parent
-    filters = [
-        "setpts=PTS-STARTPTS",
-        f"scale={HORIZONTAL_W}:{HORIZONTAL_H}:force_original_aspect_ratio=decrease",
-        f"pad={HORIZONTAL_W}:{HORIZONTAL_H}:(ow-iw)/2:(oh-ih)/2",
-        "setsar=1",
-    ]
-    if ass_name:
-        filters.append(f"ass={ass_name}")
-    cmd = [
-        *_base_cmd(source, window),
-        "-vf",
-        ",".join(filters),
-        *_audio_filter(),
-        *VIDEO_ARGS,
-        out_path.name,
-    ]
-    run(cmd, cwd=work_dir)
-    return RenderResult(
-        path=out_path,
-        format="horizontal_16x9",
-        duration_s=window.duration,
-        burned_captions=bool(ass_name),
-    )
+def _subtitles_filter(ass_path: Path | None) -> str | None:
+    if ass_path is None:
+        return None
+    escaped = str(ass_path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    return f"subtitles=filename='{escaped}'"
 
 
 def render_vertical_center(
-    source: Path,
+    video_path: Path,
     window: Window,
     out_path: Path,
-    ass_name: str | None = None,
-    work_dir: Path | None = None,
-) -> RenderResult:
-    """9:16 center crop, sem tracking."""
-    work_dir = work_dir or out_path.parent
-    width, height = video_size(source)
-    crop_w, crop_h = _crop_size(width or 1280, height or 720)
-    filters = [
-        "setpts=PTS-STARTPTS",
-        f"crop={crop_w}:{crop_h}:(iw-{crop_w})/2:(ih-{crop_h})/2",
-        f"scale={VERTICAL_W}:{VERTICAL_H}",
-        "setsar=1",
-    ]
-    if ass_name:
-        filters.append(f"ass={ass_name}")
-    cmd = [
-        *_base_cmd(source, window),
+    *,
+    ass_path: Path | None = None,
+    size: tuple[int, int] = VERTICAL_SIZE,
+) -> Path:
+    """Render 9:16 center crop, SEM face tracking (SPEC §9)."""
+    w, h = size
+    vf_parts = ["crop=ih*9/16:ih", f"scale={w}:{h}"]
+    sub = _subtitles_filter(ass_path)
+    if sub:
+        vf_parts.append(sub)
+    vf = ",".join(vf_parts)
+
+    args = _seek_args(video_path, window) + [
         "-vf",
-        ",".join(filters),
-        *_audio_filter(),
-        *VIDEO_ARGS,
-        out_path.name,
+        vf,
+        "-af",
+        LOUDNORM_FILTER,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(out_path),
     ]
-    run(cmd, cwd=work_dir)
-    return RenderResult(
-        path=out_path,
-        format="vertical_center",
-        duration_s=window.duration,
-        burned_captions=bool(ass_name),
-    )
+    run_ffmpeg(args)
+    return Path(out_path)
 
 
-def write_sendcmd(
-    keyframes: list[tuple[float, float]],
-    crop_w: int,
-    frame_width: int,
-    dest: Path,
-) -> None:
-    """Arquivo de comandos do ffmpeg movendo o `x` do crop no tempo."""
-    lines: list[str] = []
-    last_x: int | None = None
-    max_x = max(0, frame_width - crop_w)
-    for t, center in keyframes:
-        x = int(round(min(max(center - crop_w / 2.0, 0), max_x)))
-        if last_x is not None and x == last_x:
-            continue
-        lines.append(f"{max(0.0, t):.3f} crop x {x};")
-        last_x = x
-    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def render_vertical_facetrack(
-    source: Path,
+def render_horizontal_16x9(
+    video_path: Path,
     window: Window,
     out_path: Path,
-    tracking: TrackResult,
-    ass_name: str | None = None,
-    work_dir: Path | None = None,
-) -> RenderResult:
-    """9:16 seguindo o rosto (ou quem está falando, quando há diarização)."""
-    work_dir = work_dir or out_path.parent
-    width, height = video_size(source)
-    width, height = width or 1280, height or 720
-    crop_w, crop_h = _crop_size(width, height)
-
-    if not tracking.available:
-        result = render_vertical_center(source, window, out_path, ass_name, work_dir)
-        return RenderResult(
-            path=result.path,
-            format="vertical_facetrack",
-            duration_s=result.duration_s,
-            burned_captions=result.burned_captions,
-            face_track="center_fallback",
-        )
-
-    cmd_file = work_dir / f"{out_path.stem}_track.cmd"
-    write_sendcmd(tracking.keyframes, crop_w, width, cmd_file)
-    initial_x = int(
-        round(min(max(tracking.keyframes[0][1] - crop_w / 2.0, 0), max(0, width - crop_w)))
-    )
-    filters = [
-        "setpts=PTS-STARTPTS",
-        f"sendcmd=f={cmd_file.name}",
-        f"crop={crop_w}:{crop_h}:{initial_x}:(ih-{crop_h})/2",
-        f"scale={VERTICAL_W}:{VERTICAL_H}",
-        "setsar=1",
+    *,
+    ass_path: Path | None = None,
+    size: tuple[int, int] = HORIZONTAL_SIZE,
+) -> Path:
+    """Render 16:9 trim limpo, SEM face tracking (SPEC §9)."""
+    w, h = size
+    vf_parts = [
+        f"scale={w}:{h}:force_original_aspect_ratio=increase",
+        f"crop={w}:{h}",
     ]
-    if ass_name:
-        filters.append(f"ass={ass_name}")
-    cmd = [
-        *_base_cmd(source, window),
+    sub = _subtitles_filter(ass_path)
+    if sub:
+        vf_parts.append(sub)
+    vf = ",".join(vf_parts)
+
+    args = _seek_args(video_path, window) + [
         "-vf",
-        ",".join(filters),
-        *_audio_filter(),
-        *VIDEO_ARGS,
-        out_path.name,
+        vf,
+        "-af",
+        LOUDNORM_FILTER,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(out_path),
     ]
-    run(cmd, cwd=work_dir)
-    return RenderResult(
-        path=out_path,
-        format="vertical_facetrack",
-        duration_s=window.duration,
-        burned_captions=bool(ass_name),
-        face_track=tracking.method,
-    )
+    run_ffmpeg(args)
+    return Path(out_path)
 
 
-def render_poster(source: Path, at: float, out_path: Path, width: int = 640) -> Path:
-    """Thumbnail usado nos cards da UI."""
-    run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{max(0.0, at):.3f}",
-            "-i",
-            str(source),
-            "-frames:v",
-            "1",
-            "-vf",
-            f"scale={width}:-2",
-            "-q:v",
-            "4",
-            str(out_path),
-        ]
-    )
-    return out_path
+def cut_raw(video_path: Path, window: Window, out_path: Path) -> Path:
+    """Corte simples por timestamp, sem crop/legendas (usado por testes de
+    fronteira e como utilitário de baixo nível, SPEC §12 passo 1)."""
+    args = _seek_args(video_path, window) + [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        str(out_path),
+    ]
+    run_ffmpeg(args)
+    return Path(out_path)

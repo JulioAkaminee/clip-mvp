@@ -1,78 +1,47 @@
-"""Áudio: extração para STT, chunking e loudnorm (SPEC 14.2)."""
+"""Áudio: extração e normalização de loudness (SPEC §1, §14.2)."""
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
-from .ffmpeg_utils import duration_of, run
+from .utils import run_ffmpeg
 
-LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
-"""Alvo de diálogo consistente entre falantes/cortes, sem pico estourado."""
+# Alvo EBU R128 típico para diálogo/podcast.
+LOUDNORM_I = "-16.0"
+LOUDNORM_TP = "-1.5"
+LOUDNORM_LRA = "11.0"
 
-STT_CHUNK_SECONDS = 600
-"""~10 min por chunk (SPEC 6) para respeitar o limite do endpoint STT."""
 
-
-def extract_audio(source: Path, dest: Path, normalize: bool = True) -> Path:
-    """Extrai mono 16 kHz para STT (opcionalmente já normalizado)."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    filters = ["aresample=16000"]
-    if normalize:
-        filters.append(LOUDNORM_FILTER)
-    run(
+def extract_audio(video_path: Path, out_path: Path, sample_rate: int = 16000) -> Path:
+    """Extrai áudio mono do vídeo para uso no STT (wav 16kHz)."""
+    out_path = Path(out_path)
+    run_ffmpeg(
         [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
             "-i",
-            str(source),
+            str(video_path),
             "-vn",
             "-ac",
             "1",
-            "-af",
-            ",".join(filters),
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "64k",
-            str(dest),
+            "-ar",
+            str(sample_rate),
+            str(out_path),
         ]
     )
-    return dest
+    return out_path
 
 
-def split_audio(source: Path, out_dir: Path, chunk_s: int = STT_CHUNK_SECONDS) -> list[tuple[Path, float]]:
-    """Divide o áudio em pedaços; devolve (arquivo, offset_em_segundos)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    total = duration_of(source)
-    if total <= chunk_s:
-        return [(source, 0.0)]
-    chunks: list[tuple[Path, float]] = []
-    count = math.ceil(total / chunk_s)
-    for i in range(count):
-        offset = i * chunk_s
-        dest = out_dir / f"chunk_{i:03d}.mp3"
-        run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-ss",
-                f"{offset}",
-                "-t",
-                f"{chunk_s}",
-                "-i",
-                str(source),
-                "-c",
-                "copy",
-                str(dest),
-            ]
-        )
-        if dest.exists():
-            chunks.append((dest, float(offset)))
-    return chunks
+def loudnorm(in_path: Path, out_path: Path, *, video: bool = False) -> Path:
+    """Aplica ffmpeg loudnorm (single-pass) para consistência de loudness
+    entre falantes/cortes (SPEC §14.2). Evita picos estourados após o crop."""
+    in_path = Path(in_path)
+    out_path = Path(out_path)
+    filter_arg = f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
+
+    args = ["-i", str(in_path)]
+    if video:
+        args += ["-af", filter_arg, "-c:v", "copy"]
+    else:
+        args += ["-af", filter_arg]
+    args += [str(out_path)]
+    run_ffmpeg(args)
+    return out_path

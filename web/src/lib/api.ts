@@ -1,4 +1,12 @@
-import type { AppConfig, Estimate, Health, Job, JobRequest } from "./types";
+import type {
+  AppConfig,
+  ArtifactName,
+  Clip,
+  Health,
+  JobListItem,
+  JobProgress,
+  JobRequest,
+} from "./types";
 
 const BASE = "/api";
 
@@ -37,20 +45,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<Health>("/health"),
   config: () => request<AppConfig>("/config"),
-  jobs: () => request<{ jobs: Job[]; running: string | null; queued: string[] }>("/jobs"),
-  job: (id: string) => request<Job>(`/jobs/${id}`),
+  jobs: () => request<{ jobs: JobListItem[] }>("/jobs"),
+  job: (id: string) => request<JobProgress>(`/jobs/${id}`),
+  clips: (id: string) => request<{ clips: Clip[] }>(`/jobs/${id}/clips`),
   createJob: (payload: JobRequest) =>
-    request<Job>("/jobs", { method: "POST", body: JSON.stringify(payload) }),
-  estimate: (payload: JobRequest) =>
-    request<Estimate>("/estimate", {
+    request<{ job_id: string }>("/jobs", { method: "POST", body: JSON.stringify(payload) }),
+  cancel: (id: string) => request<{ canceled: boolean }>(`/jobs/${id}/cancel`, { method: "POST" }),
+  retry: (id: string, payload?: Partial<JobRequest>) =>
+    request<{ retried: boolean }>(`/jobs/${id}/retry`, {
       method: "POST",
-      body: JSON.stringify({ ...payload, dry_run: true }),
+      body: JSON.stringify({ url: "", ...payload }),
     }),
-  cancel: (id: string) => request<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
-  resume: (id: string, payload: { mode: "more" | "count" | "auto"; count?: number | null }) =>
-    request<Job>(`/jobs/${id}/resume`, { method: "POST", body: JSON.stringify(payload) }),
-  remove: (id: string, files = false) =>
-    request<{ deleted: string }>(`/jobs/${id}?files=${files}`, { method: "DELETE" }),
   rate: (id: string, slug: string, verdict: "good" | "bad", note = "") =>
     request<Record<string, unknown>>(`/jobs/${id}/clips/${slug}/rate`, {
       method: "POST",
@@ -58,9 +63,18 @@ export const api = {
     }),
 };
 
-export function artifactUrl(jobId: string, slug: string, name: string, download = false): string {
+export function artifactUrl(
+  jobId: string,
+  slug: string,
+  name: ArtifactName | string,
+  download = false,
+): string {
   const suffix = download ? "?download=true" : "";
-  return `${BASE}/jobs/${jobId}/clips/${slug}/files/${encodeURIComponent(name)}${suffix}`;
+  return `${BASE}/jobs/${jobId}/clips/${encodeURIComponent(slug)}/files/${encodeURIComponent(name)}${suffix}`;
+}
+
+export function posterUrl(jobId: string, slug: string): string {
+  return `${BASE}/jobs/${jobId}/clips/${encodeURIComponent(slug)}/poster.jpg`;
 }
 
 export function eventsUrl(jobId: string): string {
