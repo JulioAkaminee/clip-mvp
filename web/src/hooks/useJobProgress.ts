@@ -48,6 +48,7 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
     try {
       const payload = await api.job(jobId);
       setProgress(payload);
+      setError(null);
       pushLog(payload);
       await loadClips(jobId);
     } catch (err) {
@@ -72,11 +73,15 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
     let poll: number | undefined;
     let source: EventSource | undefined;
 
+    let terminal = false;
+
     const handle = (payload: JobProgress) => {
       if (disposed) return;
+      terminal = TERMINAL.has(payload.status);
       setProgress(payload);
+      setError(null);
       pushLog(payload);
-      if (TERMINAL.has(payload.status) && !terminalNotified.current) {
+      if (terminal && !terminalNotified.current) {
         terminalNotified.current = true;
         void loadClips(jobId);
         onTerminalRef.current?.();
@@ -116,7 +121,10 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
         return;
       }
 
-      if (disposed) return;
+      // Job já terminado: o backend manda o último estado e fecha o stream, o
+      // que o navegador entrega como `onerror`. Abrir o SSE só para cair no
+      // fallback marcaria a tela como degradada sem nada ter degradado.
+      if (disposed || terminal) return;
       source = new EventSource(eventsUrl(jobId));
       source.onopen = () => setLive(true);
       source.onmessage = (event: MessageEvent<string>) => {
@@ -129,7 +137,7 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
       source.onerror = () => {
         setLive(false);
         source?.close();
-        startPolling();
+        if (!terminal) startPolling();
       };
     })();
 

@@ -2,7 +2,9 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
-const API_TARGET = process.env.CLIP_MVP_API ?? "http://127.0.0.1:8000";
+// Mesma porta default de `clip serve` (cli.py). Divergir daqui fazia o
+// `npm run dev` do README responder "API indisponível" sem nada estar errado.
+const API_TARGET = process.env.CLIP_MVP_API ?? "http://127.0.0.1:8765";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],

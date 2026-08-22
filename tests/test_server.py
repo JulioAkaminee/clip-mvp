@@ -192,6 +192,36 @@ class TestUi:
         assert "EventSource" in source
         assert "startPolling" in source
 
+    def test_ui_shows_a_loading_state_instead_of_the_new_job_form(self):
+        """Job selecionado que ainda não respondeu não é "criar job novo".
+
+        A condição antiga (`progress === null` cai no formulário) piscava o
+        formulário a cada troca de job e escondia falha de fetch atrás dele.
+        """
+        app_source = (WEB_SRC / "App.tsx").read_text("utf-8")
+        assert "Carregando progresso do job" in app_source
+        assert "Não foi possível carregar este job" in app_source
+        # o erro do hook precisa chegar até a tela
+        assert "error" in app_source
+
+
+class TestDevProxyMatchesServe:
+    def test_vite_dev_proxy_targets_the_serve_default_port(self):
+        """`clip serve` + `npm run dev` é o fluxo de dev documentado no README.
+
+        O proxy do Vite apontava para :8000 enquanto `clip serve` sobe em :8765,
+        então seguir o README ao pé da letra dava "API indisponível" sem nada
+        estar quebrado.
+        """
+        import inspect
+
+        from clip_mvp.cli import serve_cmd
+
+        default_port = inspect.signature(serve_cmd).parameters["port"].default.default
+        vite_config = (WEB_SRC.parent / "vite.config.ts").read_text("utf-8")
+
+        assert f"127.0.0.1:{default_port}" in vite_config
+
 
 class TestDuplicateSubmission:
     """job_id é determinístico pela URL: reenviar não pode duplicar o job."""

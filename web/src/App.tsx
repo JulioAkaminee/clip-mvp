@@ -6,7 +6,7 @@ import { JobView } from "./components/JobView";
 import { NewJobForm } from "./components/NewJobForm";
 import { SettingsPage } from "./components/SettingsPage";
 import { Sidebar } from "./components/Sidebar";
-import { Button, Card } from "./components/ui";
+import { Button, Card, Spinner } from "./components/ui";
 
 type Screen = "new" | "settings" | "job";
 
@@ -49,8 +49,9 @@ export default function App() {
     })();
   }, [refreshJobs]);
 
-  const { progress, clips, log, live, applyRating, reload } = useJobProgress(selectedId, () =>
-    void refreshJobs(),
+  const { progress, clips, log, live, error, applyRating, reload } = useJobProgress(
+    selectedId,
+    () => void refreshJobs(),
   );
 
   // Mantém a lista lateral (percentual e ETA de cada job) fresca.
@@ -117,6 +118,9 @@ export default function App() {
             </Card>
           )}
 
+          {/* Um job selecionado que ainda não respondeu não é "criar job novo":
+              cair no formulário aqui piscava a tela a cada troca de job e, se o
+              fetch falhasse, escondia o erro atrás de um formulário em branco. */}
           {screen === "settings" ? (
             <SettingsPage
               health={health}
@@ -124,8 +128,39 @@ export default function App() {
                 void refreshHealth();
               }}
             />
-          ) : screen === "new" || selectedId === null || progress === null ? (
+          ) : screen === "new" || selectedId === null ? (
             <NewJobForm config={config} health={health} onCreated={onCreated} />
+          ) : error !== null && progress === null ? (
+            <Card className="border-red-400/25 bg-red-500/8">
+              <h2 className="text-sm font-semibold text-red-200">
+                Não foi possível carregar este job
+              </h2>
+              <p className="mt-1 text-[0.8rem] text-red-100/80">{error}</p>
+              <p className="mt-2 text-[0.78rem] text-mist-400">
+                O job pode ter sido removido de <code className="text-mist-200">work/</code>, ou a
+                API caiu.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <Button size="sm" onClick={() => void reload()}>
+                  Tentar de novo
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setSelectedId(null);
+                    setScreen("new");
+                  }}
+                >
+                  Criar outro job
+                </Button>
+              </div>
+            </Card>
+          ) : progress === null ? (
+            <Card className="flex items-center gap-3">
+              <Spinner className="text-brand-400" />
+              <span className="text-[0.85rem] text-mist-300">Carregando progresso do job…</span>
+            </Card>
           ) : (
             <JobView
               key={progress.job_id}
