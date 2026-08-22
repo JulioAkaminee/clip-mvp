@@ -188,12 +188,16 @@ class StageState:
     units_total: float = 0.0
     units_done: float = 0.0
     predicted_seconds: float | None = None
+    #: Mesmo relógio do reporter. Sem isso o tempo decorrido de um estágio em
+    #: andamento mistura o relógio injetado (``started_at``) com o relógio real,
+    #: e todo o cálculo de ETA e de calibração fica intestável.
+    clock: Callable[[], float] = field(default=time.time, repr=False, compare=False)
 
     @property
     def elapsed(self) -> float | None:
         if self.started_at is None:
             return None
-        return (self.ended_at or time.time()) - self.started_at
+        return (self.ended_at or self.clock()) - self.started_at
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +229,7 @@ def _job_payload_keys() -> tuple[str, ...]:
         "stage",
         "stage_label",
         "stage_percent",
+        "stage_elapsed_seconds",
         "percent",
         "eta_seconds",
         "eta_text",
@@ -235,6 +240,7 @@ def _job_payload_keys() -> tuple[str, ...]:
         "stages",
         "elapsed_seconds",
         "updated_at",
+        "heartbeat",
         "error",
     )
 
@@ -260,6 +266,11 @@ class ProgressReporter:
     ETA_SMOOTHING = 0.35
     #: teto de crescimento do ETA entre duas emissões (evita saltos absurdos)
     ETA_MAX_GROWTH = 1.35
+    #: Um estágio que ainda está rodando nunca vale 0s restantes. Sem esse piso,
+    #: qualquer estágio que passe da própria previsão (e todo estágio passa, em
+    #: máquina lenta ou rede ruim) faz o painel anunciar "finalizando…" enquanto
+    #: o ffmpeg ainda tem meio minuto de trabalho.
+    MIN_RUNNING_STAGE_REMAINING_S = 3.0
 
     def __init__(
         self,
@@ -270,6 +281,7 @@ class ProgressReporter:
         source_minutes: float = 0.0,
         sinks: list[Callable[[dict[str, Any]], None]] | None = None,
         clock: Callable[[], float] = time.time,
+        heartbeat_interval: float = 0.0,
     ) -> None:
         self.job_id = job_id
         self.status_path = Path(status_path) if status_path else None
@@ -278,6 +290,9 @@ class ProgressReporter:
         self._sinks: list[Callable[[dict[str, Any]], None]] = list(sinks or [])
         self._clock = clock
         self._lock = threading.RLock()
+        self._heartbeat_interval = max(0.0, float(heartbeat_interval))
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat: threading.Thread | None = None
 
         self.started_at = clock()
         self.status = "queued"
@@ -287,7 +302,12 @@ class ProgressReporter:
         self.result: dict[str, Any] | None = None
 
         self.stages: dict[str, StageState] = {
-            name: StageState(name=name, label=stage_label(name), weight=STAGE_WEIGHTS[name])
+            name: StageState(
+                name=name,
+                label=stage_label(name),
+                weight=STAGE_WEIGHTS[name],
+                clock=clock,
+            )
             for name in STAGE_ORDER
         }
         self.clips: dict[str, ClipProgress] = {}
@@ -301,6 +321,46 @@ class ProgressReporter:
         self._last_percent = -1
         self._percent_high_water = 0.0
         self._predict_all()
+
+    # -- batimento ------------------------------------------------------
+
+    def start_heartbeat(self, interval: float | None = None) -> None:
+        """Reemite o snapshot periodicamente enquanto o job roda.
+
+        Sem isso o progresso só se move quando o pipeline chama o reporter, e
+        vários estágios são uma única chamada bloqueante: ``candidates`` é um
+        prompt sobre a transcrição inteira, ``render`` gasta ~1 min por arquivo.
+        Nesses trechos o ETA congelava e não havia como distinguir "trabalhando"
+        de "travou" — que é justamente a pergunta que o painel existe para
+        responder.
+
+        Batimentos não entram em ``events.jsonl``: aquele arquivo é o histórico
+        de transições do job, não um tick de relógio.
+        """
+        if interval is not None:
+            self._heartbeat_interval = max(0.0, float(interval))
+        if self._heartbeat_interval <= 0 or self._heartbeat is not None:
+            return
+
+        def beat() -> None:
+            while not self._heartbeat_stop.wait(self._heartbeat_interval):
+                with self._lock:
+                    running = self.status in {"queued", "running"}
+                if not running:
+                    return
+                self._emit(force=True, heartbeat=True)
+
+        self._heartbeat_stop.clear()
+        self._heartbeat = threading.Thread(
+            target=beat, name=f"clip-heartbeat-{self.job_id}", daemon=True
+        )
+        self._heartbeat.start()
+
+    def stop_heartbeat(self) -> None:
+        self._heartbeat_stop.set()
+        thread, self._heartbeat = self._heartbeat, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     # -- configuração -------------------------------------------------
 
@@ -380,6 +440,30 @@ class ProgressReporter:
             fraction = (st.units_done / total) if total > 0 else 0.0
         self.update(stage, fraction, message, units_done=done)
 
+    def increment_units(
+        self, stage: str, delta: float = 1.0, message: Callable[[float, float], str] | str = ""
+    ) -> float:
+        """Soma ``delta`` unidades concluídas e devolve o novo total.
+
+        :meth:`advance_units` recebe um valor absoluto, então dois workers que
+        terminam ao mesmo tempo leem o mesmo contador e mandam o mesmo número —
+        ``max()`` colapsa os dois em um. Com ``render_workers=2`` a barra de
+        render passava a contar menos arquivos do que existem e só se acertava
+        no fim do estágio. Incrementar sob o lock resolve.
+
+        ``message`` pode ser um callable ``(done, total) -> str`` para que o
+        texto use o contador já resolvido, sem outra leitura de fora do lock.
+        """
+        with self._lock:
+            st = self.stages[stage]
+            total = st.units_total or 0.0
+            st.units_done = min(total, st.units_done + float(delta)) if total > 0 else st.units_done + float(delta)
+            done = st.units_done
+            fraction = (done / total) if total > 0 else 0.0
+        text = message(done, total) if callable(message) else message
+        self.update(stage, fraction, text, units_done=done)
+        return done
+
     def finish_stage(self, stage: str, message: str = "") -> None:
         with self._lock:
             st = self.stages[stage]
@@ -445,6 +529,7 @@ class ProgressReporter:
     # -- término --------------------------------------------------------
 
     def finish(self, result: dict[str, Any] | None = None, message: str = "") -> None:
+        self.stop_heartbeat()
         with self._lock:
             self.status = "done"
             self.current_stage = "done"
@@ -467,6 +552,7 @@ class ProgressReporter:
         hint: str = "",
     ) -> None:
         """Marca o job como erro. Nunca deixa a UI presa girando."""
+        self.stop_heartbeat()
         with self._lock:
             stage = stage or self.current_stage
             self.status = "error"
@@ -487,6 +573,7 @@ class ProgressReporter:
         self._emit(message=self.message, force=True)
 
     def cancel(self, message: str = "Cancelado pelo usuário") -> None:
+        self.stop_heartbeat()
         with self._lock:
             self.status = "canceled"
             self.current_stage = "canceled"
@@ -566,7 +653,10 @@ class ProgressReporter:
                     predicted_remaining = elapsed * (1.0 - frac) / frac
                 else:
                     predicted_remaining = max(0.0, predicted - elapsed)
-                remaining += max(0.0, predicted_remaining)
+                # Enquanto o estágio não terminou, ele custa algo: a última
+                # unidade ainda está sendo escrita quando o contador já bateu no
+                # total, e todo estágio eventualmente passa da própria previsão.
+                remaining += max(predicted_remaining, self.MIN_RUNNING_STAGE_REMAINING_S)
             else:
                 saw_any = True
                 remaining += max(0.0, predicted)
@@ -595,6 +685,7 @@ class ProgressReporter:
             stage = self.current_stage
             st = self.stages.get(stage)
             eta = self._smooth_eta(self._raw_eta())
+            stage_elapsed = st.elapsed if st is not None else None
             payload: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
                 "job_id": self.job_id,
@@ -602,6 +693,12 @@ class ProgressReporter:
                 "stage": stage,
                 "stage_label": stage_label(stage),
                 "stage_percent": round(st.percent, 2) if st else 0.0,
+                # Quanto tempo o estágio atual já leva: é o número que separa
+                # "está trabalhando" de "travou" quando não há unidades para
+                # contar (um único prompt, um único ffmpeg).
+                "stage_elapsed_seconds": (
+                    round(stage_elapsed, 2) if stage_elapsed is not None else None
+                ),
                 "percent": round(self._percent(), 2),
                 "eta_seconds": (int(round(eta)) if eta is not None else None),
                 "eta_text": format_eta(eta),
@@ -612,6 +709,7 @@ class ProgressReporter:
                 "stages": [self.stages[n].to_dict() for n in STAGE_ORDER],
                 "elapsed_seconds": round(self._clock() - self.started_at, 2),
                 "updated_at": self._clock(),
+                "heartbeat": False,
                 "error": self.error,
                 "source_minutes": round(self.source_minutes, 2),
                 "result": self.result,
@@ -621,7 +719,7 @@ class ProgressReporter:
     #: Intervalo mínimo entre emissões que não mudam o percentual inteiro.
     EMIT_MIN_INTERVAL = 0.15
 
-    def _emit(self, message: str = "", *, force: bool = False) -> None:
+    def _emit(self, message: str = "", *, force: bool = False, heartbeat: bool = False) -> None:
         now = self._clock()
         if not force:
             with self._lock:
@@ -637,8 +735,10 @@ class ProgressReporter:
             if message:
                 self.message = message
             payload = self.snapshot()
+            payload["heartbeat"] = heartbeat
         self._write_status(payload)
-        self._append_event(payload)
+        if not heartbeat:
+            self._append_event(payload)
         for sink in list(self._sinks):
             try:
                 sink(payload)

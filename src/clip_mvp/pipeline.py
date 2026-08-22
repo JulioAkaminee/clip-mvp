@@ -255,6 +255,7 @@ def _select_clips(
 def make_reporter(settings: Settings, job_id: str, **kwargs: Any) -> ProgressReporter:
     """Cria um reporter que persiste status/eventos em ``work/<job_id>/``."""
     jdir = make_job_dir(settings.work_dir, job_id)
+    kwargs.setdefault("heartbeat_interval", settings.progress_heartbeat_s)
     return ProgressReporter(
         job_id,
         status_path=jdir / "status.json",
@@ -336,6 +337,10 @@ def _run_or_resume(
     cancel_check: Callable[[], bool] | None = None,
 ) -> JobSummary:
     reporter = reporter or make_reporter(settings, job_id)
+    # Vários estágios são uma única chamada bloqueante (um prompt sobre a
+    # transcrição inteira, um ffmpeg por arquivo): sem batimento o ETA congela
+    # justamente nos trechos em que o usuário mais precisa saber que algo anda.
+    reporter.start_heartbeat()
     try:
         return _execute(
             job_id,
@@ -353,6 +358,8 @@ def _run_or_resume(
     except Exception as exc:  # noqa: BLE001 - o estado de erro precisa chegar à UI
         reporter.fail(exc, hint=_hint_for(exc))
         raise
+    finally:
+        reporter.stop_heartbeat()
 
 
 def _execute(
@@ -778,11 +785,9 @@ def _render_format(
     else:
         reporter.update_clip(slug, format_name=format_name, format_status="done")
     finally:
-        stage = reporter.stages["render"]
-        reporter.advance_units(
+        reporter.increment_units(
             "render",
-            min(stage.units_total, stage.units_done + 1),
-            f"Renderizando… {int(stage.units_done) + 1}/{int(stage.units_total)} arquivos",
+            message=lambda done, total: f"Renderizando… {int(done)}/{int(total)} arquivos",
         )
 
 

@@ -109,6 +109,13 @@ class Settings:
     # Feedback few-shot (SPEC §14.7)
     feedback_examples_n: int = field(default_factory=lambda: _env_int("CLIP_FEEDBACK_EXAMPLES_N", 6))
 
+    # Batimento do progresso: de quanto em quanto tempo reemitir o snapshot
+    # enquanto o job roda, para o ETA andar dentro de estágios sem unidades
+    # contáveis (um prompt, um ffmpeg). 0 desliga.
+    progress_heartbeat_s: float = field(
+        default_factory=lambda: _env_float("CLIP_PROGRESS_HEARTBEAT_S", 2.0)
+    )
+
     # Paralelismo. O alvo é um MacBook i5 4-core 16GB: chamadas de rede
     # (STT/score/meta) paralelizam bem, mas ffmpeg e MediaPipe competem por CPU
     # e RAM — subir demais o render faz a máquina entrar em swap e ficar mais
