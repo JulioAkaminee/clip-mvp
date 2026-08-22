@@ -298,6 +298,7 @@ class ProgressReporter:
         self._calibration_weight = 0.0
         self._eta_smoothed: float | None = None
         self._last_emit = 0.0
+        self._last_percent = -1
         self._predict_all()
 
     # -- configuração -------------------------------------------------
@@ -612,11 +613,20 @@ class ProgressReporter:
             }
             return payload
 
+    #: Intervalo mínimo entre emissões que não mudam o percentual inteiro.
+    EMIT_MIN_INTERVAL = 0.15
+
     def _emit(self, message: str = "", *, force: bool = False) -> None:
-        now = time.time()
-        if not force and (now - self._last_emit) < 0.15:
-            # throttle: estágios chatty não devem saturar SSE/disco
-            return
+        now = self._clock()
+        if not force:
+            with self._lock:
+                percent_now = int(self._percent())
+            # Mudou o percentual inteiro? Sempre emite: são no máximo ~100
+            # eventos por job e é isso que faz a barra andar de verdade em
+            # estágios rápidos. O throttle vale só para repetição de mensagem.
+            if percent_now == self._last_percent and (now - self._last_emit) < self.EMIT_MIN_INTERVAL:
+                return
+            self._last_percent = percent_now
         self._last_emit = now
         with self._lock:
             if message:

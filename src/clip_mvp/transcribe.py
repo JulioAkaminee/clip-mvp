@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import Settings
 from .models import Segment, Transcript, Word
@@ -108,10 +109,15 @@ def transcribe_audio(
     client: OpenRouterClient | None = None,
     language: str = "pt",
     chunk_seconds: int = CHUNK_SECONDS_DEFAULT,
+    on_progress: Callable[[int, int, str], None] | None = None,
 ) -> Transcript:
     """Transcreve o áudio completo (com chunking ~10min) via OpenRouter Whisper.
 
+    Os chunks são enviados em paralelo limitado: STT é espera de rede, e um
+    podcast de 1h vira 6 chamadas que não precisam ser sequenciais.
+
     `client` pode ser injetado (ex.: em testes) para evitar chamadas de rede.
+    ``on_progress(concluídos, total, mensagem)`` alimenta a barra e o ETA.
     """
     client = client or OpenRouterClient(settings)
     audio_path = Path(audio_path)
@@ -119,11 +125,42 @@ def transcribe_audio(
     tmp_dir = Path(tempfile.mkdtemp(prefix="clip_mvp_stt_"))
     try:
         chunks = _split_audio(audio_path, chunk_seconds, tmp_dir)
+        total = len(chunks)
+        results: dict[int, dict[str, Any]] = {}
+        done = 0
+
+        if on_progress:
+            on_progress(0, total, f"Transcrevendo… 0/{total} blocos")
+
+        def work(index: int) -> tuple[int, dict[str, Any]]:
+            chunk_path, _offset = chunks[index]
+            return index, client.transcribe(chunk_path, language=language)
+
+        workers = max(1, min(settings.network_workers, total))
+        if workers == 1 or total == 1:
+            for i in range(total):
+                results[i] = work(i)[1]
+                done += 1
+                if on_progress:
+                    on_progress(done, total, f"Transcrevendo… {done}/{total} blocos")
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(work, i) for i in range(total)]
+                for future in as_completed(futures):
+                    index, raw = future.result()
+                    results[index] = raw
+                    done += 1
+                    if on_progress:
+                        on_progress(done, total, f"Transcrevendo… {done}/{total} blocos")
+
+        # remonta na ordem cronológica: a ordem de conclusão do pool é arbitrária
         all_segments: list[Segment] = []
         next_id = 0
-        for chunk_path, offset in chunks:
-            raw = client.transcribe(chunk_path, language=language)
-            segs = _parse_verbose_json(raw, offset, next_id)
+        for i in range(total):
+            raw = results.get(i)
+            if raw is None:
+                continue
+            segs = _parse_verbose_json(raw, chunks[i][1], next_id)
             all_segments.extend(segs)
             next_id += len(segs)
     finally:

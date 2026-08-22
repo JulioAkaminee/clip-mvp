@@ -76,11 +76,16 @@ def fake_client(whisper_verbose_json_raw) -> FakeOpenRouterClient:
 
 
 def _patch_download(monkeypatch, sample_video_path: Path):
-    def fake_download_source(url: str, job_dir: Path, *, height: int = 720) -> DownloadResult:
+    def fake_download_source(
+        url: str, job_dir: Path, *, height: int = 720, on_progress=None
+    ) -> DownloadResult:
         job_dir = Path(job_dir)
         job_dir.mkdir(parents=True, exist_ok=True)
         dest = job_dir / "source.mp4"
         shutil.copyfile(sample_video_path, dest)
+        if on_progress:
+            on_progress(0.5, "Baixando vídeo… 50%")
+            on_progress(1.0, "Download concluído")
         return DownloadResult(
             video_path=dest,
             info_path=job_dir / "source.info.json",
@@ -90,6 +95,8 @@ def _patch_download(monkeypatch, sample_video_path: Path):
         )
 
     monkeypatch.setattr(pipeline_mod, "download_source", fake_download_source)
+    # sem isso o seed do ETA tentaria consultar a rede durante o teste
+    monkeypatch.setattr(pipeline_mod, "probe_metadata", lambda url: {"duration": 12.0})
 
 
 def _settings(tmp_path: Path) -> Settings:

@@ -198,13 +198,29 @@ class TestEta:
 
         assert r_slow.snapshot()["eta_seconds"] > r_fast.snapshot()["eta_seconds"]
 
-    def test_eta_does_not_spike_between_emissions(self, reporter, clock):
+    def test_eta_does_not_spike_between_consecutive_events(self, tmp_path):
+        """O número na tela sobe suavemente, nunca teleporta.
+
+        A garantia vale entre eventos consecutivos: é isso que o usuário vê.
+        """
+        clock = FakeClock()
+        events: list[dict] = []
+        reporter = ProgressReporter(
+            "job", source_minutes=30.0, clock=clock, sinks=[events.append]
+        )
         reporter.start_stage("download", units_total=1)
         clock.advance(5)
-        before = reporter.snapshot()["eta_seconds"]
+        reporter.update("download", 0.5, "metade")
+        clock.advance(1)
         reporter.set_units("render", 300)  # explosão artificial de trabalho
-        after = reporter.snapshot()["eta_seconds"]
-        assert after <= max(before * ProgressReporter.ETA_MAX_GROWTH, before + 20) + 1
+        clock.advance(1)
+        reporter.set_units("score", 200)
+
+        etas = [e["eta_seconds"] for e in events if e["eta_seconds"] is not None]
+        assert len(etas) >= 3
+        for previous, current in zip(etas, etas[1:]):
+            ceiling = max(previous * ProgressReporter.ETA_MAX_GROWTH, previous + 20) + 1
+            assert current <= ceiling, f"ETA saltou de {previous}s para {current}s"
 
     def test_longer_video_has_longer_eta(self, clock):
         short = ProgressReporter("a", source_minutes=5.0, clock=FakeClock())
