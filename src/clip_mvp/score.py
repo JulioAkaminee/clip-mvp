@@ -13,6 +13,10 @@ from .models import Candidate, Score, ScoreBreakdown
 from .openrouter import OpenRouterClient, image_to_b64
 from .utils import run_ffmpeg
 
+#: Faixa de cada critério do breakdown (SPEC §8: quatro critérios de 0–25 que
+#: somam 100).
+DIMENSION_MAX = 25.0
+
 #: Teto de score para trecho com contexto aberto (SPEC §8: penalidade dura).
 TRUNCATED_SCORE_CAP = 45.0
 #: Um corte que não fecha a ideia não pode pontuar alto em "arco".
@@ -181,15 +185,45 @@ def apply_quality_rules(
     )
 
 
+def _dimension(breakdown_raw: dict, name: str) -> float:
+    """Um critério do breakdown, dentro da faixa da SPEC §8 (0–25)."""
+    try:
+        value = float(breakdown_raw.get(name, 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(DIMENSION_MAX, value))
+
+
 def _parse_score(raw: dict) -> Score:
-    breakdown_raw = raw.get("breakdown", {})
+    """Lê a resposta do scorer já dentro das regras da SPEC §8.
+
+    O modelo é um LLM pedindo para respeitar aritmética: ele às vezes devolve
+    ``hook: 30`` (fora da faixa 0–25) ou um ``total`` que não é a soma dos
+    quatro critérios. Aceitar isso cru contamina duas coisas: o ranking, que
+    passa a comparar notas em escalas diferentes, e as penalidades
+    determinísticas de :func:`apply_quality_rules`, que descontam do total a
+    diferença cortada de um critério — conta que só fecha se o total for a soma.
+
+    Os quatro critérios *são* a nota (SPEC §8: "somam 100"), então a soma manda.
+    O ``total`` solto do modelo só é usado quando não veio breakdown nenhum.
+    """
+    breakdown_raw = raw.get("breakdown") or {}
     breakdown = ScoreBreakdown(
-        hook=float(breakdown_raw.get("hook", 0)),
-        emocao=float(breakdown_raw.get("emocao", 0)),
-        citavel=float(breakdown_raw.get("citavel", 0)),
-        arco=float(breakdown_raw.get("arco", 0)),
+        hook=_dimension(breakdown_raw, "hook"),
+        emocao=_dimension(breakdown_raw, "emocao"),
+        citavel=_dimension(breakdown_raw, "citavel"),
+        arco=_dimension(breakdown_raw, "arco"),
     )
-    total = float(raw.get("total", breakdown.total)) or breakdown.total
+
+    if breakdown.total > 0:
+        total = breakdown.total
+    else:
+        try:
+            total = float(raw.get("total", 0) or 0)
+        except (TypeError, ValueError):
+            total = 0.0
+    total = max(0.0, min(100.0, total))
+
     return Score(
         total=round(total, 2),
         breakdown=breakdown,

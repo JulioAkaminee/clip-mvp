@@ -12,6 +12,7 @@ from clip_mvp.config import Settings
 from clip_mvp.models import Score, ScoreBreakdown
 from clip_mvp.score import (
     TRUNCATED_ARCO_CAP,
+    _parse_score,
     apply_quality_rules,
     extract_frames,
     frames_cache_key,
@@ -167,6 +168,64 @@ class TestBounds:
     )
     def test_looks_truncated(self, text, expected):
         assert looks_truncated(text) is expected
+
+
+class TestBreakdownBounds:
+    """SPEC §8: quatro critérios de 0–25 que somam 100.
+
+    Isso é um pedido em prompt para um LLM, então o código precisa ser a rede de
+    segurança. Aceitar `hook: 40` cru contaminava o ranking (notas em escalas
+    diferentes) e as penalidades, que descontam do total a diferença cortada de
+    um critério — conta que só fecha se o total for a soma.
+    """
+
+    def test_dimension_above_25_is_clamped(self):
+        score = _parse_score(
+            {"breakdown": {"hook": 40, "emocao": 20, "citavel": 20, "arco": 20}, "total": 100}
+        )
+        assert score.breakdown.hook == 25.0
+        assert score.total == 85.0
+
+    def test_negative_dimension_is_clamped(self):
+        score = _parse_score(
+            {"breakdown": {"hook": -5, "emocao": 20, "citavel": 20, "arco": 20}}
+        )
+        assert score.breakdown.hook == 0.0
+        assert score.total == 60.0
+
+    def test_total_follows_the_breakdown_when_the_model_disagrees(self):
+        score = _parse_score(
+            {"breakdown": {"hook": 20, "emocao": 20, "citavel": 20, "arco": 20}, "total": 95}
+        )
+        assert score.total == 80.0
+
+    def test_total_is_kept_when_the_model_sends_no_breakdown(self):
+        score = _parse_score({"total": 72})
+        assert score.total == 72.0
+
+    def test_garbage_values_do_not_crash_the_job(self):
+        score = _parse_score({"breakdown": {"hook": "muito alto", "emocao": None}, "total": "n/a"})
+        assert score.total == 0.0
+        assert score.breakdown.hook == 0.0
+
+    def test_hook_penalty_keeps_total_and_breakdown_coherent(self):
+        """A penalidade de hook desconta do total; se o total não fosse a soma,
+        o `meta.json` sairia com breakdown e nota contando histórias diferentes."""
+        score = _parse_score(
+            {
+                "breakdown": {"hook": 30, "emocao": 20, "citavel": 20, "arco": 20},
+                "total": 90,
+                "context_complete": True,
+            }
+        )
+        result = apply_quality_rules(
+            score,
+            text_excerpt=CLOSED,
+            duration_s=45.0,
+            hook_text="",
+            settings=settings(),
+        )
+        assert result.total == result.breakdown.total
 
 
 class TestFramesCacheKey:
