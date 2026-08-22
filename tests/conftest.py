@@ -39,5 +39,13 @@ def whisper_verbose_json_raw() -> dict:
 
 
 @pytest.fixture()
+def whisper_verbose_json_diarized() -> dict:
+    """Mesma conversa BR, com speaker labels (SPEC §9/§14.6)."""
+    return json.loads(
+        (FIXTURES_DIR / "whisper_verbose_json_diarized.json").read_text(encoding="utf-8")
+    )
+
+
+@pytest.fixture()
 def expected_fixture() -> dict:
     return json.loads((FIXTURES_DIR / "expected.json").read_text(encoding="utf-8"))

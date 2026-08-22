@@ -45,10 +45,29 @@ def _split_audio(audio_path: Path, chunk_seconds: int, tmp_dir: Path) -> list[tu
     return chunks
 
 
-def _parse_verbose_json(raw: dict[str, Any], offset_s: float, id_start: int) -> list[Segment]:
+def _speaker_label(seg: dict[str, Any], scope: str) -> str | None:
+    raw = seg.get("speaker", seg.get("speaker_id"))
+    if raw is None:
+        return None
+    label = str(raw).strip()
+    if not label:
+        return None
+    return f"{label}@{scope}" if scope else label
+
+
+def _parse_verbose_json(
+    raw: dict[str, Any], offset_s: float, id_start: int, *, speaker_scope: str = ""
+) -> list[Segment]:
     """Converte a resposta verbose_json (Whisper) em Segments com Words,
     aplicando o offset do chunk. Tolerante a formatos levemente diferentes
-    entre providers na OpenRouter (SPEC §15)."""
+    entre providers na OpenRouter (SPEC §15).
+
+    ``speaker_scope`` prefixa os labels de falante com o bloco que os produziu.
+    Diarização vem por requisição, então o ``SPEAKER_00`` do bloco 1 não é
+    necessariamente a mesma pessoa que o do bloco 0; misturar os dois faria o
+    face track seguir o rosto errado. O escopo mantém cada label válido dentro
+    do bloco onde ele foi medido (SPEC §15: disponibilidade varia por modelo).
+    """
     raw_segments = raw.get("segments") or []
     raw_words = raw.get("words") or []
 
@@ -74,6 +93,7 @@ def _parse_verbose_json(raw: dict[str, Any], offset_s: float, id_start: int) -> 
                     end=seg_end,
                     text=str(seg.get("text", "")).strip(),
                     words=seg_words,
+                    speaker=_speaker_label(seg, speaker_scope),
                 )
             )
     elif words_all:
@@ -109,6 +129,7 @@ def transcribe_audio(
     client: OpenRouterClient | None = None,
     language: str = "pt",
     chunk_seconds: int = CHUNK_SECONDS_DEFAULT,
+    model: str | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> Transcript:
     """Transcreve o áudio completo (com chunking ~10min) via OpenRouter Whisper.
@@ -117,6 +138,8 @@ def transcribe_audio(
     podcast de 1h vira 6 chamadas que não precisam ser sequenciais.
 
     `client` pode ser injetado (ex.: em testes) para evitar chamadas de rede.
+    ``model`` sobrepõe o papel de STT — é como a passada dedicada de diarização
+    herda o chunking daqui em vez de mandar o arquivo inteiro (SPEC §9, §15).
     ``on_progress(concluídos, total, mensagem)`` alimenta a barra e o ETA.
     """
     client = client or OpenRouterClient(settings)
@@ -134,7 +157,7 @@ def transcribe_audio(
 
         def work(index: int) -> tuple[int, dict[str, Any]]:
             chunk_path, _offset = chunks[index]
-            return index, client.transcribe(chunk_path, language=language)
+            return index, client.transcribe(chunk_path, language=language, model=model)
 
         workers = max(1, min(settings.network_workers, total))
         if workers == 1 or total == 1:
@@ -160,7 +183,9 @@ def transcribe_audio(
             raw = results.get(i)
             if raw is None:
                 continue
-            segs = _parse_verbose_json(raw, chunks[i][1], next_id)
+            segs = _parse_verbose_json(
+                raw, chunks[i][1], next_id, speaker_scope=str(i) if total > 1 else ""
+            )
             all_segments.extend(segs)
             next_id += len(segs)
     finally:

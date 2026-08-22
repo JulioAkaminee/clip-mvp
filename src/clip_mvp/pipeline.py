@@ -20,10 +20,15 @@ from .budget import apply_budget, estimate_cost
 from .candidates import generate_candidates, resolve_target_range
 from .config import Settings
 from .dedupe import DedupeItem, dedupe_items
-from .diarization import diarize, resolve_speaker_matching_method
+from .diarization import (
+    resolve_diarization,
+    resolve_speaker_matching_method,
+    speaker_timeline,
+    uses_dedicated_pass,
+)
 from .download import download_source, probe_metadata
 from .feedback import load_recent_feedback, write_selected_index
-from .models import Candidate, Score, Transcript
+from .models import Candidate, DiarizationResult, Score, Transcript
 from .openrouter import OpenRouterClient
 from .progress import ClipProgress, ProgressReporter
 from .score import score_candidates
@@ -148,30 +153,30 @@ def _ensure_candidates(
     return candidates
 
 
-def _ensure_diarization_method(
+def _ensure_diarization(
+    transcript: Transcript,
     audio_path: Path,
     settings: Settings,
     paths: dict[str, Path],
     *,
     client: OpenRouterClient | None = None,
-) -> str:
-    """Diariza (com cache em work/<job_id>/diarization.json, SPEC §14.4) e
-    retorna o método a registrar em meta.json (SPEC §14.6)."""
+) -> DiarizationResult:
+    """Timeline de falantes (cache em work/<job_id>/diarization.json, SPEC §14.4).
+
+    Prefere os speaker labels da própria transcrição (grátis) e só cai numa
+    passada dedicada quando o papel de diarização aponta para outro modelo — que
+    é o usuário dizendo "este modelo sabe separar falantes". Essa passada reusa o
+    chunking da transcrição (SPEC §15) e está na estimativa de custo (SPEC §14.4).
+    """
     if paths["diarization"].exists():
-        cached = read_json(paths["diarization"])
-        return cached.get("method", "activity_proxy")
+        try:
+            return DiarizationResult.model_validate(read_json(paths["diarization"]))
+        except Exception:  # noqa: BLE001 - cache velho/corrompido recalcula
+            pass
 
-    try:
-        diarization = diarize(audio_path, settings, client=client)
-    except Exception:
-        diarization = None
-
-    method = resolve_speaker_matching_method(diarization)
-    write_json(
-        paths["diarization"],
-        {"method": method, "segments": [s.model_dump() for s in diarization.segments] if diarization else []},
-    )
-    return method
+    result = resolve_diarization(transcript, audio_path, settings, client=client)
+    write_json(paths["diarization"], result.model_dump())
+    return result
 
 
 @dataclass
@@ -575,7 +580,21 @@ def _execute(
     )
 
     check_cancel()
-    speaker_method = _ensure_diarization_method(audio_path, settings, paths, client=client)
+    diarization = _ensure_diarization(transcript, audio_path, settings, paths, client=client)
+    speaker_method = resolve_speaker_matching_method(
+        diarization, used_for_crop="face" in options.formats
+    )
+    if diarization.method != "diarization":
+        hint = (
+            " Escolha um modelo com speaker labels no papel de diarização (Configurações) "
+            "se quiser o crop seguindo quem fala."
+            if not uses_dedicated_pass(settings)
+            else ""
+        )
+        summary.notes.append(
+            "Sem labels de falante; o face track segue o rosto de maior área "
+            f"(activity_proxy documentado, SPEC §14.6).{hint}"
+        )
 
     selection_meta = {
         "mode": "count" if options.count is not None else ("more" if options.more else "auto"),
@@ -606,6 +625,8 @@ def _execute(
         settings=settings,
         options=options,
         reporter=reporter,
+        diarization=diarization,
+        check_cancel=check_cancel,
     )
 
     check_cancel()
@@ -685,11 +706,28 @@ def _render_selected(
     settings: Settings,
     options: RunOptions,
     reporter: ProgressReporter,
+    diarization: DiarizationResult | None = None,
+    check_cancel: Callable[[], None] = lambda: None,
 ) -> None:
-    """Renderiza todos os formatos de todos os clipes, com progresso por clipe."""
+    """Renderiza todos os formatos de todos os clipes, com progresso por clipe.
+
+    ``check_cancel`` é consultado entre arquivos, não só entre estágios: render é
+    o estágio mais longo do job, e um Cancelar que só responde quando o último
+    ffmpeg termina não é um Cancelar.
+    """
     want_face = "face" in options.formats
     want_center = "9x16" in options.formats
     want_horizontal = "16x9" in options.formats
+    sample_fps = face_track_mod.DEFAULT_SAMPLE_FPS
+
+    def _speakers_for(window) -> list[str | None] | None:
+        """Quem fala em cada amostra do face track daquela janela (SPEC §14.6)."""
+        if diarization is None or not diarization.segments:
+            return None
+        n_samples = max(1, int(round(max(0.0, window.end - window.start) * sample_fps)))
+        return speaker_timeline(
+            diarization, start=window.start, n_samples=n_samples, dt=1.0 / sample_fps
+        )
 
     units = 0
     for candidate, _score in selected:
@@ -713,6 +751,7 @@ def _render_selected(
             )
 
     def render_one(candidate: Candidate, score: Score) -> None:
+        check_cancel()
         slug = slugs[candidate.id]
         clip_dir = out_clip_dir(settings.out_dir, round(score.total), slug)
         caption_paths = captions_by_clip.get(candidate.id, {})
@@ -740,6 +779,7 @@ def _render_selected(
 
         if candidate.window_9x16 is not None:
             if want_center:
+                check_cancel()
                 _render_format(
                     reporter,
                     slug,
@@ -752,6 +792,7 @@ def _render_selected(
                     ),
                 )
             if want_face:
+                check_cancel()
                 _render_format(
                     reporter,
                     slug,
@@ -761,6 +802,7 @@ def _render_selected(
                         candidate.window_9x16,
                         clip_dir / "vertical_facetrack.mp4",
                         ass_path=caption_paths.get("ass_9x16"),
+                        speakers=_speakers_for(candidate.window_9x16),
                     ),
                 )
 

@@ -215,6 +215,11 @@ export function JobView({
                 <p className="font-mono text-lg text-white">{formatUsd(cost.total_usd)}</p>
                 <dl className="space-y-0.5 text-[0.72rem] text-mist-400">
                   <Line label={`STT (${cost.stt_minutes.toFixed(1)} min)`} value={cost.stt_usd} />
+                  {/* Só aparece quando o papel de diarização usa outro modelo: com
+                      o default os labels vêm da transcrição e não custam nada. */}
+                  {!!cost.diarization_usd && (
+                    <Line label="diarização (modelo próprio)" value={cost.diarization_usd} />
+                  )}
                   <Line label={`candidatos (${cost.n_candidates})`} value={cost.text_usd} />
                   <Line label="score com vision" value={cost.vision_usd} />
                 </dl>

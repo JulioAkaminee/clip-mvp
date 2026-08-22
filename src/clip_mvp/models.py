@@ -23,6 +23,9 @@ class Segment(BaseModel):
     end: float
     text: str
     words: list[Word] = Field(default_factory=list)
+    #: Label de falante, quando o modelo de STT expõe (SPEC §9, §14.6). É daqui
+    #: que sai a timeline de diarização — sem uma segunda passada de áudio.
+    speaker: Optional[str] = None
 
 
 class Transcript(BaseModel):
@@ -124,6 +127,9 @@ class SelectedClip(BaseModel):
 class CostEstimate(BaseModel):
     stt_minutes: float
     stt_usd: float
+    #: Passada dedicada de diarização; 0 quando a timeline sai dos labels que a
+    #: transcrição já devolveu (SPEC §9, §14.4).
+    diarization_usd: float = 0.0
     n_candidates: int
     text_usd: float
     vision_usd: float

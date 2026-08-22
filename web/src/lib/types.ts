@@ -60,6 +60,8 @@ export interface JobError {
 export interface CostEstimate {
   stt_minutes: number;
   stt_usd: number;
+  /** Passada dedicada de diarização; 0 quando os labels vêm da transcrição. */
+  diarization_usd?: number;
   n_candidates: number;
   text_usd: number;
   vision_usd: number;
