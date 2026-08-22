@@ -27,7 +27,9 @@ URL = "https://youtube.com/watch?v=demo-pt-br"
 
 
 def _fake_client() -> FakeOpenRouterClient:
-    whisper_raw = json.loads((FIXTURES / "whisper_verbose_json_raw.json").read_text("utf-8"))
+    # Fixture com speaker labels: o demo exercita o crop guiado por falante
+    # (SPEC §14.6) em vez do fallback, que é o caminho mais interessante de olhar.
+    whisper_raw = json.loads((FIXTURES / "whisper_verbose_json_diarized.json").read_text("utf-8"))
     candidates = {
         "candidates": [
             {
