@@ -1,10 +1,10 @@
 """Diarização (speaker↔rosto) com fallback documentado (SPEC §9, §14.6).
 
 Fluxo:
-1. Tenta diarização via OpenRouter (quando o modelo de STT expõe speaker
-   labels). Se a resposta não tiver diarização (a maioria dos modelos
-   Whisper-compatíveis na OpenRouter não expõe isso hoje — SPEC §15), cai no
-   fallback.
+1. Tenta diarização via OpenRouter, no modelo do papel de diarização
+   (configurável na tela de Configurações; vazio = mesmo modelo de STT). Se a
+   resposta não tiver speaker labels (a maioria dos modelos Whisper-compatíveis
+   na OpenRouter não expõe isso hoje — SPEC §15), cai no fallback.
 2. Fallback documentado (`activity_proxy`): sem diarização de áudio, o
    `face_track.detect_face_centers` já escolhe, por padrão, o rosto de maior
    área (mais "em foco"/central) como proxy de quem está falando — é uma
@@ -27,7 +27,9 @@ def diarize(audio_path: Path, settings: Settings, *, client: OpenRouterClient | 
     provider não expuser speaker labels (fallback tratado por quem chama)."""
     client = client or OpenRouterClient(settings)
     try:
-        raw = client.transcribe(audio_path, language="pt")
+        raw = client.transcribe(
+            audio_path, language="pt", model=settings.model_for_diarization()
+        )
     except Exception:
         return DiarizationResult(segments=[], method="unavailable")
 

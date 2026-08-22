@@ -13,6 +13,13 @@ Endpoints que a UI usa para mostrar o resultado:
 
 - ``GET  /api/health``                            dependências locais e modelos
 - ``GET  /api/config``                            regras do produto (90s, pad, faixas de N)
+
+Configuração da OpenRouter feita pela própria interface:
+
+- ``GET  /api/settings``          chave (mascarada) + modelo de cada papel de IA
+- ``PUT  /api/settings``          grava chave e/ou modelos no arquivo de settings
+- ``POST /api/settings/test``     testa a conexão com a OpenRouter
+- ``GET  /api/settings/models``   catálogo da OpenRouter para escolher o modelo
 - ``GET  /api/jobs/{id}/clips``                   cortes com meta.json e artefatos
 - ``GET  /api/jobs/{id}/clips/{slug}/files/{f}``  preview (Range) e download
 - ``GET  /api/jobs/{id}/clips/{slug}/poster.jpg`` thumbnail (gerado sob demanda)
@@ -27,17 +34,30 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .candidates import auto_count_range, candidate_pool_size
-from .config import Settings, get_settings
+from .config import Settings, env_settings
 from .feedback import load_recent_feedback, rate_clip
+from .openrouter import OpenRouterError, fetch_models, verify_key
 from .pipeline import RunOptions, make_reporter, resume_job, run_job
 from .progress import STAGE_LABELS, STAGE_ORDER, EventBroker, ProgressReporter
+from .settings_store import (
+    MODEL_ROLES,
+    ROLE_BY_KEY,
+    SettingsValidationError,
+    apply_stored,
+    describe,
+    load_stored,
+    mask_key,
+    save_stored,
+    validate_api_key,
+    validate_model_id,
+)
 from .utils import make_job_id, read_json, run_ffmpeg
 
 #: Build da UI React (``cd web && npm run build``).
@@ -143,11 +163,36 @@ class RateRequest(BaseModel):
     note: str = ""
 
 
+class SettingsUpdate(BaseModel):
+    """Corpo do ``PUT /api/settings``.
+
+    Campos ausentes não mudam nada: a UI pode salvar só os modelos sem reenviar a
+    chave (que ela nunca recebe de volta em texto claro).
+    """
+
+    #: Chave nova. ``None`` ou vazio = mantém a que já está gravada.
+    api_key: str | None = None
+    #: Apaga a chave do arquivo de settings (volta a valer o `.env`, se houver).
+    clear_api_key: bool = False
+    #: ``{"score": "google/gemini-2.5-pro"}``. Valor vazio volta ao default do `.env`.
+    models: dict[str, str] | None = None
+
+
+class ConnectionTest(BaseModel):
+    #: Chave a testar antes de salvar. Vazio = testa a que já está configurada.
+    api_key: str | None = None
+
+
 class JobRunner:
     """Roda jobs em threads e mantém um broker de eventos por job."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, *, resolve: Callable[[], Settings] | None = None
+    ) -> None:
         self.settings = settings
+        #: Resolve a configuração no momento de disparar o job, para que uma chave
+        #: ou modelo salvos na UI valham no próximo job sem reiniciar o servidor.
+        self._resolve = resolve or (lambda: settings)
         self._brokers: dict[str, EventBroker] = {}
         self._reporters: dict[str, ProgressReporter] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -168,6 +213,7 @@ class JobRunner:
         broker = EventBroker()
         reporter = make_reporter(self.settings, job_id, sinks=[broker.publish])
         cancel = threading.Event()
+        job_settings = self._resolve()
 
         with self._lock:
             self._brokers[job_id] = broker
@@ -179,7 +225,7 @@ class JobRunner:
                 if resuming:
                     resume_job(
                         job_id,
-                        self.settings,
+                        job_settings,
                         options,
                         reporter=reporter,
                         cancel_check=cancel.is_set,
@@ -187,7 +233,7 @@ class JobRunner:
                 else:
                     run_job(
                         url,
-                        self.settings,
+                        job_settings,
                         options,
                         reporter=reporter,
                         cancel_check=cancel.is_set,
@@ -520,12 +566,85 @@ Documentação da API: <a href="/docs">/docs</a>.</p>
 </main></body></html>"""
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or get_settings()
-    runner = JobRunner(settings)
+#: Quanto tempo o catálogo da OpenRouter (~centenas de modelos) fica em cache.
+#: Ele muda em dias, não em segundos, e a tela de Configurações pede a lista a
+#: cada abertura. `refresh=true` força a releitura.
+MODELS_CACHE_TTL_S = 30 * 60
+
+
+def _models_cache_path(settings: Settings) -> Path:
+    return Path(settings.work_dir) / "openrouter_models.json"
+
+
+def read_models_cache(settings: Settings, *, ttl_s: float = MODELS_CACHE_TTL_S) -> list[dict] | None:
+    """Catálogo em cache, ou ``None`` se não houver ou estiver velho.
+
+    O catálogo é o mesmo para qualquer chave (é o cardápio da OpenRouter, não algo
+    da conta), então o cache não precisa ser por chave.
+    """
+    path = _models_cache_path(settings)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text("utf-8"))
+        fetched_at = float(payload["fetched_at"])
+        models = payload["models"]
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(models, list) or (time.time() - fetched_at) > ttl_s:
+        return None
+    return models
+
+
+def write_models_cache(settings: Settings, models: list[dict]) -> None:
+    path = _models_cache_path(settings)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"fetched_at": time.time(), "models": models}, ensure_ascii=False),
+            "utf-8",
+        )
+    except OSError:  # noqa: BLE001 - cache é conveniência, não pode quebrar a tela
+        pass
+
+
+def filter_models(models: list[dict], *, requires: tuple[str, ...] = (), query: str = "") -> list[dict]:
+    """Filtra o catálogo por modalidade de entrada e por texto digitado.
+
+    `text` é implícito (todo modelo de chat aceita texto); o que importa filtrar é
+    `image` (papel de score) e `audio` (STT/diarização).
+    """
+    needed = {item for item in requires if item != "text"}
+    needle = query.strip().lower()
+    result = []
+    for model in models:
+        modalities = set(model.get("input_modalities") or [])
+        if needed and not needed <= modalities:
+            continue
+        if needle and needle not in f"{model.get('id', '')} {model.get('name', '')}".lower():
+            continue
+        result.append(model)
+    return result
+
+
+def create_app(settings: Settings | None = None, *, settings_path: Path | None = None) -> FastAPI:
+    """Monta a API.
+
+    `settings` é a camada de ambiente (`.env`); o que a UI gravou em
+    `settings_path` entra por cima a cada requisição/job, então salvar a chave na
+    tela não exige reiniciar o `clip serve`.
+    """
+    settings = settings if settings is not None else env_settings()
+
+    def resolve_settings() -> Settings:
+        return apply_stored(settings, load_stored(settings_path))
+
+    runner = JobRunner(settings, resolve=resolve_settings)
     app = FastAPI(title="clip-mvp", version="0.1.0")
     app.state.runner = runner
     app.state.settings = settings
+    app.state.settings_path = settings_path
+    app.state.resolve_settings = resolve_settings
 
     def _require_snapshot(job_id: str) -> dict[str, Any]:
         snapshot = runner.snapshot(job_id)
@@ -646,6 +765,113 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="job não está em execução")
         return {"job_id": job_id, "canceled": True}
 
+    # -- configuração da OpenRouter (chave + modelo por papel) -------------
+    @app.get("/api/settings")
+    def get_settings_route() -> dict[str, Any]:
+        """Estado da configuração. A chave sai **mascarada**, nunca completa."""
+        return describe(
+            resolve_settings(), load_stored(settings_path), env=settings, path=settings_path
+        )
+
+    @app.put("/api/settings")
+    def update_settings(payload: SettingsUpdate) -> dict[str, Any]:
+        stored = load_stored(settings_path)
+        try:
+            if payload.clear_api_key:
+                stored.openrouter_api_key = ""
+            elif payload.api_key and payload.api_key.strip():
+                stored.openrouter_api_key = validate_api_key(payload.api_key)
+
+            for role_key, raw_value in (payload.models or {}).items():
+                role = ROLE_BY_KEY.get(role_key)
+                if role is None:
+                    known = ", ".join(item.key for item in MODEL_ROLES)
+                    raise SettingsValidationError(
+                        f"Papel de IA desconhecido: `{role_key}`. Use um destes: {known}."
+                    )
+                if not (raw_value or "").strip():
+                    # Vazio é "voltar ao default do projeto", não "modelo em branco".
+                    stored.models.pop(role_key, None)
+                else:
+                    stored.models[role_key] = validate_model_id(raw_value, role=role)
+        except SettingsValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+        save_stored(stored, settings_path)
+        return describe(resolve_settings(), stored, env=settings, path=settings_path)
+
+    @app.post("/api/settings/test")
+    def test_connection(payload: ConnectionTest | None = None) -> dict[str, Any]:
+        """Testa a chave contra a OpenRouter antes de confiar nela num job."""
+        candidate = (payload.api_key or "").strip() if payload else ""
+        if candidate:
+            try:
+                key = validate_api_key(candidate)
+            except SettingsValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+        else:
+            key = resolve_settings().openrouter_api_key
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="Nenhuma chave configurada: cole a chave da OpenRouter antes de testar.",
+            )
+        try:
+            result = verify_key(key, base_url=resolve_settings().openrouter_base_url)
+        except OpenRouterError as exc:
+            # Chave errada não é erro do servidor: a tela mostra o motivo inline.
+            return {"ok": False, "message": str(exc)}
+        label = result.get("label")
+        return {
+            **result,
+            "message": (
+                f"Conexão OK — chave “{label}” aceita pela OpenRouter."
+                if label
+                else "Conexão OK — chave aceita pela OpenRouter."
+            ),
+        }
+
+    @app.get("/api/settings/models")
+    def list_openrouter_models(
+        role: str | None = Query(None, description="Filtra pelo que o papel exige (ex. score→vision)"),
+        q: str = Query("", max_length=120, description="Busca por id ou nome"),
+        limit: int = Query(400, ge=1, le=5000),
+        refresh: bool = Query(False, description="Ignora o cache e relê o catálogo"),
+    ) -> dict[str, Any]:
+        """Catálogo da OpenRouter (`GET /models`) para o seletor de modelos.
+
+        Qualquer id é aceito no campo de texto da UI; esta lista existe para
+        procurar sem sair da tela, não para limitar a escolha.
+        """
+        resolved = resolve_settings()
+        if not resolved.openrouter_api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Configure a chave da OpenRouter para listar os modelos disponíveis.",
+            )
+        if role is not None and role not in ROLE_BY_KEY:
+            raise HTTPException(status_code=400, detail=f"Papel de IA desconhecido: `{role}`.")
+
+        models = None if refresh else read_models_cache(resolved)
+        cached = models is not None
+        if models is None:
+            try:
+                models = fetch_models(
+                    resolved.openrouter_api_key, base_url=resolved.openrouter_base_url
+                )
+            except OpenRouterError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from None
+            write_models_cache(resolved, models)
+
+        requires = ROLE_BY_KEY[role].requires if role else ()
+        matching = filter_models(models, requires=requires, query=q)
+        return {
+            "models": matching[:limit],
+            "total": len(models),
+            "matching": len(matching),
+            "cached": cached,
+        }
+
     # -- ambiente e regras do produto -------------------------------------
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -662,19 +888,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:  # noqa: BLE001
             ytdlp_ok = bool(shutil.which("yt-dlp"))
         ffmpeg_ok = bool(shutil.which("ffmpeg"))
+        # Chave e modelos vêm da configuração resolvida (`.env` + o que a UI
+        # salvou), então a tela mostra o que o próximo job vai realmente usar.
+        resolved = resolve_settings()
+        stored = load_stored(settings_path)
         return {
             "ok": ffmpeg_ok and bool(shutil.which("ffprobe")),
             "ffmpeg": ffmpeg_ok,
             "ffprobe": bool(shutil.which("ffprobe")),
             "yt_dlp": ytdlp_ok,
             "mediapipe": mediapipe_ok,
-            "openrouter_key": bool(settings.openrouter_api_key),
+            "openrouter_key": bool(resolved.openrouter_api_key),
+            "openrouter_key_masked": mask_key(resolved.openrouter_api_key),
+            "openrouter_key_source": (
+                "ui" if stored.openrouter_api_key else ("env" if resolved.openrouter_api_key else None)
+            ),
             "ui_built": (WEB_DIST / "index.html").is_file(),
             "models": {
-                "stt": settings.stt_model,
-                "candidates": settings.candidate_model,
-                "score": settings.score_model,
-                "meta": settings.meta_model,
+                "stt": resolved.stt_model,
+                "candidates": resolved.candidate_model,
+                "score": resolved.score_model,
+                "meta": resolved.meta_model,
+                "diarization": resolved.model_for_diarization(),
             },
             "work_dir": str(settings.work_dir),
             "out_dir": str(settings.out_dir),

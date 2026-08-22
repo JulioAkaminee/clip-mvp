@@ -10,6 +10,13 @@ from clip_mvp.models import Transcript
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings_file(tmp_path_factory, monkeypatch):
+    """Nenhum teste lê/escreve o settings.json real do usuário (onde mora a chave)."""
+    path = tmp_path_factory.mktemp("clip-settings") / "settings.json"
+    monkeypatch.setenv("CLIP_SETTINGS_FILE", str(path))
+
+
 @pytest.fixture()
 def fixtures_dir() -> Path:
     return FIXTURES_DIR

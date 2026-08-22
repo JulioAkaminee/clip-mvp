@@ -311,8 +311,9 @@ export function NewJobForm({
         )}
         {health && !health.openrouter_key && (
           <p className="rounded-xl border border-amber-300/25 bg-amber-300/8 px-3.5 py-2.5 text-[0.8rem] text-amber-100">
-            Sem <code>OPENROUTER_API_KEY</code> no <code>.env</code> o job falha na transcrição —
-            configure a chave antes de gerar cortes.
+            Sem chave da OpenRouter o job falha na transcrição. Abra{" "}
+            <strong className="font-medium text-amber-50">Configurações</strong> na barra lateral
+            (ou preencha <code>OPENROUTER_API_KEY</code> no <code>.env</code>) antes de gerar cortes.
           </p>
         )}
       </Card>
@@ -337,7 +338,9 @@ export function NewJobForm({
           <p className="border-t border-white/8 pt-3 text-[0.72rem] text-mist-400">
             Modelos: STT <span className="text-mist-300">{health.models.stt}</span> · candidatos{" "}
             <span className="text-mist-300">{health.models.candidates}</span> · score{" "}
-            <span className="text-mist-300">{health.models.score}</span>
+            <span className="text-mist-300">{health.models.score}</span> · meta{" "}
+            <span className="text-mist-300">{health.models.meta}</span> · diarização{" "}
+            <span className="text-mist-300">{health.models.diarization}</span>
           </p>
         )}
       </Card>
