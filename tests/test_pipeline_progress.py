@@ -285,6 +285,59 @@ class TestFailureState:
             )
         assert reporter.snapshot()["status"] == "canceled"
 
+    def test_cancel_during_render_does_not_wait_for_every_file(
+        self, tmp_path, monkeypatch, sample_video_path, fake_client
+    ):
+        """Render é o estágio mais longo (~1 min por arquivo, MediaPipe no 9:16).
+
+        O cancelamento só era consultado entre estágios, então clicar em Cancelar
+        durante o render significava esperar todos os ffmpeg terminarem — o que,
+        para o usuário, é um botão que não faz nada.
+        """
+        _patch_download(monkeypatch, sample_video_path)
+        settings = Settings(
+            openrouter_api_key="test-key",
+            work_dir=tmp_path / "work",
+            out_dir=tmp_path / "out",
+            min_duration_full_arc_s=0.0,
+            render_workers=1,
+        )
+        reporter = pipeline_mod.make_reporter(settings, "job-cancel-render")
+
+        rendered: list[str] = []
+        real_horizontal = pipeline_mod.render_mod.render_horizontal_16x9
+        cancel = {"asked": False}
+
+        def horizontal_then_cancel(*args, **kwargs):
+            rendered.append("horizontal_16x9")
+            cancel["asked"] = True
+            return real_horizontal(*args, **kwargs)
+
+        def should_not_run(*args, **kwargs):
+            rendered.append("vertical")
+            raise AssertionError("render seguiu depois do cancelamento")
+
+        monkeypatch.setattr(
+            pipeline_mod.render_mod, "render_horizontal_16x9", horizontal_then_cancel
+        )
+        monkeypatch.setattr(pipeline_mod.render_mod, "render_vertical_center", should_not_run)
+        monkeypatch.setattr(
+            pipeline_mod.face_track_mod, "render_vertical_facetrack", should_not_run
+        )
+
+        with pytest.raises(pipeline_mod.JobCanceled):
+            pipeline_mod.run_job(
+                "https://youtube.com/watch?v=fixture",
+                settings,
+                pipeline_mod.RunOptions(),
+                client=fake_client,
+                reporter=reporter,
+                cancel_check=lambda: cancel["asked"],
+            )
+
+        assert rendered == ["horizontal_16x9"]
+        assert reporter.snapshot()["status"] == "canceled"
+
 
 class TestDryRunProgress:
     def test_dry_run_completes_without_leaving_stages_pending(

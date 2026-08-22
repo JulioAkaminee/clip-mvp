@@ -574,8 +574,13 @@ def _execute(
         feedback_examples=feedback_examples,
         frames_dir=paths["frames"],
         use_vision=allowed_n > 0 or options.budget is None,
-        on_progress=lambda done, total, cand, score: reporter.advance_units(
-            "score", done, f"Avaliado {done}/{total} — {cand.title[:40]}: {score.total:.0f}"
+        # Um pool grande com 3 workers são vários turnos de rede: checar o
+        # cancelamento a cada candidato avaliado evita ficar preso no estágio.
+        on_progress=lambda done, total, cand, score: (
+            reporter.advance_units(
+                "score", done, f"Avaliado {done}/{total} — {cand.title[:40]}: {score.total:.0f}"
+            ),
+            check_cancel(),
         ),
     )
     best = max((s.total for _, s in scored), default=0.0)
@@ -661,6 +666,7 @@ def _execute(
     reporter.start_stage("captions", units_total=len(selected))
     captions_by_clip: dict[str, dict[str, Any]] = {}
     for i, (candidate, score) in enumerate(selected, 1):
+        check_cancel()
         clip_dir = out_clip_dir(settings.out_dir, round(score.total), slugs[candidate.id])
         captions_by_clip[candidate.id] = _build_clip_captions(
             candidate, transcript, clip_dir, options
