@@ -234,8 +234,3 @@ def _snap_result(
         pad_after_s=pad_after,
         media_duration=transcript.duration or None,
     )
-
-
-def _snap(window: Window, words, transcript: Transcript, pad_before: float, pad_after: float) -> Window:
-    result = _snap_result(window, words, transcript, pad_before, pad_after)
-    return Window(start=result.start, end=result.end)

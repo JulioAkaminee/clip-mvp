@@ -17,7 +17,7 @@ from . import meta as meta_mod
 from . import render as render_mod
 from . import subtitles as subtitles_mod
 from .budget import apply_budget, estimate_cost
-from .candidates import generate_candidates, resolve_target_range
+from .candidates import candidate_pool_size, generate_candidates, resolve_target_range
 from .config import Settings
 from .dedupe import DedupeItem, dedupe_items
 from .diarization import (
@@ -128,6 +128,32 @@ def _ensure_transcript(
     return transcript
 
 
+def _read_cached_candidates(path: Path) -> tuple[list[Candidate], int]:
+    """Candidatos em cache + o tamanho de pool que foi pedido ao gerá-los.
+
+    O pool pedido é o que permite saber se o cache ainda serve para o N atual.
+    Comparar com ``len(candidates)`` não serve: o modelo costuma devolver menos
+    do que se pediu, e aí todo ``resume`` regeneraria para sempre.
+    """
+    raw = read_json(path)
+    if isinstance(raw, dict):
+        items = raw.get("candidates") or []
+        requested = int(raw.get("pool_requested") or len(items))
+    else:  # formato antigo: lista pura, sem proveniência
+        items = raw
+        requested = len(items)
+    return [Candidate.model_validate(c) for c in items], requested
+
+
+def _cached_pool_request(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        return _read_cached_candidates(path)[1]
+    except Exception:  # noqa: BLE001 - cache ilegível é como cache ausente
+        return None
+
+
 def _ensure_candidates(
     transcript: Transcript,
     settings: Settings,
@@ -139,8 +165,10 @@ def _ensure_candidates(
     force_regenerate: bool = False,
 ) -> list[Candidate]:
     if paths["candidates"].exists() and not force_regenerate:
-        raw = read_json(paths["candidates"])
-        return [Candidate.model_validate(c) for c in raw]
+        try:
+            return _read_cached_candidates(paths["candidates"])[0]
+        except Exception:  # noqa: BLE001 - cache ilegível regenera
+            pass
 
     candidates = generate_candidates(
         transcript,
@@ -149,7 +177,14 @@ def _ensure_candidates(
         client=client,
         feedback_examples=feedback_examples,
     )
-    write_json(paths["candidates"], [c.model_dump() for c in candidates])
+    write_json(
+        paths["candidates"],
+        {
+            "target_hi": target_hi,
+            "pool_requested": candidate_pool_size(target_hi),
+            "candidates": [c.model_dump() for c in candidates],
+        },
+    )
     return candidates
 
 
@@ -492,7 +527,24 @@ def _execute(
     feedback_examples = load_recent_feedback(settings.work_dir, settings.feedback_examples_n)
 
     check_cancel()
-    force_regen = is_resume and options.count is not None and not paths["candidates"].exists()
+    # `resume --more/--count N` pedindo mais do que o pool original: reusar o
+    # cache aqui deixava o pedido sem efeito, porque não havia candidato novo de
+    # onde tirar clip. Regenerar custa um prompt de texto e continua sem
+    # re-baixar nem re-transcrever, que é o que a SPEC §3 promete no resume.
+    needed_pool = candidate_pool_size(target_hi)
+    cached_pool = _cached_pool_request(paths["candidates"])
+    force_regen = (
+        is_resume
+        and (options.count is not None or options.more)
+        and cached_pool is not None
+        and cached_pool < needed_pool
+    )
+    if force_regen:
+        summary.notes.append(
+            f"Pool de candidatos em cache foi gerado para {cached_pool}; o pedido atual "
+            f"precisa de ~{needed_pool}. Regerando candidatos (transcrição e vídeo "
+            "seguem em cache)."
+        )
     if paths["candidates"].exists() and not force_regen:
         reporter.skip_stage("candidates", "Candidatos reaproveitados do cache")
     else:
@@ -909,8 +961,6 @@ def _write_selected_meta(
 
 
 def candidates_pool_hint(target_hi: int) -> int:
-    from .candidates import candidate_pool_size
-
     return candidate_pool_size(target_hi)
 
 

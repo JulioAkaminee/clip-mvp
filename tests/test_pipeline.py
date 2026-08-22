@@ -204,3 +204,84 @@ def test_resume_reuses_cached_transcript_and_candidates(tmp_path, monkeypatch, s
     # Não deve ter transcrito de novo nem regenerado candidatos (cache em work/<job_id>/).
     assert len(fake_client.transcribe_calls) == n_transcribe_calls_before
     assert second.candidates == first.candidates
+
+
+def _spy_on_candidate_generation(monkeypatch) -> list[int]:
+    """Registra o `target_hi` de cada geração real de candidatos."""
+    calls: list[int] = []
+    real = pipeline_mod.generate_candidates
+
+    def spy(transcript, settings, *, target_hi, **kwargs):
+        calls.append(target_hi)
+        return real(transcript, settings, target_hi=target_hi, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "generate_candidates", spy)
+    return calls
+
+
+def test_resume_with_more_regenerates_the_candidate_pool(
+    tmp_path, monkeypatch, sample_video_path, fake_client
+):
+    """SPEC §3: `resume --more` tem de poder entregar mais cortes.
+
+    Reusar o pool do run `auto` deixava o pedido sem efeito — não havia candidato
+    novo de onde tirar clip. Regenerar é um prompt de texto; a transcrição e o
+    vídeo continuam vindo do cache.
+    """
+    _patch_download(monkeypatch, sample_video_path)
+    settings = _settings(tmp_path)
+    generations = _spy_on_candidate_generation(monkeypatch)
+
+    first = pipeline_mod.run_job(
+        "https://youtube.com/watch?v=fixture", settings, pipeline_mod.RunOptions(), client=fake_client
+    )
+    transcribe_before = len(fake_client.transcribe_calls)
+    assert len(generations) == 1
+
+    pipeline_mod.resume_job(
+        first.job_id, settings, pipeline_mod.RunOptions(more=True, min_score=0), client=fake_client
+    )
+
+    assert len(generations) == 2, "o --more precisa de candidatos novos"
+    assert generations[1] > generations[0], "o pool novo tem de ser maior"
+    # Barato: nada de re-download nem de re-transcrição.
+    assert len(fake_client.transcribe_calls) == transcribe_before
+
+
+def test_resume_with_count_within_the_cached_pool_reuses_it(
+    tmp_path, monkeypatch, sample_video_path, fake_client
+):
+    """Regenerar é só para pedido que não caberia; o resume comum segue barato."""
+    _patch_download(monkeypatch, sample_video_path)
+    settings = _settings(tmp_path)
+    generations = _spy_on_candidate_generation(monkeypatch)
+
+    first = pipeline_mod.run_job(
+        "https://youtube.com/watch?v=fixture", settings, pipeline_mod.RunOptions(), client=fake_client
+    )
+
+    pipeline_mod.resume_job(
+        first.job_id, settings, pipeline_mod.RunOptions(count=2, min_score=0), client=fake_client
+    )
+
+    assert len(generations) == 1
+
+
+def test_candidate_cache_from_an_older_run_is_still_readable(
+    tmp_path, monkeypatch, sample_video_path, fake_client
+):
+    """O cache era uma lista pura; jobs em work/ não devem quebrar no upgrade."""
+    _patch_download(monkeypatch, sample_video_path)
+    settings = _settings(tmp_path)
+    first = pipeline_mod.run_job(
+        "https://youtube.com/watch?v=fixture", settings, pipeline_mod.RunOptions(), client=fake_client
+    )
+
+    path = settings.work_dir / first.job_id / "candidates.json"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps(stored["candidates"]), encoding="utf-8")
+
+    second = pipeline_mod.resume_job(
+        first.job_id, settings, pipeline_mod.RunOptions(min_score=0), client=fake_client
+    )
+    assert second.candidates == first.candidates
