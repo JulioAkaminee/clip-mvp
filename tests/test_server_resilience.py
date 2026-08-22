@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from clip_mvp.config import Settings
+from clip_mvp.pipeline import make_reporter
 from clip_mvp.server import STALE_JOB_AFTER_S, create_app, mark_stale_if_dead
 
 
@@ -240,6 +241,98 @@ class TestJobOwnedByAnotherProcess:
         response = client.post("/api/jobs/job_cli/cancel")
         assert response.status_code == 409
         assert "CLI" in response.json()["detail"]
+
+    def test_a_job_resumed_on_the_cli_is_not_frozen_at_this_server_last_run(self, app_client):
+        """O reporter em memória de um job terminado aqui nunca é descartado.
+
+        Servi-lo cegamente congelava o job no último estado que ESTE processo
+        conheceu: `clip resume` na CLI reusa o mesmo job_id (ele vem da URL) e
+        escreve progresso novo em `status.json` que a UI nunca veria.
+        """
+        client, settings = app_client
+        runner = client.app.state.runner
+        job_id = "job_finished_here"
+
+        # Um job que rodou e terminou neste servidor.
+        reporter = make_reporter(settings, job_id)
+        reporter.start_stage("download", units_total=1)
+        reporter.finish_stage("download", "baixado")
+        reporter.finish({"summary": {"selected": 0, "out_dirs": [], "notes": []}}, "pronto")
+        runner._reporters[job_id] = reporter
+        assert runner.snapshot(job_id)["status"] == "done"
+
+        # Agora a CLI retoma o mesmo job e escreve progresso mais novo.
+        (settings.work_dir / job_id / "status.json").write_text(
+            json.dumps(
+                _snapshot(job_id=job_id, status="running", stage="render", updated_at=time.time())
+            ),
+            "utf-8",
+        )
+
+        payload = runner.snapshot(job_id)
+        assert payload["status"] == "running"
+        assert payload["stage"] == "render"
+
+    def test_a_lingering_reporter_does_not_hide_an_interrupted_job(self, app_client):
+        """`ProgressReporter.snapshot()` estampa `updated_at` com a hora da chamada.
+
+        Enquanto o reporter de um job morto ficava sendo servido, o timestamp
+        nunca envelhecia e o job jamais era marcado como interrompido — a
+        detecção existia e não alcançava justamente os jobs deste processo.
+        """
+        client, settings = app_client
+        runner = client.app.state.runner
+        job_id = "job_thread_died"
+
+        reporter = make_reporter(settings, job_id)
+        reporter.start_stage("render", units_total=3)
+        runner._reporters[job_id] = reporter
+
+        # A thread morreu sem passar por finish/fail, e o status.json parou de
+        # ser reescrito há muito tempo.
+        (settings.work_dir / job_id / "status.json").write_text(
+            json.dumps(
+                _snapshot(job_id=job_id, status="running", updated_at=time.time() - 900.0)
+            ),
+            "utf-8",
+        )
+
+        payload = runner.snapshot(job_id)
+        assert payload["status"] == "error"
+        assert payload["stale"] is True
+        assert payload["error"]["retriable"] is True
+
+    def test_a_live_job_in_this_process_still_uses_its_own_reporter(self, app_client):
+        """O caminho comum não deve passar a ler disco a cada requisição."""
+        client, settings = app_client
+        runner = client.app.state.runner
+        job_id = "job_live_here"
+
+        reporter = make_reporter(settings, job_id)
+        reporter.start_stage("score", units_total=4)
+        reporter.advance_units("score", 2, "avaliando")
+        runner._reporters[job_id] = reporter
+        monkeypatched = {"reads": 0}
+        original = runner._stored_snapshot
+
+        def counting(job: str):
+            monkeypatched["reads"] += 1
+            return original(job)
+
+        runner._stored_snapshot = counting
+        runner._threads[job_id] = _AlwaysAliveThread()
+
+        payload = runner.snapshot(job_id)
+
+        assert payload["stage"] == "score"
+        assert monkeypatched["reads"] == 0
+
+
+class _AlwaysAliveThread:
+    """Stand-in para uma thread de job em execução."""
+
+    def is_alive(self) -> bool:
+        return True
 
 
 class TestHistoryTail:

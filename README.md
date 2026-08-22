@@ -235,6 +235,13 @@ mesma pasta `out/`. Nesse caso `retry` e `cancel` respondem 409 explicando que o
 job é de outro processo (cancelar é um sinal em memória: só alcança quem
 começou).
 
+Para um job que não está rodando **neste** processo, quem manda é sempre o
+`status.json`, nunca o objeto de progresso que ficou na memória do servidor. Esse
+objeto reestampa a hora a cada leitura, então um job encerrado parecia
+eternamente fresco: o painel congelava no último estado que aquele `clip serve`
+tinha visto (ignorando um `clip resume` posterior na CLI) e um job cujo processo
+morreu nunca envelhecia o suficiente para ser marcado como interrompido.
+
 ### Payload de progresso
 
 CLI, API e UI consomem exatamente o mesmo objeto:

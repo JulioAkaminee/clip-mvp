@@ -211,22 +211,39 @@ class JobRunner:
         thread.start()
         return job_id, False
 
+    def _stored_snapshot(self, job_id: str) -> dict[str, Any] | None:
+        path = Path(self.settings.work_dir) / job_id / "status.json"
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+
     def snapshot(self, job_id: str) -> dict[str, Any] | None:
+        running = self.is_running(job_id)
         with self._lock:
             reporter = self._reporters.get(job_id)
-        if reporter is not None:
-            payload = reporter.snapshot()
+
+        if reporter is not None and running:
+            payload: dict[str, Any] | None = reporter.snapshot()
         else:
-            path = Path(self.settings.work_dir) / job_id / "status.json"
-            if not path.is_file():
-                return None
-            try:
-                payload = json.loads(path.read_text("utf-8"))
-            except (json.JSONDecodeError, OSError):
-                return None
-        return mark_stale_if_dead(
-            payload, running=self.is_running(job_id), now=time.time()
-        )
+            # Reporters não são descartados quando o job acaba, e
+            # ``ProgressReporter.snapshot()`` estampa ``updated_at`` com a hora da
+            # chamada — então um reporter parado parece eternamente fresco. Servir
+            # isso para um job que não está rodando aqui tem dois efeitos ruins: o
+            # job congela no último estado que ESTE processo viu (um `clip resume`
+            # na CLI reusa o mesmo job_id, porque ele vem da URL, e escreve
+            # progresso novo que a UI nunca veria), e a detecção de job
+            # interrompido nunca dispara, porque o timestamp nunca envelhece.
+            # O ``status.json`` carrega a hora real da última escrita.
+            payload = self._stored_snapshot(job_id)
+            if payload is None and reporter is not None:
+                payload = reporter.snapshot()
+
+        if payload is None:
+            return None
+        return mark_stale_if_dead(payload, running=running, now=time.time())
 
     def broker(self, job_id: str) -> EventBroker | None:
         with self._lock:
