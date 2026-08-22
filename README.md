@@ -53,14 +53,18 @@ progresso da CLI. Com ela você:
   restantes**, tempo de cada estágio e status de render por corte (quais
   formatos já saíram, qual está rodando, qual teve o 9:16 descartado);
 - pré-visualiza cada corte nos três formatos, com breakdown do score, janelas
-  9:16/16:9 e motivo do corte;
+  9:16/16:9 e motivo do corte — e no 9:16 pode ligar a **máscara de safe area**
+  para conferir, antes de publicar, que a legenda não cai atrás da UI do
+  TikTok/Shorts (mesmas frações do burn-in, SPEC §14.5);
 - copia títulos, descrições e hashtags de YouTube Shorts, YouTube 16:9 e TikTok;
 - baixa os `.mp4`, `.srt` e `.ass`;
 - vota **bom/ruim** por corte (vai para `work/feedback.jsonl` e volta como
   few-shot nos próximos prompts);
 - pede **mais cortes** ou **refaz com N** reaproveitando o cache do job;
 - quando um estágio falha, vê a dica em PT-BR e um botão **Tentar de novo** —
-  a tela nunca fica girando para sempre (o SSE cai para polling sozinho).
+  a tela nunca fica girando para sempre (o SSE cai para polling sozinho), e um
+  job abandonado por processo morto aparece como **interrompido** com
+  **Retomar de onde parou**.
 
 Jobs criados na CLI aparecem na UI e vice-versa: o estado vive em
 `work/<job_id>/status.json`.
@@ -156,6 +160,29 @@ A primeira estimativa de um vídeo longo pode ser grosseira; ela se ajusta nos
 primeiros estágios. O texto é PT-BR: `~4 min restantes`, `~45 s restantes`
 abaixo de um minuto, `concluído` no fim.
 
+Dois detalhes que fazem o número ser confiável em vez de decorativo:
+
+- **Batimento.** Vários estágios são uma única chamada bloqueante: `candidates`
+  é um prompt sobre a transcrição inteira, `render` gasta ~1 min por arquivo.
+  Sem nada reemitindo, o ETA congelava justamente aí. O reporter reemite o
+  snapshot a cada 2s (`CLIP_PROGRESS_HEARTBEAT_S`), então o ETA anda e a UI
+  mostra quanto tempo o estágio atual já leva. Batimentos não entram no
+  `events.jsonl`, que é o histórico de transições do job.
+- **Nunca "finalizando" com trabalho pendente.** Todo estágio acaba passando da
+  própria previsão, e a última unidade ainda está sendo escrita quando o
+  contador já bateu no total. Um estágio em andamento sempre custa alguns
+  segundos, então a tela não anuncia o fim antes da hora.
+
+### Job interrompido
+
+Se o processo morrer (kill, reboot, laptop fechado no meio do render), o
+`status.json` continuaria dizendo `running` para sempre. Como um job vivo
+reescreve esse arquivo a cada batimento — inclusive quando roda na CLI, em outro
+processo — o frescor do arquivo é o que separa "morreu" de "está vivo em outro
+lugar". Passado esse tempo, a API devolve o job como erro retriável
+(`stale: true`) com **Retomar de onde parou**, que reaproveita todo o cache em
+`work/`. Nada de spinner eterno.
+
 ### Payload de progresso
 
 CLI, API e UI consomem exatamente o mesmo objeto:
@@ -166,15 +193,19 @@ CLI, API e UI consomem exatamente o mesmo objeto:
   "stage_label": "Renderizando cortes",
   "percent": 83.0,
   "stage_percent": 57.0,
+  "stage_elapsed_seconds": 71.4,
   "eta_seconds": 96,
   "eta_text": "~1.5 min restantes",
   "message": "Renderizando… 4/7 arquivos",
   "clips_done": 1,
   "clips_total": 3,
   "clips": [{ "slug": "...", "score": 88, "status": "running",
-              "formats": {"horizontal_16x9": "done"}, "vertical_skipped": null }],
+              "formats": {"horizontal_16x9": "done", "vertical_center": "running",
+                          "vertical_facetrack": "pending"},
+              "vertical_skipped": null }],
   "stages": [{ "name": "download", "status": "done", "elapsed_seconds": 42.1 }],
   "status": "running",
+  "heartbeat": false,
   "error": null
 }
 ```
@@ -233,11 +264,28 @@ out/87_hook-fulano/
   contexto fechar (início de fala e pontuação terminal). A folga é limitada ao
   silêncio disponível, para não puxar a palavra do vizinho para dentro do corte.
 - 9:16 sempre ≤ 90s. Se o contexto fechado passar disso, o corte procura a maior
-  sub-janela alinhada a frase que caiba no teto; só quando não existe nenhuma é
-  que exporta só `horizontal_16x9` com `vertical_skipped` no `meta.json`.
+  sub-janela alinhada a frase que caiba no teto — mas só aceita se ela ainda for
+  um momento (piso de 15s, `CLIP_VERTICAL_MIN_SHRUNK_S`). Sobrando só um
+  fragmento, exporta apenas `horizontal_16x9` com `vertical_skipped` no
+  `meta.json`. Quando encolhe, o `meta.json` registra
+  `windows.vertical_9x16.shrunk_from_16x9` e se aquela janela fecha contexto
+  sozinha.
 - 16:9 tem duração livre, decidida pela IA.
+- **O score avalia a transcrição literal da janela final**, não o `text_excerpt`
+  que o modelo de candidatos escreveu: o snap por palavra mexe nas fronteiras
+  depois que aquela paráfrase foi gerada. Os primeiros 3s vão separados para o
+  scorer, e um corte que abre praticamente sem fala tem o `hook` limitado de
+  forma determinística.
 - Corte truncado não é publicável: contexto aberto tem teto de score 45 e `arco`
   no máximo 6, independentemente da nota que o modelo deu.
+- Dedupe olha overlap temporal no 16:9 **e** no 9:16 (é o 9:16 que vai para o
+  TikTok) e detecta a mesma ideia por vocabulário de conteúdo, não só por texto
+  quase idêntico.
+- Além do limiar absoluto, a seleção aplica um **piso relativo**
+  (`CLIP_SCORE_RELATIVE_GAP`, default 22): num vídeo com um momento de 92, um
+  corte de 61 não vai junto só porque passou dos 60. O piso nunca desce abaixo do
+  mínimo da faixa da SPEC §3 e é desligado no `--count N`, que é um pedido
+  explícito de quantidade.
 - `--more`/`--count` nunca inventam clip fraco: qualidade > quantidade.
 - Face tracking (MediaPipe) roda só no `vertical_facetrack`, nunca no
   `vertical_center`/`horizontal_16x9`.
@@ -248,13 +296,35 @@ out/87_hook-fulano/
 
 - `work/<job_id>/` guarda vídeo, áudio, transcrição, candidatos, frames e
   diarização: `resume` não re-baixa, não re-transcreve e não re-extrai frames.
+  O cache de frames é indexado pela **janela**, não pela posição do candidato:
+  regenerar candidatos não reaproveita frames de outro momento (o scorer
+  avaliaria o vídeo errado), e dois candidatos com a mesma janela dividem a
+  extração.
 - Chamadas de rede (STT, score, títulos) rodam em paralelo limitado
   (`CLIP_NETWORK_WORKERS`, default 3); render e face tracking usam um pool
   menor (`CLIP_RENDER_WORKERS`, default 2) porque ffmpeg e MediaPipe competem
   por CPU/RAM e subir demais só faz a máquina entrar em swap.
 - Vision roda **só** nos candidatos, com 3 frames reduzidos a 512px — o scorer
   precisa enxergar enquadramento e reação, não 720p.
+- O dedupe compara vocabulário de conteúdo antes de qualquer comparação
+  caractere-a-caractere, e limita o texto que vai para o `SequenceMatcher`:
+  com excerpts de transcrição real, comparar todos os pares no tamanho cheio era
+  CPU quadrática sem sinal extra.
 - `--dry-run` e `--budget` decidem antes do passo caro.
+
+### Gargalos que continuam de pé
+
+- **Render é o teto.** MediaPipe a ~8–12fps domina o `vertical_facetrack`; com
+  `CLIP_RENDER_WORKERS=2` num i5 de 4 cores, dois ffmpeg já saturam a CPU. Subir
+  o pool não acelera, só aumenta a pressão de RAM.
+- **STT é um round-trip por chunk de ~10 min.** Em vídeo longo é o segundo maior
+  custo de tempo e depende inteiramente da latência da OpenRouter.
+- **Candidatos são um único prompt** sobre a transcrição inteira (truncada em
+  12k caracteres). Um podcast de 3h perde detalhe no fim da transcrição —
+  particionar isso é a próxima melhoria estrutural, e não caberia nesta passada
+  sem mudar a forma do prompt.
+- **`out/` e `work/` não têm expiração automática** (SPEC §15 pede limpar
+  `work/` antigo). Hoje é manual.
 
 ## Testes
 
