@@ -72,8 +72,11 @@ export function Sidebar({
               >
                 <span className="flex items-center gap-2">
                   <StatusDot status={job.status ?? "pending"} />
-                  <span className="flex-1 truncate text-[0.82rem] font-medium text-mist-200">
-                    {shortenUrl(job.source_url, 32) || job.job_id}
+                  <span
+                    className="min-w-0 flex-1 truncate text-[0.82rem] font-medium text-mist-200"
+                    title={job.source_url || job.job_id}
+                  >
+                    {shortenUrl(job.source_url, 26) || job.job_id}
                   </span>
                   {active && (
                     <span className="shrink-0 font-mono text-[0.7rem] text-brand-400">

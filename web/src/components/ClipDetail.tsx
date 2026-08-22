@@ -182,7 +182,7 @@ export function ClipDetail({
                     <a
                       href={artifactUrl(jobId, clip.slug, name, true)}
                       download
-                      className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[0.78rem] text-mist-300 transition-colors hover:bg-white/6 hover:text-white"
+                      className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[0.78rem] text-mist-300 underline-offset-2 transition-colors hover:bg-white/6 hover:text-white hover:underline"
                     >
                       <span>{ARTIFACT_LABELS[name] ?? name}</span>
                       <span className="font-mono text-[0.68rem] text-mist-400">↓</span>

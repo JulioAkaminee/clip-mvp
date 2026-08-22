@@ -515,6 +515,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/api/jobs/{job_id}/history")
+    def job_history(job_id: str, limit: int = Query(300, ge=1, le=5000)) -> dict[str, Any]:
+        """Histórico de mensagens do job (o `events.jsonl` que o reporter grava).
+
+        É o que permite abrir um job já terminado e ainda ver o caminho que ele
+        percorreu, em vez de só o último frame.
+        """
+        path = Path(settings.work_dir) / job_id / "events.jsonl"
+        if not path.is_file():
+            _require_snapshot(job_id)  # 404 se o job não existe mesmo
+            return {"events": []}
+        events: list[dict[str, Any]] = []
+        last_message = ""
+        for line in path.read_text("utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = (event.get("message") or "").strip()
+            if not message or message == last_message:
+                continue
+            last_message = message
+            events.append(
+                {
+                    "t": event.get("updated_at"),
+                    "stage": event.get("stage", ""),
+                    "message": message,
+                }
+            )
+        return {"events": events[-limit:]}
+
     @app.post("/api/jobs/{job_id}/retry")
     def retry_job(job_id: str, payload: JobRequest | None = None) -> dict[str, Any]:
         if runner.is_running(job_id):

@@ -6,6 +6,7 @@ import type {
   JobListItem,
   JobProgress,
   JobRequest,
+  LogLine,
 } from "./types";
 
 const BASE = "/api";
@@ -48,6 +49,7 @@ export const api = {
   jobs: () => request<{ jobs: JobListItem[] }>("/jobs"),
   job: (id: string) => request<JobProgress>(`/jobs/${id}`),
   clips: (id: string) => request<{ clips: Clip[] }>(`/jobs/${id}/clips`),
+  history: (id: string) => request<{ events: LogLine[] }>(`/jobs/${id}/history`),
   createJob: (payload: JobRequest) =>
     request<{ job_id: string }>("/jobs", { method: "POST", body: JSON.stringify(payload) }),
   cancel: (id: string) => request<{ canceled: boolean }>(`/jobs/${id}/cancel`, { method: "POST" }),

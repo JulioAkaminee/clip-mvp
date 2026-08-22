@@ -113,6 +113,26 @@ class TestHealthAndConfig:
         assert len(body["target_ranges"]) == 4
 
 
+class TestHistory:
+    """Abrir um job terminado tem de mostrar o caminho, não só o último frame."""
+
+    def test_history_comes_from_the_persisted_events(self, client):
+        job_id = _finished_job(client)
+        events = client.get(f"/api/jobs/{job_id}/history").json()["events"]
+        assert events
+        assert {"t", "stage", "message"} <= set(events[0])
+        assert events[-1]["message"] == "ok"
+
+    def test_history_drops_repeated_messages(self, client):
+        job_id = _finished_job(client)
+        events = client.get(f"/api/jobs/{job_id}/history").json()["events"]
+        messages = [event["message"] for event in events]
+        assert all(a != b for a, b in zip(messages, messages[1:]))
+
+    def test_history_of_unknown_job_is_404(self, client):
+        assert client.get("/api/jobs/nope/history").status_code == 404
+
+
 class TestClipListing:
     def test_lists_clips_with_meta_and_artifacts(self, client, exported_clip):
         job_id = _finished_job(client)

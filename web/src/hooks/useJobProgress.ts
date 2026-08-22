@@ -101,6 +101,13 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
 
     void (async () => {
       try {
+        // O histórico persistido em events.jsonl entra primeiro: abrir um job
+        // já terminado mostra o caminho todo, não só o último frame.
+        const history = await api.history(jobId).catch(() => ({ events: [] }));
+        if (!disposed && history.events.length > 0) {
+          setLog(history.events.slice(-300));
+          lastMessage.current = history.events[history.events.length - 1]?.message ?? "";
+        }
         const initial = await api.job(jobId);
         handle(initial);
         await loadClips(jobId);
