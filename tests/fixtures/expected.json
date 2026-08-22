@@ -1,0 +1,7 @@
+{
+  "description": "Expectativas minimas para o fixture BR (transcript_pt_br.json + sample_video.mp4), SPEC \u00a714.8.",
+  "min_candidates_context_complete": 1,
+  "requires_at_least_one_vertical_9x16_le_90s": true,
+  "max_vertical_9x16_duration_s": 90,
+  "no_mid_word_cuts": true
+}

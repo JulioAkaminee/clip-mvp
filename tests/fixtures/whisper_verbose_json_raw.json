@@ -1,0 +1,37 @@
+{
+  "task": "transcribe",
+  "language": "portuguese",
+  "duration": 12.0,
+  "text": "C\u00ea j\u00e1 tentou aquele treino novo? Sim, mas doeu tanto que eu n\u00e3o conseguia nem rir depois. Foi hil\u00e1rio, s\u00e9rio, melhor risada da semana.",
+  "segments": [
+    {"id": 0, "start": 0.0, "end": 2.6, "text": "C\u00ea j\u00e1 tentou aquele treino novo?"},
+    {"id": 1, "start": 3.2, "end": 6.9, "text": "Sim, mas doeu tanto que eu n\u00e3o conseguia nem rir depois."},
+    {"id": 2, "start": 7.0, "end": 9.8, "text": "Foi hil\u00e1rio, s\u00e9rio, melhor risada da semana."}
+  ],
+  "words": [
+    {"word": "C\u00ea", "start": 0.0, "end": 0.25},
+    {"word": "j\u00e1", "start": 0.3, "end": 0.55},
+    {"word": "tentou", "start": 0.6, "end": 1.1},
+    {"word": "aquele", "start": 1.15, "end": 1.6},
+    {"word": "treino", "start": 1.65, "end": 2.1},
+    {"word": "novo?", "start": 2.15, "end": 2.6},
+    {"word": "Sim,", "start": 3.2, "end": 3.45},
+    {"word": "mas", "start": 3.5, "end": 3.7},
+    {"word": "doeu", "start": 3.75, "end": 4.1},
+    {"word": "tanto", "start": 4.15, "end": 4.5},
+    {"word": "que", "start": 4.55, "end": 4.7},
+    {"word": "eu", "start": 4.75, "end": 4.9},
+    {"word": "n\u00e3o", "start": 4.95, "end": 5.2},
+    {"word": "conseguia", "start": 5.25, "end": 5.9},
+    {"word": "nem", "start": 5.95, "end": 6.15},
+    {"word": "rir", "start": 6.2, "end": 6.45},
+    {"word": "depois.", "start": 6.5, "end": 6.9},
+    {"word": "Foi", "start": 7.0, "end": 7.2},
+    {"word": "hil\u00e1rio,", "start": 7.25, "end": 7.8},
+    {"word": "s\u00e9rio,", "start": 7.85, "end": 8.2},
+    {"word": "melhor", "start": 8.25, "end": 8.6},
+    {"word": "risada", "start": 8.65, "end": 9.1},
+    {"word": "da", "start": 9.15, "end": 9.25},
+    {"word": "semana.", "start": 9.3, "end": 9.8}
+  ]
+}
