@@ -57,6 +57,10 @@ def build_meta(
             "start": window_9x16.start,
             "end": window_9x16.end,
             "duration_s": window_9x16.duration_s,
+            # O 9:16 pode ser uma sub-janela do 16:9 (contexto >90s encolhido,
+            # SPEC §2). Quem publica precisa saber disso sem abrir o vídeo.
+            "context_complete": bool(candidate.vertical_context_complete),
+            "shrunk_from_16x9": bool(candidate.vertical_shrunk),
         }
 
     return {

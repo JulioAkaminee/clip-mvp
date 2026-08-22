@@ -60,6 +60,11 @@ class Settings:
 
     # Duração máxima do vertical (SPEC §2)
     vertical_max_s: float = field(default_factory=lambda: _env_float("CLIP_VERTICAL_MAX_S", 90.0))
+    # Piso do encolhimento do 9:16: contexto >90s só vira Short se a sub-janela
+    # que cabe no teto ainda for um momento, não um fragmento (SPEC §2).
+    vertical_min_shrunk_s: float = field(
+        default_factory=lambda: _env_float("CLIP_VERTICAL_MIN_SHRUNK_S", 15.0)
+    )
 
     # Score (SPEC §3, §8)
     min_score_default: float = field(default_factory=lambda: _env_float("CLIP_MIN_SCORE", 60.0))

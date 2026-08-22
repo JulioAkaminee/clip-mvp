@@ -185,12 +185,13 @@ def _resolve_vertical(
     """
     proposed = cand.window_9x16 or cand.window_16x9
     if not words:
-        snapped = _snap(proposed, words, transcript, pad_before, pad_after)
-        if snapped.duration_s > settings.vertical_max_s:
+        result = _snap_result(proposed, words, transcript, pad_before, pad_after)
+        if result.duration_s > settings.vertical_max_s:
             cand.window_9x16 = None
             cand.vertical_skip_reason = "context_exceeds_90s"
         else:
-            cand.window_9x16 = snapped
+            cand.window_9x16 = Window(start=result.start, end=result.end)
+            cand.vertical_context_complete = result.context_complete
         return
 
     fitted, skip_reason = fit_vertical_window(
@@ -198,6 +199,7 @@ def _resolve_vertical(
         proposed.end,
         words,
         max_duration_s=settings.vertical_max_s,
+        min_duration_s=settings.vertical_min_shrunk_s,
         pad_before_s=pad_before,
         pad_after_s=pad_after,
         media_duration=transcript.duration or None,
@@ -209,6 +211,10 @@ def _resolve_vertical(
 
     cand.window_9x16 = Window(start=fitted.start, end=fitted.end)
     cand.vertical_skip_reason = None
+    # O 9:16 pode ser uma sub-janela do 16:9: quem exporta precisa saber se ela
+    # fecha contexto por conta própria, não só se o momento inteiro fechava.
+    cand.vertical_context_complete = fitted.context_complete
+    cand.vertical_shrunk = fitted.end < cand.window_16x9.end - 1e-3
 
 
 def _snap_result(

@@ -407,12 +407,19 @@ def snap_window(
     )
 
 
+#: Um 9:16 encolhido abaixo disso não é mais "o momento", é um fragmento dele.
+#: A spec só autoriza encolher enquanto ainda houver **contexto completo** numa
+#: janela menor (SPEC §2), e o sweet spot do vertical começa em ~20s.
+MIN_SHRUNK_VERTICAL_S = 15.0
+
+
 def fit_vertical_window(
     start: float,
     end: float,
     words: list[Word],
     *,
     max_duration_s: float = 90.0,
+    min_duration_s: float = MIN_SHRUNK_VERTICAL_S,
     pad_before_s: float = 0.2,
     pad_after_s: float = 0.4,
     media_duration: float | None = None,
@@ -426,6 +433,10 @@ def fit_vertical_window(
     comece em fronteira de fala, termine em pontuação terminal e caiba no teto
     — preferindo as que terminam junto do fim canônico, porque é lá que mora a
     punchline.
+
+    ``min_duration_s`` é o piso do caminho de encolhimento: sobrar um fragmento
+    de poucos segundos não é "contexto completo numa janela menor", é um Short
+    ruim. Nesse caso é melhor exportar só o 16:9 (a saída (b) da spec).
 
     Retorna ``(janela, motivo_do_skip)``; um dos dois é sempre ``None``.
     """
@@ -464,7 +475,7 @@ def fit_vertical_window(
             if si > ei:
                 continue
             duration = inner[ei].end - inner[si].start + pad_before_s + pad_after_s
-            if duration > max_duration_s:
+            if duration > max_duration_s or duration < min_duration_s:
                 continue
             rank = (after_sentence, duration)
             if best is None or rank > best[0]:
@@ -486,6 +497,10 @@ def fit_vertical_window(
         expand_to_context=False,
     )
     if fitted.duration_s > max_duration_s or not fitted.ends_on_sentence:
+        return None, "context_exceeds_90s"
+    if fitted.duration_s < min_duration_s:
+        # Sobrou um fragmento: melhor entregar só o 16:9 do que um Short que
+        # começa do nada (SPEC §2, saída (b)).
         return None, "context_exceeds_90s"
     return fitted, None
 
