@@ -25,6 +25,7 @@ import json
 import mimetypes
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -63,6 +64,52 @@ POSTER_SOURCES: tuple[str, ...] = (
 )
 
 STREAM_CHUNK = 512 * 1024
+
+#: Um job vivo reescreve ``status.json`` a cada batimento (2s por padrão),
+#: inclusive quando roda na CLI em outro processo. Passado este tempo sem
+#: nenhuma escrita e sem thread viva aqui, o job morreu: `kill`, reboot, ou o
+#: laptop fechou no meio do render. Sem isso a UI herdava um "rodando" eterno,
+#: com ETA congelado e nenhum botão para sair do lugar.
+STALE_JOB_AFTER_S = 45.0
+
+_ACTIVE = {"queued", "running"}
+
+
+def mark_stale_if_dead(
+    snapshot: dict[str, Any], *, running: bool, now: float, after_s: float = STALE_JOB_AFTER_S
+) -> dict[str, Any]:
+    """Converte um job abandonado em estado de erro retriável.
+
+    O objetivo é honestidade: "interrompido" com um botão de retomar é
+    informação; um spinner que gira para sempre não é.
+    """
+    snapshot.setdefault("stale", False)
+    if running or snapshot.get("status") not in _ACTIVE:
+        return snapshot
+
+    updated_at = snapshot.get("updated_at")
+    if not isinstance(updated_at, (int, float)) or (now - updated_at) <= after_s:
+        return snapshot
+
+    stage = snapshot.get("stage") or "queued"
+    idle_min = max(1, int((now - updated_at) // 60))
+    snapshot["status"] = "error"
+    snapshot["stale"] = True
+    snapshot["eta_seconds"] = None
+    snapshot["eta_text"] = "interrompido"
+    snapshot["message"] = f"Job interrompido em {snapshot.get('stage_label', stage)}"
+    snapshot["error"] = {
+        "stage": stage,
+        "stage_label": snapshot.get("stage_label", stage),
+        "type": "JobInterrupted",
+        "message": (
+            f"O job parou de responder há ~{idle_min} min (processo encerrado, "
+            "reinício do servidor ou máquina suspensa)."
+        ),
+        "retriable": True,
+        "hint": "Clique em Tentar de novo: o cache em work/ é reaproveitado, sem re-baixar nem re-transcrever.",
+    }
+    return snapshot
 
 
 class JobRequest(BaseModel):
@@ -107,7 +154,8 @@ class JobRunner:
         self._cancels: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
-    def start(self, url: str, options: RunOptions, *, job_id: str | None = None) -> str:
+    def start(self, url: str, options: RunOptions, *, job_id: str | None = None) -> tuple[str, bool]:
+        """Dispara o job e devolve ``(job_id, é_um_job_que_já_estava_rodando)``."""
         resuming = job_id is not None
         job_id = job_id or make_job_id(url)
 
@@ -115,7 +163,7 @@ class JobRunner:
         # roda faria duas threads escreverem o mesmo status.json e a mesma pasta
         # out/. Nesse caso o certo é acompanhar o job que já existe.
         if self.is_running(job_id):
-            return job_id
+            return job_id, True
 
         broker = EventBroker()
         reporter = make_reporter(self.settings, job_id, sinks=[broker.publish])
@@ -151,20 +199,24 @@ class JobRunner:
         with self._lock:
             self._threads[job_id] = thread
         thread.start()
-        return job_id
+        return job_id, False
 
     def snapshot(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             reporter = self._reporters.get(job_id)
         if reporter is not None:
-            return reporter.snapshot()
-        path = Path(self.settings.work_dir) / job_id / "status.json"
-        if path.is_file():
+            payload = reporter.snapshot()
+        else:
+            path = Path(self.settings.work_dir) / job_id / "status.json"
+            if not path.is_file():
+                return None
             try:
-                return json.loads(path.read_text("utf-8"))
+                payload = json.loads(path.read_text("utf-8"))
             except (json.JSONDecodeError, OSError):
                 return None
-        return None
+        return mark_stale_if_dead(
+            payload, running=self.is_running(job_id), now=time.time()
+        )
 
     def broker(self, job_id: str) -> EventBroker | None:
         with self._lock:
@@ -222,6 +274,7 @@ class JobRunner:
                         "updated_at": snapshot.get("updated_at"),
                         "source_minutes": snapshot.get("source_minutes"),
                         "running": self.is_running(path.name),
+                        "stale": snapshot.get("stale", False),
                     }
                 )
             jobs.append(info)
@@ -357,6 +410,27 @@ def collect_clips(settings: Settings, job_id: str, snapshot: dict[str, Any] | No
     return clips
 
 
+#: Quanto do fim de ``events.jsonl`` o histórico lê. A UI só mostra as últimas
+#: centenas de linhas, então carregar o arquivo inteiro na memória para depois
+#: fatiar é trabalho jogado fora — e um job de podcast longo com retries gera
+#: um arquivo grande.
+HISTORY_TAIL_BYTES = 512 * 1024
+
+
+def _tail_lines(path: Path, *, max_bytes: int = HISTORY_TAIL_BYTES) -> list[str]:
+    """Últimas linhas completas do arquivo, sem ler o que vem antes."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()  # descarta a linha partida no meio
+            raw = fh.read()
+    except OSError:
+        return []
+    return raw.decode("utf-8", errors="replace").splitlines()
+
+
 def _ensure_poster(clip_dir: Path) -> Path | None:
     """Thumbnail do card, extraído do primeiro export disponível."""
     poster = clip_dir / "poster.jpg"
@@ -476,8 +550,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def create_job(payload: JobRequest) -> dict[str, Any]:
         if not payload.url.strip():
             raise HTTPException(status_code=400, detail="url é obrigatória")
-        job_id = runner.start(payload.url.strip(), payload.to_options())
-        return {"job_id": job_id}
+        job_id, already_running = runner.start(payload.url.strip(), payload.to_options())
+        return {
+            "job_id": job_id,
+            # O job_id vem da URL: reenviar o mesmo link não cria um segundo job.
+            # A UI precisa dizer isso, senão parece que o formulário não respondeu.
+            "already_running": already_running,
+        }
 
     @app.get("/api/jobs")
     def list_jobs() -> dict[str, Any]:
@@ -528,7 +607,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"events": []}
         events: list[dict[str, Any]] = []
         last_message = ""
-        for line in path.read_text("utf-8").splitlines():
+        for line in _tail_lines(path):
             line = line.strip()
             if not line:
                 continue
