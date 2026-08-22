@@ -14,6 +14,7 @@ from clip_mvp.score import (
     TRUNCATED_ARCO_CAP,
     apply_quality_rules,
     extract_frames,
+    frames_cache_key,
     looks_truncated,
 )
 
@@ -166,6 +167,21 @@ class TestBounds:
     )
     def test_looks_truncated(self, text, expected):
         assert looks_truncated(text) is expected
+
+
+class TestFramesCacheKey:
+    def test_the_key_is_the_window_not_the_candidate_position(self):
+        """Regenerar candidatos não pode reaproveitar frames de outro momento.
+
+        O id do candidato é posicional (`cand_003`), então indexar o cache por
+        ele fazia o scorer avaliar o vídeo errado depois de uma regeneração.
+        """
+        assert frames_cache_key(612.4, 668.0) == frames_cache_key(612.4, 668.0)
+        assert frames_cache_key(612.4, 668.0) != frames_cache_key(700.0, 760.0)
+
+    def test_the_key_is_filesystem_safe(self):
+        key = frames_cache_key(612.44, 668.05)
+        assert "/" not in key and "." not in key
 
 
 class TestFrameExtraction:

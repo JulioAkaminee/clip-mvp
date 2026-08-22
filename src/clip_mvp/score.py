@@ -93,6 +93,18 @@ def extract_frames(
     return paths
 
 
+def frames_cache_key(start: float, end: float) -> str:
+    """Nome do diretório de cache dos frames de uma janela.
+
+    Antes o cache era indexado pelo id do candidato (``cand_003``), que é
+    posicional: regenerar os candidatos reaproveitava frames de um momento
+    completamente diferente e o scorer avaliava o vídeo errado. A janela é a
+    identidade real do que foi extraído — e dois candidatos com a mesma janela
+    passam a dividir os frames em vez de pagar duas extrações.
+    """
+    return f"w{start:.1f}-{end:.1f}".replace(".", "_")
+
+
 def looks_truncated(text: str) -> bool:
     """Heurística barata: o trecho termina no meio de uma ideia?"""
     stripped = (text or "").strip()
@@ -210,7 +222,7 @@ def score_candidate(
         tmp_ctx = tempfile.TemporaryDirectory(prefix="clip_mvp_frames_")
         target_dir = Path(tmp_ctx.name)
     else:
-        target_dir = Path(frames_dir) / candidate.id
+        target_dir = Path(frames_dir) / frames_cache_key(window.start, window.end)
 
     try:
         images_b64: list[str] = []
