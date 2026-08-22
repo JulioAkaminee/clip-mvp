@@ -97,6 +97,10 @@ def _settings(tmp_path: Path) -> Settings:
         openrouter_api_key="test-key",
         work_dir=tmp_path / "work",
         out_dir=tmp_path / "out",
+        # O vídeo de fixture tem ~10s, abaixo do piso de arco completo. Aqui
+        # queremos testar o encanamento do pipeline, não a regra de duração
+        # (que tem teste próprio em test_score_rules.py).
+        min_duration_full_arc_s=0.0,
     )
 
 

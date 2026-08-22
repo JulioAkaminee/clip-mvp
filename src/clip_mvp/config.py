@@ -75,6 +75,19 @@ class Settings:
     )
     frames_per_score: int = field(default_factory=lambda: _env_int("CLIP_FRAMES_PER_SCORE", 3))
 
+    # Penalidades determinísticas do score (SPEC §8). Contexto aberto tem teto
+    # duro; cortes muito curtos raramente entregam arco completo, então também
+    # levam um teto (0 desliga a regra).
+    truncated_score_cap: float = field(
+        default_factory=lambda: _env_float("CLIP_TRUNCATED_SCORE_CAP", 45.0)
+    )
+    min_duration_full_arc_s: float = field(
+        default_factory=lambda: _env_float("CLIP_MIN_DURATION_FULL_ARC_S", 12.0)
+    )
+    short_clip_score_cap: float = field(
+        default_factory=lambda: _env_float("CLIP_SHORT_CLIP_SCORE_CAP", 70.0)
+    )
+
     # Diretórios (SPEC §5)
     work_dir: Path = field(default_factory=lambda: Path(os.getenv("CLIP_WORK_DIR", "work")))
     out_dir: Path = field(default_factory=lambda: Path(os.getenv("CLIP_OUT_DIR", "out")))
@@ -84,6 +97,17 @@ class Settings:
 
     # Feedback few-shot (SPEC §14.7)
     feedback_examples_n: int = field(default_factory=lambda: _env_int("CLIP_FEEDBACK_EXAMPLES_N", 6))
+
+    # Paralelismo. O alvo é um MacBook i5 4-core 16GB: chamadas de rede
+    # (STT/score/meta) paralelizam bem, mas ffmpeg e MediaPipe competem por CPU
+    # e RAM — subir demais o render faz a máquina entrar em swap e ficar mais
+    # lenta que rodando serial.
+    network_workers: int = field(default_factory=lambda: _env_int("CLIP_NETWORK_WORKERS", 3))
+    render_workers: int = field(
+        default_factory=lambda: _env_int(
+            "CLIP_RENDER_WORKERS", max(1, min(2, (os.cpu_count() or 4) // 2))
+        )
+    )
 
     def require_api_key(self) -> str:
         if not self.openrouter_api_key:
