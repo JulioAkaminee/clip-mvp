@@ -13,15 +13,19 @@ const STATUS_LABEL: Record<string, string> = {
 export function Sidebar({
   jobs,
   selectedId,
+  screen,
   health,
   onSelect,
   onNew,
+  onSettings,
 }: {
   jobs: JobListItem[];
   selectedId: string | null;
+  screen: "new" | "settings" | "job";
   health: Health | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onSettings: () => void;
 }) {
   return (
     <aside className="flex h-full min-h-0 w-full flex-col gap-4 border-white/8 lg:w-80 lg:border-r lg:pr-5">
@@ -37,12 +41,22 @@ export function Sidebar({
             Cortes automáticos com contexto fechado
           </p>
         </div>
-        <Button size="sm" variant="primary" onClick={onNew} title="Novo job">
-          + Novo
-        </Button>
+        <div className="flex shrink-0 flex-col gap-1.5">
+          <Button size="sm" variant="primary" onClick={onNew} title="Novo job">
+            + Novo
+          </Button>
+          <Button
+            size="sm"
+            variant={screen === "settings" ? "primary" : "outline"}
+            onClick={onSettings}
+            title="Configurações da OpenRouter"
+          >
+            Configurações
+          </Button>
+        </div>
       </div>
 
-      <HealthPanel health={health} />
+      <HealthPanel health={health} onSettings={onSettings} />
 
       <div className="flex min-h-0 flex-1 flex-col gap-2">
         <div className="flex items-center justify-between px-1">
@@ -65,7 +79,7 @@ export function Sidebar({
                 onClick={() => onSelect(job.job_id)}
                 className={cx(
                   "w-full rounded-xl border px-3 py-2.5 text-left transition-colors",
-                  selectedId === job.job_id
+                  screen === "job" && selectedId === job.job_id
                     ? "border-brand-400/45 bg-brand-500/10"
                     : "border-white/8 bg-white/3 hover:border-white/20 hover:bg-white/6",
                 )}
@@ -117,7 +131,13 @@ export function Sidebar({
   );
 }
 
-function HealthPanel({ health }: { health: Health | null }) {
+function HealthPanel({
+  health,
+  onSettings,
+}: {
+  health: Health | null;
+  onSettings: () => void;
+}) {
   if (!health) {
     return (
       <div className="rounded-xl border border-white/8 bg-white/3 px-3 py-2.5 text-[0.75rem] text-mist-400">
@@ -156,10 +176,18 @@ function HealthPanel({ health }: { health: Health | null }) {
           </li>
         ))}
       </ul>
-      {!health.openrouter_key && (
+      {health.openrouter_key ? (
         <p className="text-[0.7rem] leading-snug text-mist-400">
-          Preencha <code className="text-mist-300">OPENROUTER_API_KEY</code> no{" "}
-          <code className="text-mist-300">.env</code>: sem chave o job para no primeiro passo de IA.
+          OpenRouter {health.openrouter_key_masked ?? "configurada"}
+          {health.openrouter_key_source === "ui" ? " (pela interface)" : " (pelo .env)"}.
+        </p>
+      ) : (
+        <p className="text-[0.7rem] leading-snug text-mist-400">
+          Sem chave o job para no primeiro passo de IA.{" "}
+          <button type="button" onClick={onSettings} className="text-brand-400 hover:underline">
+            Abrir Configurações
+          </button>{" "}
+          para colar a chave da OpenRouter.
         </p>
       )}
       {!health.mediapipe && (

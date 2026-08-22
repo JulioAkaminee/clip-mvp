@@ -4,8 +4,11 @@ import type { AppConfig, Health, JobListItem } from "./lib/types";
 import { useJobProgress } from "./hooks/useJobProgress";
 import { JobView } from "./components/JobView";
 import { NewJobForm } from "./components/NewJobForm";
+import { SettingsPage } from "./components/SettingsPage";
 import { Sidebar } from "./components/Sidebar";
 import { Button, Card } from "./components/ui";
+
+type Screen = "new" | "settings" | "job";
 
 const JOBS_POLL_MS = 4000;
 
@@ -14,6 +17,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [jobs, setJobs] = useState<JobListItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [screen, setScreen] = useState<Screen>("new");
   const [bootError, setBootError] = useState<string | null>(null);
 
   const refreshJobs = useCallback(async () => {
@@ -38,7 +42,10 @@ export default function App() {
       }
       const list = await refreshJobs();
       const active = list.find((job) => job.status === "running" || job.status === "queued");
-      setSelectedId(active?.job_id ?? null);
+      if (active) {
+        setSelectedId(active.job_id);
+        setScreen("job");
+      }
     })();
   }, [refreshJobs]);
 
@@ -54,9 +61,18 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [jobs, refreshJobs]);
 
+  const refreshHealth = useCallback(async () => {
+    try {
+      setHealth(await api.health());
+    } catch {
+      /* a tela de Configurações já mostra o erro de salvamento */
+    }
+  }, []);
+
   const onCreated = async (jobId: string) => {
     await refreshJobs();
     setSelectedId(jobId);
+    setScreen("job");
   };
 
   return (
@@ -66,9 +82,17 @@ export default function App() {
           <Sidebar
             jobs={jobs}
             selectedId={selectedId}
+            screen={screen}
             health={health}
-            onSelect={setSelectedId}
-            onNew={() => setSelectedId(null)}
+            onSelect={(id) => {
+              setSelectedId(id);
+              setScreen("job");
+            }}
+            onNew={() => {
+              setSelectedId(null);
+              setScreen("new");
+            }}
+            onSettings={() => setScreen("settings")}
           />
         </div>
 
@@ -93,7 +117,14 @@ export default function App() {
             </Card>
           )}
 
-          {selectedId === null || progress === null ? (
+          {screen === "settings" ? (
+            <SettingsPage
+              health={health}
+              onChanged={() => {
+                void refreshHealth();
+              }}
+            />
+          ) : screen === "new" || selectedId === null || progress === null ? (
             <NewJobForm config={config} health={health} onCreated={onCreated} />
           ) : (
             <JobView

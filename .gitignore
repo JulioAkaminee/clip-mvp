@@ -20,3 +20,6 @@ dist/
 node_modules/
 .vite/
 tsconfig.tsbuildinfo
+
+# Chave da OpenRouter gravada pela UI (default: ~/.config/clip-mvp/)
+**/clip-mvp/settings.json

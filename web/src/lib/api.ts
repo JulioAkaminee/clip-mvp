@@ -1,12 +1,17 @@
 import type {
   AppConfig,
+  AppSettings,
   ArtifactName,
   Clip,
+  ConnectionTestResult,
   Health,
   JobListItem,
   JobProgress,
   JobRequest,
   LogLine,
+  ModelRoleKey,
+  ModelsCatalog,
+  SettingsUpdate,
 } from "./types";
 
 const BASE = "/api";
@@ -66,6 +71,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ verdict, note }),
     }),
+  settings: () => request<AppSettings>("/settings"),
+  updateSettings: (payload: SettingsUpdate) =>
+    request<AppSettings>("/settings", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  testConnection: (apiKey?: string) =>
+    request<ConnectionTestResult>("/settings/test", {
+      method: "POST",
+      body: JSON.stringify(apiKey ? { api_key: apiKey } : {}),
+    }),
+  models: (params?: { role?: ModelRoleKey; q?: string; refresh?: boolean }) => {
+    const query = new URLSearchParams();
+    if (params?.role) query.set("role", params.role);
+    if (params?.q) query.set("q", params.q);
+    if (params?.refresh) query.set("refresh", "true");
+    const suffix = query.size ? `?${query}` : "";
+    return request<ModelsCatalog>(`/settings/models${suffix}`);
+  },
 };
 
 export function artifactUrl(

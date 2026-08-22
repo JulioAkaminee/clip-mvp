@@ -23,7 +23,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e .              # CLI + API
 pip install -e '.[facetrack]' # + MediaPipe/OpenCV para o vertical_facetrack
-cp .env.example .env          # preencha OPENROUTER_API_KEY=
+cp .env.example .env          # opcional: OPENROUTER_API_KEY= (também dá para colar na UI)
 ```
 
 Sem MediaPipe o `vertical_facetrack` não é gerado (o job avisa e segue com
@@ -46,6 +46,9 @@ cd web && npm run dev         # UI em :5173 com hot reload
 A interface é um app React + Vite (`web/`) que consome o mesmo payload de
 progresso da CLI. Com ela você:
 
+- cola a **chave da OpenRouter** e escolhe o modelo de cada papel de IA em
+  **Configurações** (STT, candidatos, score/vision, texto social, diarização) —
+  qualquer id do catálogo, com busca quando a chave está salva;
 - cola a URL e escolhe quantidade (**auto** / **+50%** / **fixo N**), limiar de
   score, formatos, legendas e plataformas;
 - estima o custo antes de gastar (**dry-run**) e trava um **orçamento** em USD;
@@ -68,6 +71,38 @@ progresso da CLI. Com ela você:
 
 Jobs criados na CLI aparecem na UI e vice-versa: o estado vive em
 `work/<job_id>/status.json`.
+
+### Chave e modelos (Configurações)
+
+A chave **não precisa** morar só no `.env`. Em **Configurações** você cola
+`OPENROUTER_API_KEY`, testa a conexão e escolhe o modelo de cada papel:
+
+| Papel | Para quê | Default (`.env.example`) |
+|-------|----------|--------------------------|
+| STT / Whisper | transcrição PT-BR com timestamps | `openai/whisper-1` |
+| Candidatos | trechos com contexto fechado | `google/gemini-2.5-flash` |
+| Score (vision) | nota 0–100 + 3 frames | `google/gemini-2.5-flash` |
+| Meta / texto social | títulos e hashtags YT/TikTok | `google/gemini-2.5-flash` |
+| Diarização | speaker labels (opcional; vazio = STT) | (mesmo do STT) |
+
+Qualquer slug da OpenRouter (`autor/modelo`, inclusive `:free`) é aceito — o
+campo é texto livre. Com a chave salva, a tela busca `GET /api/v1/models` e
+filtra por modalidade (áudio no STT, visão no score).
+
+A chave é gravada **fora do repositório**, com permissão `0600`:
+
+```
+~/.config/clip-mvp/settings.json
+```
+
+(ou o caminho de `CLIP_SETTINGS_FILE` / `$XDG_CONFIG_HOME/clip-mvp/settings.json`).
+A API **nunca** devolve o valor completo — só um máscara (`sk-or-…cdef`) e a
+origem (`ui` ou `env`). A CLI (`clip "URL"`) lê o mesmo arquivo por cima do
+`.env`, então configurar na tela vale no terminal sem reiniciar nada. Precedência:
+
+```
+default do código  <  .env  <  arquivo de settings (UI)
+```
 
 ## Uso da CLI
 
@@ -230,8 +265,12 @@ Resultado (o que a UI mostra depois do progresso):
 
 | Método | Rota | Para quê |
 |--------|------|----------|
-| `GET` | `/api/health` | ffmpeg, yt-dlp, MediaPipe, chave e modelos |
+| `GET` | `/api/health` | ffmpeg, yt-dlp, MediaPipe, chave **mascarada** e modelos |
 | `GET` | `/api/config` | regras do produto (teto de 90s, padding, faixas de N) |
+| `GET` | `/api/settings` | chave mascarada + modelo de cada papel (STT, candidatos, score, meta, diarização) |
+| `PUT` | `/api/settings` | grava chave e/ou modelos no arquivo de settings |
+| `POST` | `/api/settings/test` | testa a conexão com a OpenRouter (chave nova ou a já salva) |
+| `GET` | `/api/settings/models` | catálogo da OpenRouter (`?role=score&q=gemini`) |
 | `GET` | `/api/jobs/{id}/clips` | cortes com `meta.json` e artefatos disponíveis |
 | `GET` | `/api/jobs/{id}/clips/{slug}/files/{arquivo}` | preview (com `Range`) e download |
 | `GET` | `/api/jobs/{id}/clips/{slug}/poster.jpg` | thumbnail (gerado sob demanda) |
@@ -289,8 +328,9 @@ out/87_hook-fulano/
 - `--more`/`--count` nunca inventam clip fraco: qualidade > quantidade.
 - Face tracking (MediaPipe) roda só no `vertical_facetrack`, nunca no
   `vertical_center`/`horizontal_16x9`.
-- Todas as chamadas de IA (STT, candidatos, score/vision, títulos) passam pela
-  OpenRouter (`OPENROUTER_API_KEY`).
+- Todas as chamadas de IA (STT, candidatos, score/vision, títulos, diarização)
+  passam pela OpenRouter. A chave vem do arquivo de Configurações ou de
+  `OPENROUTER_API_KEY` no `.env`.
 
 ## Eficiência (alvo: MacBook Pro i5 16GB)
 
@@ -342,6 +382,9 @@ PT-BR mockada) e mockam as chamadas de IA — não requerem rede nem
 `OPENROUTER_API_KEY` real. `tests/test_server_clips.py` cobre os endpoints que a
 UI consome (listagem de cortes, `Range` no preview, download, thumbnail e
 feedback) e `tests/test_server.py` verifica que a UI lê exatamente os campos que
-o payload de progresso promete.
+o payload de progresso promete. `tests/test_settings_store.py` e
+`tests/test_server_settings.py` cobrem mascaramento da chave, persistência
+`0600`, override `.env` ← UI e o contrato da tela de Configurações (sem vazar
+o valor da chave).
 
 Alvo: MacBook Pro Intel i5 16GB; ffmpeg + yt-dlp + MediaPipe locais; STT/LLM/vision no OpenRouter.

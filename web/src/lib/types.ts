@@ -174,6 +174,10 @@ export interface Clip {
   out_dir?: string;
 }
 
+export type KeySource = "ui" | "env";
+export type ModelSource = "ui" | "env" | "inherited";
+export type ModelRoleKey = "stt" | "candidates" | "score" | "meta" | "diarization";
+
 export interface Health {
   ok: boolean;
   ffmpeg: boolean;
@@ -181,10 +185,74 @@ export interface Health {
   yt_dlp: boolean;
   mediapipe: boolean;
   openrouter_key: boolean;
+  /** Chave mascarada (`sk-or-…cdef`). Nunca o valor completo. */
+  openrouter_key_masked?: string | null;
+  openrouter_key_source?: KeySource | null;
   ui_built: boolean;
   models: Record<string, string>;
   work_dir: string;
   out_dir: string;
+}
+
+export interface SettingsOpenRouter {
+  configured: boolean;
+  masked: string | null;
+  source: KeySource | null;
+  base_url: string;
+}
+
+export interface ModelRoleState {
+  role: ModelRoleKey;
+  label: string;
+  description: string;
+  requires: string[];
+  optional: boolean;
+  inherits_from: ModelRoleKey | null;
+  value: string;
+  env_default: string;
+  source: ModelSource;
+  effective: string;
+}
+
+export interface AppSettings {
+  openrouter: SettingsOpenRouter;
+  models: ModelRoleState[];
+  settings_file: string;
+  updated_at: number | null;
+}
+
+export interface SettingsUpdate {
+  api_key?: string | null;
+  clear_api_key?: boolean;
+  models?: Partial<Record<ModelRoleKey, string>>;
+}
+
+export interface ConnectionTestResult {
+  ok: boolean;
+  message: string;
+  label?: string | null;
+  usage_usd?: number | null;
+  limit_usd?: number | null;
+  limit_remaining_usd?: number | null;
+  is_free_tier?: boolean | null;
+  models_available?: number;
+}
+
+export interface OpenRouterModel {
+  id: string;
+  name: string;
+  context_length: number | null;
+  input_modalities: string[];
+  prompt_usd_per_mtok: number | null;
+  completion_usd_per_mtok: number | null;
+  free: boolean;
+}
+
+export interface ModelsCatalog {
+  models: OpenRouterModel[];
+  total: number;
+  matching: number;
+  cached: boolean;
 }
 
 export interface AppConfig {
