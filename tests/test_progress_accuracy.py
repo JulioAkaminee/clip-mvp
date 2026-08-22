@@ -97,6 +97,38 @@ class TestEtaHonesty:
         rep.finish()
         assert rep.snapshot()["eta_seconds"] == 0
 
+
+class TestTerminalEtaText:
+    """Um job terminado não tem "tempo restante" — o texto tem de dizer isso."""
+
+    def test_a_finished_job_says_concluido(self):
+        rep = reporter()
+        rep.start_stage("render", units_total=1)
+        rep.finish_stage("render")
+        rep.finish()
+        assert rep.snapshot()["eta_text"] == "concluído"
+
+    def test_a_failed_job_does_not_claim_to_be_calculating(self):
+        rep = reporter()
+        rep.start_stage("score", units_total=3)
+        rep.fail(RuntimeError("429 rate limit"), hint="espere um pouco")
+        payload = rep.snapshot()
+        assert payload["eta_seconds"] is None
+        assert payload["eta_text"] == "interrompido"
+
+    def test_a_canceled_job_says_cancelado(self):
+        rep = reporter()
+        rep.start_stage("download", units_total=1)
+        rep.cancel()
+        assert rep.snapshot()["eta_text"] == "cancelado"
+
+    def test_a_running_job_still_gets_a_countdown(self):
+        clock = [1000.0]
+        rep = reporter(clock=lambda: clock[0], source_minutes=30.0)
+        rep.start_stage("transcribe", units_total=3)
+        clock[0] += 5.0
+        assert "restantes" in rep.snapshot()["eta_text"]
+
     def test_stage_elapsed_is_exposed_for_stages_without_units(self):
         """`candidates` é um prompt só: o tempo do estágio é o único sinal de vida."""
         clock = [1000.0]

@@ -123,8 +123,24 @@ def stage_label(stage: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def format_eta(eta_seconds: float | None) -> str:
-    """Formata o ETA em PT-BR: ``~3 min restantes`` / ``~45 s restantes``."""
+#: Texto de ETA para job que já terminou: nesses estados não há tempo restante,
+#: e "finalizando…" num job concluído ou "calculando tempo restante…" num job que
+#: falhou é simplesmente mentira (SPEC: rótulos honestos em PT-BR).
+TERMINAL_ETA_TEXT: dict[str, str] = {
+    "done": "concluído",
+    "error": "interrompido",
+    "canceled": "cancelado",
+}
+
+
+def format_eta(eta_seconds: float | None, status: str | None = None) -> str:
+    """Formata o ETA em PT-BR: ``~3 min restantes`` / ``~45 s restantes``.
+
+    ``status`` terminal manda no texto: um job concluído não está "finalizando"
+    e um job que falhou não está "calculando tempo restante".
+    """
+    if status in TERMINAL_ETA_TEXT:
+        return TERMINAL_ETA_TEXT[status]
     if eta_seconds is None:
         return "calculando tempo restante…"
     if eta_seconds <= 0:
@@ -701,7 +717,7 @@ class ProgressReporter:
                 ),
                 "percent": round(self._percent(), 2),
                 "eta_seconds": (int(round(eta)) if eta is not None else None),
-                "eta_text": format_eta(eta),
+                "eta_text": format_eta(eta, self.status),
                 "message": self.message,
                 "clips_done": self.clips_done,
                 "clips_total": self.clips_total,

@@ -333,6 +333,10 @@ pytest                 # ou: clip test
 cd web && npm run build   # typecheck do front (tsc -b) + bundle
 ```
 
+Para conferir a UI sem gastar OpenRouter, `python scripts/seed_demo_job.py` roda
+o pipeline inteiro com as chamadas de IA mockadas (fixture BR) e deixa um job
+completo em `work/` + `out/`; depois `clip serve` e abra o job.
+
 Os testes usam fixtures em `tests/fixtures/` (vídeo sintético + transcrição
 PT-BR mockada) e mockam as chamadas de IA — não requerem rede nem
 `OPENROUTER_API_KEY` real. `tests/test_server_clips.py` cobre os endpoints que a
