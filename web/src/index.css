@@ -1,0 +1,115 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #070910;
+  --color-ink-900: #0b0e16;
+  --color-ink-850: #10141f;
+  --color-ink-800: #151a27;
+  --color-ink-700: #1d2434;
+  --color-ink-600: #2a3346;
+  --color-mist-400: #8b95ad;
+  --color-mist-300: #aab3c7;
+  --color-mist-200: #d3d9e6;
+  --color-brand-500: #6c8cff;
+  --color-brand-400: #8ea6ff;
+  --color-brand-600: #4f6ee0;
+  --color-lime-glow: #9be15d;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-ink-950 text-mist-200 antialiased;
+    background-image:
+      radial-gradient(60rem 40rem at 15% -10%, rgba(108, 140, 255, 0.16), transparent 60%),
+      radial-gradient(50rem 35rem at 95% 0%, rgba(155, 225, 93, 0.08), transparent 55%);
+    background-attachment: fixed;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-ink-600) transparent;
+  }
+
+  ::selection {
+    background: rgba(108, 140, 255, 0.35);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-brand-400);
+    outline-offset: 2px;
+    border-radius: 0.35rem;
+  }
+}
+
+@utility panel {
+  @apply rounded-2xl border border-white/8 bg-ink-900/70 backdrop-blur-xl;
+}
+
+@utility hairline {
+  @apply border-white/8;
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.progress-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.28),
+    transparent
+  );
+  transform: translateX(-100%);
+  animation: shimmer 1.6s infinite;
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(108, 140, 255, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 0.5rem rgba(108, 140, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(108, 140, 255, 0);
+  }
+}
+
+.pulse-ring {
+  animation: pulse-ring 1.8s infinite;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.fade-up {
+  animation: fade-up 0.24s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-shimmer::after,
+  .pulse-ring,
+  .fade-up {
+    animation: none;
+  }
+}
