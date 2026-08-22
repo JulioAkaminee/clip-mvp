@@ -179,7 +179,15 @@ def _select_clips(
 ) -> tuple[list[tuple[Candidate, Score]], int]:
     """Aplica limiar + dedupe (por score) + teto (SPEC §3 fluxo interno)."""
     items = [
-        DedupeItem(item=(c, s), start=c.window_16x9.start, end=c.window_16x9.end, text=c.text_excerpt, score=s.total)
+        DedupeItem(
+            item=(c, s),
+            start=c.window_16x9.start,
+            end=c.window_16x9.end,
+            text=c.text_excerpt,
+            score=s.total,
+            alt_start=c.window_9x16.start if c.window_9x16 else None,
+            alt_end=c.window_9x16.end if c.window_9x16 else None,
+        )
         for c, s in scored
     ]
     dedupe_result = dedupe_items(items)
