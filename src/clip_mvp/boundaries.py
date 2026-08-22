@@ -34,6 +34,9 @@ MAX_BACKWARD_EXPAND_S = 8.0
 #: Silêncio entre palavras que já vale como fronteira natural de bloco.
 NATURAL_GAP_S = 0.45
 
+#: Janela que o espectador usa para decidir se continua assistindo (SPEC §8: hook).
+HOOK_WINDOW_S = 3.0
+
 
 @dataclass(frozen=True)
 class BoundaryResult:
@@ -58,6 +61,43 @@ class BoundaryResult:
 def ends_sentence(word: Word) -> bool:
     text = (word.text or "").strip()
     return bool(text) and text[-1] in TERMINAL_PUNCT
+
+
+def words_in_window(words: list[Word], start: float, end: float) -> list[Word]:
+    """Palavras faladas dentro de ``[start, end]``, em ordem.
+
+    Inclui a palavra que só encosta na janela: é o que o espectador ouve.
+    """
+    return [
+        w
+        for w in sorted(words, key=lambda w: w.start)
+        if w.end > start + 1e-6 and w.start < end - 1e-6
+    ]
+
+
+def text_in_window(words: list[Word], start: float, end: float) -> str:
+    """Transcrição real da janela — o texto que o corte exportado vai dizer.
+
+    Usar isto em vez do ``text_excerpt`` que o LLM de candidatos escreveu é o
+    que faz a penalidade de truncamento e o scorer julgarem o corte de verdade,
+    e não uma paráfrase que pode ter sido aparada em qualquer ponto.
+    """
+    return " ".join(w.text.strip() for w in words_in_window(words, start, end) if w.text.strip())
+
+
+def hook_text(words: list[Word], start: float, *, hook_window_s: float = HOOK_WINDOW_S) -> str:
+    """O que é dito nos primeiros segundos do corte (SPEC §8: hook 0–25)."""
+    return text_in_window(words, start, start + max(0.1, hook_window_s))
+
+
+def segment_text_in_window(segments: list[Segment], start: float, end: float) -> str:
+    """Fallback de :func:`text_in_window` quando o STT só deu segmentos."""
+    parts = [
+        (seg.text or "").strip()
+        for seg in sorted(segments, key=lambda s: s.start)
+        if seg.end > start + 1e-6 and seg.start < end - 1e-6
+    ]
+    return " ".join(p for p in parts if p)
 
 
 def _snap_point_to_words(point: float, words: list[Word], *, is_start: bool) -> tuple[float, bool]:

@@ -53,7 +53,13 @@ class Window(BaseModel):
 
 
 class Candidate(BaseModel):
-    """Candidato a corte gerado pela IA (antes de score/dedupe)."""
+    """Candidato a corte gerado pela IA (antes de score/dedupe).
+
+    ``text_excerpt`` é a transcrição **real** da janela 16:9 depois do snap por
+    palavra, não a paráfrase que o modelo de candidatos escreveu: é ela que o
+    scorer lê e que a penalidade de truncamento avalia. A versão do modelo fica
+    em ``llm_excerpt`` para inspeção.
+    """
 
     id: str
     title: str
@@ -63,6 +69,14 @@ class Candidate(BaseModel):
     context_complete: bool = True
     llm_notes: str = ""
     vertical_skip_reason: Optional[str] = None
+    #: Excerpt original proposto pelo LLM (antes de ser trocado pela transcrição).
+    llm_excerpt: str = ""
+    #: Transcrição dos primeiros segundos do corte (SPEC §8: hook).
+    hook_text: str = ""
+    #: O 9:16 fecha contexto por conta própria (começa em fala e fecha frase)?
+    vertical_context_complete: bool = True
+    #: O 9:16 teve de encolher para caber no teto de 90s (SPEC §2).
+    vertical_shrunk: bool = False
 
 
 class ScoreBreakdown(BaseModel):

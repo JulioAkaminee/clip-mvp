@@ -6,7 +6,13 @@ import math
 from importlib import resources
 from typing import Any
 
-from .boundaries import fit_vertical_window, snap_window
+from .boundaries import (
+    fit_vertical_window,
+    hook_text,
+    segment_text_in_window,
+    snap_window,
+    text_in_window,
+)
 from .config import Settings
 from .models import Candidate, Transcript, Window
 from .openrouter import OpenRouterClient
@@ -84,10 +90,12 @@ def _parse_candidate(raw: dict[str, Any], idx: int) -> Candidate | None:
     if not w16:
         return None
     w9 = raw.get("window_9x16")
+    llm_excerpt = str(raw.get("text_excerpt", ""))[:2000]
     return Candidate(
         id=f"cand_{idx:03d}",
         title=str(raw.get("title", f"Momento {idx + 1}"))[:200],
-        text_excerpt=str(raw.get("text_excerpt", ""))[:2000],
+        text_excerpt=llm_excerpt,
+        llm_excerpt=llm_excerpt,
         window_9x16=Window(start=float(w9["start"]), end=float(w9["end"])) if w9 else None,
         window_16x9=Window(start=float(w16["start"]), end=float(w16["end"])),
         context_complete=bool(raw.get("context_complete", True)),
@@ -129,14 +137,35 @@ def generate_candidates(
         cand = _parse_candidate(raw, i)
         if cand is None:
             continue
-        cand.window_16x9 = _snap(cand.window_16x9, words, transcript, pad_before, pad_after)
-        cand.context_complete = cand.context_complete and _closes_context(
-            cand.window_16x9, words, transcript, pad_before, pad_after
-        )
+        snapped = _snap_result(cand.window_16x9, words, transcript, pad_before, pad_after)
+        cand.window_16x9 = Window(start=snapped.start, end=snapped.end)
+        cand.context_complete = cand.context_complete and snapped.context_complete
+        _attach_transcript_text(cand, words, transcript)
         _resolve_vertical(cand, words, transcript, settings, pad_before, pad_after)
         candidates.append(cand)
 
     return candidates
+
+
+def _attach_transcript_text(cand: Candidate, words, transcript: Transcript) -> None:
+    """Troca o excerpt do LLM pela transcrição real da janela final.
+
+    O snap por palavra mexe nas fronteiras depois que o modelo já escreveu o
+    excerpt, então a paráfrase dele não descreve mais o corte que vai sair. Como
+    é esse texto que alimenta o scorer, a penalidade de truncamento e o dedupe,
+    ele precisa ser o que o vídeo realmente diz.
+    """
+    window = cand.window_16x9
+    if words:
+        real = text_in_window(words, window.start, window.end)
+        cand.hook_text = hook_text(words, window.start)
+    else:
+        real = segment_text_in_window(transcript.segments, window.start, window.end)
+        cand.hook_text = segment_text_in_window(
+            transcript.segments, window.start, window.start + 3.0
+        )
+    if real:
+        cand.text_excerpt = real[:4000]
 
 
 def _resolve_vertical(
@@ -182,11 +211,15 @@ def _resolve_vertical(
     cand.vertical_skip_reason = None
 
 
-def _closes_context(
+def _snap_result(
     window: Window, words, transcript: Transcript, pad_before: float, pad_after: float
-) -> bool:
-    """Revalida o fechamento de contexto de forma determinística."""
-    result = snap_window(
+):
+    """Snap + validação de contexto em uma única passada.
+
+    O snap é idempotente, então revalidar com uma segunda chamada só custava
+    tempo: o resultado já diz se a janela começa em fala e fecha frase.
+    """
+    return snap_window(
         window.start,
         window.end,
         words=words,
@@ -195,17 +228,8 @@ def _closes_context(
         pad_after_s=pad_after,
         media_duration=transcript.duration or None,
     )
-    return result.context_complete
 
 
 def _snap(window: Window, words, transcript: Transcript, pad_before: float, pad_after: float) -> Window:
-    result = snap_window(
-        window.start,
-        window.end,
-        words=words,
-        segments=transcript.segments,
-        pad_before_s=pad_before,
-        pad_after_s=pad_after,
-        media_duration=transcript.duration or None,
-    )
+    result = _snap_result(window, words, transcript, pad_before, pad_after)
     return Window(start=result.start, end=result.end)

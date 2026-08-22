@@ -21,6 +21,13 @@ TRUNCATED_ARCO_CAP = 6.0
 MIN_DURATION_FOR_FULL_ARC_S = 12.0
 SHORT_CLIP_SCORE_CAP = 70.0
 
+#: Palavras faladas nos ~3s iniciais abaixo das quais o corte abre em silêncio
+#: (ou em meia palavra) e o hook não pode ser forte, por mais bonito que seja o
+#: frame que o modelo de vision viu (SPEC §8: hook = primeiros ~3s).
+MIN_HOOK_WORDS = 3
+#: Teto de "hook" quando o corte abre praticamente sem fala.
+WEAK_HOOK_CAP = 10.0
+
 TERMINAL_PUNCT = ".!?…"
 
 
@@ -94,12 +101,23 @@ def looks_truncated(text: str) -> bool:
     return stripped[-1] not in TERMINAL_PUNCT
 
 
+def opens_without_speech(hook_text: str, *, min_words: int = MIN_HOOK_WORDS) -> bool:
+    """O corte abre praticamente em silêncio nos primeiros ~3s?
+
+    Um Short que começa com o interlocutor ainda respirando perde o espectador
+    antes de a frase começar, e o modelo de vision não tem como perceber isso
+    olhando três frames.
+    """
+    return len((hook_text or "").split()) < min_words
+
+
 def apply_quality_rules(
     score: Score,
     *,
     text_excerpt: str,
     duration_s: float,
     boundary_context_complete: bool = True,
+    hook_text: str | None = None,
     settings: Settings | None = None,
 ) -> Score:
     """Aplica a penalidade dura da SPEC §8 em cima da nota do modelo.
@@ -107,6 +125,9 @@ def apply_quality_rules(
     O scorer se apaixona por momentos fortes mesmo quando o trecho começa ou
     termina no meio da fala. Corte truncado não é publicável, então o teto é
     inegociável e vale independentemente do que o modelo respondeu.
+
+    ``hook_text`` é a transcrição dos primeiros segundos do corte; quando
+    informada, um corte que abre sem fala perde nota de ``hook``.
     """
     truncated_cap = settings.truncated_score_cap if settings else TRUNCATED_SCORE_CAP
     min_arc_s = settings.min_duration_full_arc_s if settings else MIN_DURATION_FOR_FULL_ARC_S
@@ -124,6 +145,13 @@ def apply_quality_rules(
         if total > truncated_cap:
             total = truncated_cap
             notes.append(f"penalidade: contexto não fecha (teto {truncated_cap:.0f})")
+
+    if hook_text is not None and opens_without_speech(hook_text) and breakdown.hook > WEAK_HOOK_CAP:
+        # O total do modelo é a soma dos quatro critérios, então descontar a
+        # diferença mantém as duas coisas coerentes.
+        total -= breakdown.hook - WEAK_HOOK_CAP
+        breakdown.hook = WEAK_HOOK_CAP
+        notes.append("hook fraco: os primeiros segundos abrem quase sem fala")
 
     if min_arc_s > 0 and 0 < duration_s < min_arc_s and total > short_cap:
         total = short_cap
@@ -199,10 +227,18 @@ def score_candidate(
                 for ex in feedback_examples
             )
 
+        # O hook entra separado: sem isso o modelo julga "os primeiros 3
+        # segundos" olhando o trecho inteiro e chuta (SPEC §8).
+        hook_line = (
+            f"Primeiros 3s (o hook, transcrição literal): {candidate.hook_text}\n"
+            if candidate.hook_text
+            else ""
+        )
         user = (
             f"Título: {candidate.title}\n"
             f"Duração do corte: {window.duration_s:.1f}s\n"
-            f"Trecho da transcrição: {candidate.text_excerpt}\n"
+            f"{hook_line}"
+            f"Transcrição literal do corte: {candidate.text_excerpt}\n"
             f"Notas do gerador de candidatos: {candidate.llm_notes}\n"
             f"context_complete (proposto): {candidate.context_complete}"
             f"{feedback_text}"
@@ -217,6 +253,7 @@ def score_candidate(
         text_excerpt=candidate.text_excerpt,
         duration_s=window.duration_s,
         boundary_context_complete=candidate.context_complete,
+        hook_text=candidate.hook_text or None,
         settings=settings,
     )
 
