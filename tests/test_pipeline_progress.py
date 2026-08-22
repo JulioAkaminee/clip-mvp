@@ -133,7 +133,7 @@ class TestStageSequence:
     def test_stage_labels_are_ptbr(self, run):
         labels = {s["label"] for s in run["snapshot"]["stages"]}
         assert "Baixando vídeo" in labels
-        assert "Renderizando cortes" in labels
+        assert "Montando os vídeos" in labels
 
 
 class TestPercentAndEta:

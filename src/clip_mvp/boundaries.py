@@ -37,6 +37,10 @@ NATURAL_GAP_S = 0.45
 #: Janela que o espectador usa para decidir se continua assistindo (SPEC §8: hook).
 HOOK_WINDOW_S = 3.0
 
+#: Motivos de pular o 9:16 (viram ``vertical_skipped`` no meta.json, SPEC §2).
+VERTICAL_EXCEEDS_CAP = "context_exceeds_90s"
+VERTICAL_TOO_SHORT = "context_below_min"
+
 
 @dataclass(frozen=True)
 class BoundaryResult:
@@ -413,6 +417,70 @@ def snap_window(
 MIN_SHRUNK_VERTICAL_S = 15.0
 
 
+def extend_window_to_minimum(
+    start: float,
+    end: float,
+    words: list[Word],
+    *,
+    min_duration_s: float,
+    pad_before_s: float = 0.2,
+    pad_after_s: float = 0.4,
+    media_duration: float | None = None,
+    max_expand_s: float = 120.0,
+) -> BoundaryResult:
+    """Estica a janela até ``min_duration_s`` parando sempre em fim de frase.
+
+    Duas regras, nesta ordem:
+
+    1. **Cresce pelo fim.** O modelo escolheu aquele início por um motivo — é
+       onde a pergunta ou o setup começa. Puxar o começo para trás por uma
+       fração arbitrária da diferença faz o corte abrir no meio de um assunto
+       anterior, que é exatamente o defeito que a SPEC §2 proíbe.
+    2. **Só então recua o começo**, e mesmo assim parando em início de fala
+       (logo depois de uma pontuação terminal), nunca no meio de uma frase.
+
+    Se não houver pontuação suficiente à frente dentro de ``max_expand_s``,
+    devolve o melhor que conseguiu: entregar um corte um pouco mais curto é
+    melhor que entregar um corte que começa do nada.
+    """
+    if end - start >= min_duration_s or not words:
+        return snap_to_word_boundaries(
+            start, end, words,
+            pad_before_s=pad_before_s, pad_after_s=pad_after_s, media_duration=media_duration,
+        )
+
+    ordered = sorted(words, key=lambda w: w.start)
+    ceiling = end + max_expand_s
+    floor = start - max_expand_s
+
+    new_end = end
+    for word in ordered:
+        if word.end <= end or word.end > ceiling:
+            continue
+        if ends_sentence(word):
+            new_end = word.end
+            if new_end - start >= min_duration_s:
+                break
+
+    new_start = start
+    if new_end - new_start < min_duration_s:
+        for i in range(len(ordered) - 1, -1, -1):
+            word = ordered[i]
+            if word.start >= start or word.start < floor:
+                continue
+            starts_speech = i == 0 or ends_sentence(ordered[i - 1])
+            if not starts_speech:
+                continue
+            new_start = word.start
+            if new_end - new_start >= min_duration_s:
+                break
+
+    return snap_to_word_boundaries(
+        new_start, new_end, words,
+        pad_before_s=pad_before_s, pad_after_s=pad_after_s, media_duration=media_duration,
+    )
+
+
 def fit_vertical_window(
     start: float,
     end: float,
@@ -449,12 +517,29 @@ def fit_vertical_window(
             pad_after_s=pad_after_s,
             media_duration=media_duration,
         )
-        if result.duration_s <= max_duration_s:
+        if min_duration_s <= result.duration_s <= max_duration_s:
             return result, None
+        if result.duration_s < min_duration_s:
+            extra = min_duration_s - result.duration_s
+            expanded = snap_to_word_boundaries(
+                max(0.0, result.start - extra * 0.35),
+                result.end + extra * 0.65,
+                words,
+                pad_before_s=pad_before_s,
+                pad_after_s=pad_after_s,
+                media_duration=media_duration,
+            )
+            if min_duration_s <= expanded.duration_s <= max_duration_s:
+                return expanded, None
+            # Curto demais é o oposto de "passa de 90s": procurar uma
+            # sub-janela menor dentro de algo que já é pequeno não tem como
+            # dar certo, e devolver o motivo errado faz o meta.json e a tela
+            # dizerem que o contexto estourou o teto quando ele ficou aquém.
+            return None, VERTICAL_TOO_SHORT
 
     inner = [w for w in sorted(words, key=lambda w: w.start) if w.start >= start - 1e-3 and w.end <= end + 1e-3]
     if not inner:
-        return None, "context_exceeds_90s"
+        return None, VERTICAL_EXCEEDS_CAP
 
     # Um início de fala vale mais que uma simples pausa: começar logo depois de
     # um ponto final soa como o começo de uma ideia, começar numa pausa no meio
@@ -467,7 +552,7 @@ def fit_vertical_window(
             starts.append((i, after_sentence))
     ends = [i for i, w in enumerate(inner) if ends_sentence(w)]
     if not ends or not starts:
-        return None, "context_exceeds_90s"
+        return None, VERTICAL_EXCEEDS_CAP
 
     best: tuple[tuple[bool, float], int, int] | None = None
     for ei in reversed(ends):  # preferir terminar o mais perto da punchline
@@ -484,7 +569,7 @@ def fit_vertical_window(
             break
 
     if best is None:
-        return None, "context_exceeds_90s"
+        return None, VERTICAL_EXCEEDS_CAP
 
     _, si, ei = best
     fitted = snap_to_word_boundaries(
@@ -497,11 +582,11 @@ def fit_vertical_window(
         expand_to_context=False,
     )
     if fitted.duration_s > max_duration_s or not fitted.ends_on_sentence:
-        return None, "context_exceeds_90s"
+        return None, VERTICAL_EXCEEDS_CAP
     if fitted.duration_s < min_duration_s:
         # Sobrou um fragmento: melhor entregar só o 16:9 do que um Short que
         # começa do nada (SPEC §2, saída (b)).
-        return None, "context_exceeds_90s"
+        return None, VERTICAL_TOO_SHORT
     return fitted, None
 
 

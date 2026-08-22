@@ -89,9 +89,11 @@ class Settings:
     vertical_max_s: float = field(default_factory=lambda: _env_float("CLIP_VERTICAL_MAX_S", 90.0))
     # Piso do encolhimento do 9:16: contexto >90s só vira Short se a sub-janela
     # que cabe no teto ainda for um momento, não um fragmento (SPEC §2).
+    vertical_min_s: float = field(default_factory=lambda: _env_float("CLIP_VERTICAL_MIN_S", 45.0))
     vertical_min_shrunk_s: float = field(
-        default_factory=lambda: _env_float("CLIP_VERTICAL_MIN_SHRUNK_S", 15.0)
+        default_factory=lambda: _env_float("CLIP_VERTICAL_MIN_SHRUNK_S", 45.0)
     )
+    horizontal_min_s: float = field(default_factory=lambda: _env_float("CLIP_HORIZONTAL_MIN_S", 60.0))
 
     # Score (SPEC §3, §8)
     min_score_default: float = field(default_factory=lambda: _env_float("CLIP_MIN_SCORE", 60.0))
@@ -130,8 +132,8 @@ class Settings:
     work_dir: Path = field(default_factory=lambda: Path(os.getenv("CLIP_WORK_DIR", "work")))
     out_dir: Path = field(default_factory=lambda: Path(os.getenv("CLIP_OUT_DIR", "out")))
 
-    # Download (SPEC §6: 720p)
-    download_height: int = field(default_factory=lambda: _env_int("CLIP_DOWNLOAD_HEIGHT", 720))
+    # Download em Full HD. 1080p é o teto; se a fonte não tiver, o yt-dlp cai no melhor abaixo.
+    download_height: int = field(default_factory=lambda: _env_int("CLIP_DOWNLOAD_HEIGHT", 1080))
 
     # Feedback few-shot (SPEC §14.7)
     feedback_examples_n: int = field(default_factory=lambda: _env_int("CLIP_FEEDBACK_EXAMPLES_N", 6))

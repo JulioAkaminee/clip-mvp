@@ -6,6 +6,8 @@ que é a única fonte de verdade de progresso para a CLI, a API HTTP e a UI web.
 
 from __future__ import annotations
 
+import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,11 +18,13 @@ from . import face_track as face_track_mod
 from . import meta as meta_mod
 from . import render as render_mod
 from . import subtitles as subtitles_mod
+from .boundaries import VERTICAL_EXCEEDS_CAP
 from .budget import apply_budget, estimate_cost
 from .candidates import generate_candidates, resolve_target_range
 from .config import Settings
 from .dedupe import DedupeItem, dedupe_items
-from .diarization import diarize, resolve_speaker_matching_method
+from .diarization import diarize, resolve_speaker_matching_method, speaker_at
+from .models import DiarizationResult
 from .download import download_source, probe_metadata
 from .feedback import load_recent_feedback, write_selected_index
 from .models import Candidate, Score, Transcript
@@ -30,9 +34,9 @@ from .score import score_candidates
 from .transcribe import dump_transcript, load_transcript, transcribe_audio
 from .utils import ffprobe_duration
 from .utils import job_dir as make_job_dir
-from .utils import make_job_id, out_clip_dir, read_json, slugify, write_json
+from .utils import make_job_id, out_clip_dir, read_json, slugify, source_title, write_json
 
-DEFAULT_FORMATS = ["face", "9x16", "16x9"]
+DEFAULT_FORMATS = ["face", "16x9"]
 DEFAULT_PLATFORMS = ["yt", "tiktok"]
 DEFAULT_CAPTIONS = "both"
 
@@ -48,6 +52,15 @@ class RunOptions:
     platforms: list[str] = field(default_factory=lambda: list(DEFAULT_PLATFORMS))
     dry_run: bool = False
     budget: float | None = None
+    # Customização de Legendas / Safe Area
+    subtitle_style: str = "viral"
+    subtitle_position_v: float | None = None
+    subtitle_font_size: float = 1.0
+    subtitle_color: str | None = None
+    subtitle_outline_color: str | None = None
+    subtitle_uppercase: bool = False
+    subtitle_highlight: str = "pop"
+    subtitle_highlight_color: str | None = None
 
 
 @dataclass
@@ -63,6 +76,7 @@ class JobSummary:
     #: deste vídeo (SPEC §3.5: qualidade > quantidade).
     below_floor_removed: int = 0
     quality_floor: float | None = None
+    best_score: float | None = None
     dry_run: bool = False
     cost_estimate: dict[str, Any] | None = None
     budget_warning: str | None = None
@@ -134,7 +148,23 @@ def _ensure_candidates(
     force_regenerate: bool = False,
 ) -> list[Candidate]:
     if paths["candidates"].exists() and not force_regenerate:
+        from .candidates import finalize_candidate_windows
+
         raw = read_json(paths["candidates"])
+        pad_before = settings.pad_ms_min / 1000.0
+        pad_after = settings.pad_ms_max / 1000.0
+        words = transcript.all_words()
+        finalized: list[Candidate] = []
+        for item in raw:
+            cand = Candidate.model_validate(item)
+            kept = finalize_candidate_windows(
+                cand, words, transcript, settings, pad_before, pad_after
+            )
+            if kept is not None:
+                finalized.append(kept)
+        if finalized:
+            write_json(paths["candidates"], [c.model_dump() for c in finalized])
+            return finalized
         return [Candidate.model_validate(c) for c in raw]
 
     candidates = generate_candidates(
@@ -148,18 +178,30 @@ def _ensure_candidates(
     return candidates
 
 
-def _ensure_diarization_method(
+def _ensure_diarization(
     audio_path: Path,
     settings: Settings,
     paths: dict[str, Path],
     *,
     client: OpenRouterClient | None = None,
-) -> str:
-    """Diariza (com cache em work/<job_id>/diarization.json, SPEC §14.4) e
-    retorna o método a registrar em meta.json (SPEC §14.6)."""
+) -> tuple[str, DiarizationResult | None]:
+    """Diariza (com cache em work/<job_id>/diarization.json, SPEC §14.4).
+
+    Devolve o método **e os segmentos**. Antes só o método voltava, e a
+    timeline gravada em disco nunca era lida: o face tracking seguia o rosto
+    maior mesmo quando havia diarização dizendo quem estava falando.
+    """
     if paths["diarization"].exists():
         cached = read_json(paths["diarization"])
-        return cached.get("method", "activity_proxy")
+        segments = cached.get("segments") or []
+        result = (
+            DiarizationResult.model_validate(
+                {"segments": segments, "method": cached.get("method", "activity_proxy")}
+            )
+            if segments
+            else None
+        )
+        return cached.get("method", "activity_proxy"), result
 
     try:
         diarization = diarize(audio_path, settings, client=client)
@@ -171,7 +213,7 @@ def _ensure_diarization_method(
         paths["diarization"],
         {"method": method, "segments": [s.model_dump() for s in diarization.segments] if diarization else []},
     )
-    return method
+    return method, (diarization if method == "diarization" else None)
 
 
 @dataclass
@@ -322,6 +364,11 @@ def _hint_for(exc: BaseException) -> str:
         return "Confira se a URL está acessível e se o yt-dlp está atualizado."
     if "ffmpeg" in text or "ffprobe" in text:
         return "Verifique se o ffmpeg está instalado (`brew install ffmpeg`)."
+    if "badrequesterror" in text or "invalid model" in text or "audio/transcriptions" in text:
+        return (
+            "O modelo de transcrição precisa ser Whisper (openai/whisper-1). "
+            "Gemini/Claude/GPT-4o não funcionam no STT. Troque em Configurações e retome o job."
+        )
     return "Rode `clip resume <job_id>` para continuar de onde parou (o cache é preservado)."
 
 
@@ -381,25 +428,24 @@ def _execute(
         if cancel_check():
             raise JobCanceled("job cancelado pelo usuário")
 
-    if is_resume:
-        if not paths["transcript"].exists():
-            raise RuntimeError(
-                f"Job {job_id} não tem transcrição em cache; use `clip \"URL\"` para iniciar do zero."
-            )
-        job_meta_path = paths["dir"] / "job.json"
-        source_url = read_json(job_meta_path).get("source_url", "") if job_meta_path.exists() else ""
+    job_meta_path = paths["dir"] / "job.json"
+    cached_url = read_json(job_meta_path).get("source_url", "") if job_meta_path.exists() else ""
+    source_url = url or cached_url
+    if not source_url:
+        raise RuntimeError(
+            f"Job {job_id} não tem URL de origem. Inicie de novo colando o link."
+        )
+    write_json(paths["dir"] / "job.json", {"source_url": source_url, "job_id": job_id})
+
+    has_media = paths["video"].exists() and paths["audio"].exists()
+    if is_resume and has_media:
         reporter.skip_stage("download", "Vídeo e áudio reaproveitados do cache")
     else:
-        assert url is not None
-        source_url = url
-        write_json(paths["dir"] / "job.json", {"source_url": url, "job_id": job_id})
-        # Duração conhecida antes do primeiro byte: sem isso o ETA passaria o
-        # download inteiro sem ter o que estimar.
-        _seed_duration_estimate(url, reporter)
-
+        # Resume sem mídia (ou job novo): baixa/reaproveita o que já existir.
+        _seed_duration_estimate(source_url, reporter)
         reporter.start_stage("download", units_total=1)
         video_path = _ensure_download(
-            url,
+            source_url,
             settings,
             paths,
             on_progress=lambda frac, msg: reporter.update("download", frac * 0.9, msg),
@@ -410,6 +456,20 @@ def _execute(
 
     video_path = paths["video"]
     audio_path = paths["audio"]
+
+    # O título só existe depois do download (vem do .info.json do yt-dlp), e é
+    # o que distingue um job do outro na lista — toda URL de YouTube tem a
+    # mesma cara.
+    title = source_title(paths["dir"])
+    if title:
+        write_json(
+            paths["dir"] / "job.json",
+            {"source_url": source_url, "job_id": job_id, "source_title": title},
+        )
+
+    note = source_resolution_note(video_path)
+    if note:
+        summary.notes.append(note)
 
     # Duração é conhecida sem precisar transcrever (ffprobe no vídeo baixado,
     # ou a transcrição já cacheada em `resume`). Isso permite que --dry-run e
@@ -522,6 +582,7 @@ def _execute(
         ),
     )
     best = max((s.total for _, s in scored), default=0.0)
+    summary.best_score = round(best, 1) if scored else None
     reporter.finish_stage("score", f"{len(scored)} avaliados — melhor nota: {best:.0f}")
 
     check_cancel()
@@ -575,7 +636,7 @@ def _execute(
     )
 
     check_cancel()
-    speaker_method = _ensure_diarization_method(audio_path, settings, paths, client=client)
+    speaker_method, diarization = _ensure_diarization(audio_path, settings, paths, client=client)
 
     selection_meta = {
         "mode": "count" if options.count is not None else ("more" if options.more else "auto"),
@@ -606,6 +667,7 @@ def _execute(
         settings=settings,
         options=options,
         reporter=reporter,
+        diarization=diarization,
     )
 
     check_cancel()
@@ -623,6 +685,15 @@ def _execute(
     )
 
     write_selected_index(settings.work_dir, job_id, selected_index)
+
+    published = organize_for_publishing(Path(settings.out_dir), selected_index)
+    if published[VERTICAL_DIR] or published[HORIZONTAL_DIR]:
+        summary.notes.append(
+            f"Prontos para publicar: {published[VERTICAL_DIR]} vertical(is) em "
+            f"{settings.out_dir}/{VERTICAL_DIR}/ e {published[HORIZONTAL_DIR]} "
+            f"horizontal(is) em {settings.out_dir}/{HORIZONTAL_DIR}/."
+        )
+
     summary.selected = len(selected)
     summary.notes.append(
         f"selected={summary.selected}, candidates={summary.candidates}, "
@@ -636,6 +707,82 @@ def _execute(
     return summary
 
 
+
+def source_resolution_note(video_path: Path) -> str | None:
+    """Avisa quando a fonte é pequena demais para um 9:16 nítido.
+
+    O vertical recorta ``altura * 9/16`` de largura da fonte e amplia até
+    1080px. De um 1080p isso é um aumento de 1,8x; de um 360p, de 5,3x — e o
+    resultado sai borrado sem nada no log dizer por quê. O caso real: o
+    yt-dlp estava entregando 360p sem avisar, e todo corte saiu assim.
+    """
+    from .render import VERTICAL_SIZE, probe_video_shape
+
+    src_w, src_h = probe_video_shape(video_path)
+    if src_h <= 0:
+        return None
+    crop_w = src_h * 9 / 16
+    upscale = VERTICAL_SIZE[0] / max(1.0, min(crop_w, src_w))
+    if upscale <= 2.0:
+        return None
+    return (
+        f"A fonte baixada tem {src_w}x{src_h}: o corte vertical precisa ampliar "
+        f"{upscale:.1f}x para chegar em 1080p e vai sair menos nítido. "
+        "Se o vídeo original tiver resolução maior, apague work/<job_id>/source.mp4 "
+        "e rode de novo para baixar em Full HD."
+    )
+
+
+
+#: Nome das pastas de publicação criadas na finalização.
+VERTICAL_DIR = "verticais"
+HORIZONTAL_DIR = "horizontais"
+
+#: Que arquivo de cada corte vai para qual pasta, e com que sufixo no nome.
+_PUBLISH_LAYOUT: tuple[tuple[str, str, str], ...] = (
+    ("vertical_facetrack.mp4", VERTICAL_DIR, "rosto"),
+    ("vertical_center.mp4", VERTICAL_DIR, "fixo"),
+    ("horizontal_16x9.mp4", HORIZONTAL_DIR, ""),
+)
+
+
+def organize_for_publishing(out_dir: Path, clips: list[dict[str, Any]]) -> dict[str, int]:
+    """Junta os vídeos em ``out/verticais/`` e ``out/horizontais/``.
+
+    A pasta por corte continua sendo a fonte da verdade (é onde vivem o
+    ``meta.json``, as legendas e o que a interface lê). Isto é uma segunda
+    visão da mesma coisa, para quem vai publicar: todos os 9:16 num lugar para
+    arrastar de uma vez para o TikTok, todos os 16:9 em outro para o YouTube,
+    sem entrar em cinco pastas.
+
+    Usa **hard link** quando o sistema de arquivos deixa: o arquivo aparece nos
+    dois lugares sem ocupar espaço duas vezes — um corte vertical de 1 minuto
+    passa de 20MB, e copiar tudo dobraria o disco usado por job. Cai para cópia
+    se os caminhos estiverem em volumes diferentes.
+    """
+    made = {VERTICAL_DIR: 0, HORIZONTAL_DIR: 0}
+    for clip in clips:
+        clip_dir = Path(clip.get("out_dir", ""))
+        if not clip_dir.is_dir():
+            continue
+        stem = clip_dir.name  # já é "<score>_<slug>"
+        for filename, folder, suffix in _PUBLISH_LAYOUT:
+            source = clip_dir / filename
+            if not source.is_file():
+                continue
+            target_dir = out_dir / folder
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / (f"{stem}_{suffix}.mp4" if suffix else f"{stem}.mp4")
+            if target.exists():
+                target.unlink()
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+            made[folder] += 1
+    return made
+
+
 def _summary_payload(summary: JobSummary) -> dict[str, Any]:
     return {
         "job_id": summary.job_id,
@@ -644,6 +791,7 @@ def _summary_payload(summary: JobSummary) -> dict[str, Any]:
         "deduped_removed": summary.deduped_removed,
         "below_floor_removed": summary.below_floor_removed,
         "quality_floor": summary.quality_floor,
+        "best_score": summary.best_score,
         "vertical_ok": summary.vertical_ok,
         "vertical_skipped": summary.vertical_skipped,
         "min_score": summary.min_score,
@@ -685,6 +833,7 @@ def _render_selected(
     settings: Settings,
     options: RunOptions,
     reporter: ProgressReporter,
+    diarization: DiarizationResult | None = None,
 ) -> None:
     """Renderiza todos os formatos de todos os clipes, com progresso por clipe."""
     want_face = "face" in options.formats
@@ -721,7 +870,7 @@ def _render_selected(
         if candidate.window_9x16 is None:
             reporter.update_clip(
                 slug,
-                vertical_skipped=candidate.vertical_skip_reason or "context_exceeds_90s",
+                vertical_skipped=candidate.vertical_skip_reason or VERTICAL_EXCEEDS_CAP,
                 message="Contexto passa de 90s — só 16:9",
             )
 
@@ -752,6 +901,14 @@ def _render_selected(
                     ),
                 )
             if want_face:
+                # `speaker_at` recebe tempo relativo à janela; a diarização vive
+                # em tempo absoluto da fonte.
+                window_start = candidate.window_9x16.start
+                who = (
+                    (lambda rel: speaker_at(diarization, window_start + rel))
+                    if diarization is not None
+                    else None
+                )
                 _render_format(
                     reporter,
                     slug,
@@ -761,8 +918,20 @@ def _render_selected(
                         candidate.window_9x16,
                         clip_dir / "vertical_facetrack.mp4",
                         ass_path=caption_paths.get("ass_9x16"),
+                        speaker_at=who,
                     ),
                 )
+
+        # Miniaturas agora, com o ffmpeg já quente: geradas sob demanda, a
+        # primeira abertura da grade dispara um ffmpeg por corte e os cards
+        # ficam pretos enquanto isso.
+        try:
+            from .server import _ensure_poster
+
+            for orientation in ("vertical", "horizontal"):
+                _ensure_poster(clip_dir, orientation)
+        except Exception:  # noqa: BLE001 - thumbnail é enfeite, não trava o corte
+            pass
 
         reporter.update_clip(slug, status="done", message="Renderizado")
 
@@ -830,6 +999,7 @@ def _write_selected_meta(
             selection_meta=selection_meta,
             speaker_method=speaker_method,
             client=client,
+            options=options,
         )
 
     results: dict[str, dict[str, Any]] = {}
@@ -848,6 +1018,7 @@ def _write_selected_meta(
     reporter.finish_stage("meta", f"Títulos e hashtags prontos para {len(selected)} cortes")
 
     selected_index: list[dict[str, Any]] = []
+    fallback_errors: list[str] = []
     for candidate, _score in selected:
         clip_info = results[candidate.id]
         selected_index.append(clip_info)
@@ -856,6 +1027,16 @@ def _write_selected_meta(
             summary.vertical_skipped += 1
         else:
             summary.vertical_ok += 1
+        if clip_info.get("copy_source") == "fallback" and clip_info.get("copy_error"):
+            fallback_errors.append(clip_info["copy_error"])
+
+    if fallback_errors:
+        # Título de template em todo corte é sintoma, não estilo: se o modelo de
+        # textos nunca respondeu, o usuário precisa saber para trocá-lo.
+        summary.notes.append(
+            f"{len(fallback_errors)} de {len(selected)} corte(s) ficaram com título e "
+            f"hashtags automáticos porque o modelo de textos falhou: {fallback_errors[0]}"
+        )
     return selected_index
 
 
@@ -886,20 +1067,39 @@ def _build_clip_captions(
 
     cues_16x9 = cues_for(candidate.window_16x9.start, candidate.window_16x9.end)
     subtitles_mod.write_srt(cues_16x9, clip_dir / "captions.srt")
+    subtitles_mod.write_captions_json(cues_16x9, clip_dir / "captions.json")
+    sub_kwargs = {
+        "style": options.subtitle_style or "viral",
+        "position_v": options.subtitle_position_v,
+        "font_size_scale": options.subtitle_font_size or 1.0,
+        "primary_color": options.subtitle_color,
+        "outline_color": options.subtitle_outline_color,
+        "is_uppercase": options.subtitle_uppercase,
+    }
+
     if burn_in:
         ass_16x9 = clip_dir / "captions_16x9.ass"
         subtitles_mod.write_ass(
-            cues_16x9, ass_16x9, *render_mod.HORIZONTAL_SIZE, is_vertical=False
+            cues_16x9,
+            ass_16x9,
+            *render_mod.HORIZONTAL_SIZE,
+            is_vertical=False,
+            **sub_kwargs,
         )
         paths["ass_16x9"] = ass_16x9
 
     if candidate.window_9x16 is not None:
         cues_9x16 = cues_for(candidate.window_9x16.start, candidate.window_9x16.end)
         subtitles_mod.write_srt(cues_9x16, clip_dir / "captions_9x16.srt")
+        subtitles_mod.write_captions_json(cues_9x16, clip_dir / "captions_9x16.json")
         if burn_in:
             ass_9x16 = clip_dir / "captions_9x16.ass"
             subtitles_mod.write_ass(
-                cues_9x16, ass_9x16, *render_mod.VERTICAL_SIZE, is_vertical=True
+                cues_9x16,
+                ass_9x16,
+                *render_mod.VERTICAL_SIZE,
+                is_vertical=True,
+                **sub_kwargs,
             )
             paths["ass_9x16"] = ass_9x16
 
@@ -916,18 +1116,17 @@ def _write_clip_meta(
     selection_meta: dict[str, Any],
     speaker_method: str,
     client: OpenRouterClient,
+    options: RunOptions | None = None,
 ) -> dict[str, Any]:
     """Gera os textos sociais e grava meta.json (SPEC §7)."""
     clip_dir = out_clip_dir(settings.out_dir, round(score.total), slug)
 
     vertical_skipped = candidate.vertical_skip_reason
     if candidate.window_9x16 is None and vertical_skipped is None:
-        vertical_skipped = "context_exceeds_90s"
+        vertical_skipped = VERTICAL_EXCEEDS_CAP
 
-    try:
-        social_copy = meta_mod.generate_social_copy(candidate, settings, client=client)
-    except Exception:  # noqa: BLE001 - o job não pode travar por causa de copy
-        social_copy = {"youtube": {}, "tiktok": {}}
+    social = meta_mod.generate_social_copy(candidate, settings, client=client)
+    social_copy = social.copy
 
     meta_dict = meta_mod.build_meta(
         source_url=source_url,
@@ -938,7 +1137,24 @@ def _write_clip_meta(
         vertical_skipped=vertical_skipped,
         selection=selection_meta,
         social_copy=social_copy,
+        copy_source=social.source,
         speaker_matching_method=speaker_method,
+        subtitles={
+            "style": (options.subtitle_style if options else None) or "viral",
+            "position_v": (
+                options.subtitle_position_v
+                if options and options.subtitle_position_v is not None
+                else 0.2
+            ),
+            "font_size": (options.subtitle_font_size if options else None) or 1.0,
+            "color": (options.subtitle_color if options else None) or "#FFDE00",
+            "outline_color": (options.subtitle_outline_color if options else None)
+            or "#000000",
+            "uppercase": bool(options.subtitle_uppercase) if options else True,
+            "highlight": (options.subtitle_highlight if options else None) or "pop",
+            "highlight_color": (options.subtitle_highlight_color if options else None)
+            or "#FFFFFF",
+        },
     )
     write_json(clip_dir / "meta.json", meta_dict)
 
@@ -948,4 +1164,6 @@ def _write_clip_meta(
         "reason": score.reason,
         "out_dir": str(clip_dir),
         "vertical_skipped": vertical_skipped,
+        "copy_source": social.source,
+        "copy_error": social.error,
     }

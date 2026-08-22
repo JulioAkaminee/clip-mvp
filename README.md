@@ -36,6 +36,19 @@ cd web && npm install && npm run build && cd ..
 clip serve                    # http://127.0.0.1:8765
 ```
 
+Na primeira execução, sem chave configurada, a tela é um **onboarding de três
+passos** (pegue a chave → cole e teste → comece), em vez do formulário de job:
+o pré-requisito aparece antes, e não no meio de um job que já começou a rodar.
+
+O resto da interface é uma coisa só: **um campo e um botão**. Colar o link
+dispara um probe do vídeo que mostra título, duração e a estimativa de quantos
+cortes devem sair, quanto tempo vai levar e quanto deve custar — antes de gastar
+qualquer coisa. Todo o resto (quantidade, rigor, formatos, estilo de legenda,
+teto de gasto) fica atrás de **Ajustes**, fechado por padrão e escrito sem
+jargão: `min_score` virou "quão exigente ser", `vertical_facetrack` virou
+"vertical com zoom no rosto", `--dry-run` sumiu da tela. A tradução mora toda em
+`web/src/lib/format.ts`.
+
 Desenvolvendo o front, rode os dois processos (o Vite faz proxy de `/api`):
 
 ```bash
@@ -295,6 +308,108 @@ out/87_hook-fulano/
   meta.json                 # score, breakdown, títulos/hashtags YT+TikTok
 ```
 
+## Enquadramento
+
+O que sai de cada formato, e por quê.
+
+| Formato | Enquadramento |
+|---------|---------------|
+| `vertical_facetrack` | Recorte 9:16 que **segue quem fala**, com um comando de crop por quadro. Em plano aberto (3+ pessoas, ou rosto pequeno na mesa) troca sozinho para um recorte 4:5 mais largo com fundo desfocado — que continua acompanhando a conversa, só que sem decepar ninguém na ponta. |
+| `vertical_center` | Recorte central fixo **preenchendo a tela**. É o maior rosto possível sem tracking. |
+| `horizontal_16x9` | Corte limpo, sem tracking. Nunca amplia além do que a fonte tem, e fonte fora de 16:9 (4:3, vertical, captura de tela) ganha fundo desfocado em vez de ter as laterais decepadas. |
+
+Detalhes que definem a qualidade percebida:
+
+- **A resolução da fonte manda.** O 9:16 recorta `altura x 9/16` da fonte e amplia até 1080px de largura: de um 1080p isso é 1,8x; de um 360p, 5,3x. O job avisa no resumo quando a fonte é pequena demais para o vertical sair nítido.
+- **O crop anda por quadro.** A detecção roda a ~12 Hz, mas o comando de posição é emitido na taxa do vídeo (até 60 fps), interpolado. Um comando por amostra fazia cada posição segurar por 3 a 5 quadros: o salto máximo entre quadros consecutivos caiu de 20 px para 4 px.
+- **Troca de câmera é salto, não deslize.** A suavização mede a diferença entre quadros e, num corte de plano, reinicia em vez de aplicar o limite de velocidade — senão o enquadramento atravessa o quadro novo devagar, mostrando a parede por um segundo antes de achar o rosto.
+- **Quem fala manda no crop, quando dá para saber.** Se a diarização devolver rótulos de falante, a timeline vira entrada do tracking: aprendemos em que ponto da tela cada falante costuma estar (a diarização diz *quem* e *quando*, nunca *onde*) e o crop passa a seguir quem está falando, não o rosto maior. Sem diarização, o desempate entre dois rostos usa quanto a região da boca mudou — medida grosseira, então só entra com 2+ rostos e quando um está claramente mais ativo. Com um rosto em cena, nada disso muda o resultado.
+- **A detecção decodifica em sequência.** Um `seek` por amostra obriga o decoder a voltar ao keyframe anterior toda vez; ler em ordem e processar 1 quadro a cada N deixou a detecção ~2,8x mais rápida. O quadro ainda é reduzido para 640px antes do MediaPipe — o detector trabalha em coordenadas normalizadas, então resolução extra ali é só CPU.
+
+## Design
+
+`PRODUCT.md` guarda o contexto estratégico (quem usa, em que situação, o que a
+interface não pode parecer) e `DESIGN.md` o sistema visual (cor, tipo, layout,
+movimento). Duas decisões de produto que explicam a forma da tela:
+
+**Duas velocidades, dois layouts.** O job leva 20 a 30 minutos e a aba fica em
+segundo plano; depois vêm 5 a 15 cortes para triar em poucos minutos. São usos
+opostos. *Esperando*, a tela é grande e quase estática — o percentual em corpo
+48, uma frase do que está acontecendo, e os cortes aparecendo à medida que
+ficam prontos. *Escolhendo*, ela é uma bancada densa que responde ao teclado:
+`←` `→` para andar, `Enter` para abrir, `G`/`R` para julgar, `Esc` para voltar.
+
+**A miniatura é vertical.** O que se publica é o 9:16; julgar o corte por um
+quadro 16:9 é olhar para um enquadramento que não vai ao ar — some justamente
+o que o face tracking fez. O `poster_9x16.jpg` é extraído junto com o render,
+não na primeira abertura da grade (senão os cards ficam pretos enquanto cinco
+ffmpeg rodam).
+
+Movimento corresponde a fato, nunca a montagem: só o corte que **acabou** de
+ficar pronto anima a entrada (a lista é reconstruída a cada 2s — animar tudo
+que renderiza vira um piscar contínuo), passar o mouse na miniatura avança o
+vídeo em vez de dar zoom no card, e a nota conta de zero ao chegar porque a
+nota é o veredito. `prefers-reduced-motion` troca tudo por transição
+instantânea, e o estado final nunca depende de a animação ter rodado.
+
+## Saída organizada para publicar
+
+A pasta por corte (`out/<score>_<slug>/`) continua sendo a fonte da verdade —
+é onde vivem o `meta.json`, as legendas e o que a interface lê. No fim do job,
+os vídeos também aparecem agrupados por formato:
+
+```
+out/verticais/     75_conteudo-de-moto_rosto.mp4    <- 9:16 com face tracking
+                   75_conteudo-de-moto_fixo.mp4     <- 9:16 enquadramento fixo
+out/horizontais/   75_conteudo-de-moto.mp4          <- 16:9
+```
+
+São **hard links**, não cópias: o arquivo aparece nos dois lugares ocupando um
+espaço só. Um job de 5 cortes passa de 240MB, e copiar dobraria isso.
+
+## Desempenho
+
+Alvo: MacBook Pro i5 de 4 núcleos, sem GPU útil. Onde o tempo vai, num job real
+de 5 cortes a partir de um podcast de 3,5h: download 23%, transcrição 22%,
+**render 49%**, resto 6%.
+
+O que foi medido nesta máquina, e o que a medição derrubou:
+
+- **A taxa de quadros é o maior lever do render.** A fonte vinha em 60fps e saía
+  em 60fps por inércia. Em A/B alternado (justo mesmo com o notebook
+  esquentando), limitar a saída a 30fps tirou **38%** do tempo dos três
+  formatos. `CLIP_OUTPUT_FPS` sobe de volta para 60 se o corte pedir.
+- **Aceleração por hardware não ajuda aqui.** `h264_videotoolbox` existe neste
+  i5, mas ficou *mais lento* que o x264 (8,2s contra 6,0s) e gerou arquivo 7x
+  maior. E `-hwaccel videotoolbox` no decode foi **4x mais lento** que software:
+  o custo de trazer cada quadro de volta para a memória, onde os filtros
+  precisam dele, supera o ganho.
+- **O codec da fonte quase não importa para o decode.** O medo do AV1 em
+  software não se confirmou: o dav1d fez 90s de 1080p60 em 5,5s contra 6,4s do
+  H.264. Como o arquivo AV1 é 45% menor, ele é a escolha melhor — economiza
+  download sem custar render.
+- **Preset do x264 não vale mexer.** `superfast` é 15% mais rápido mas gera
+  arquivo 2,2x maior (upload mais lento, e o SSIM mal muda); `faster` é 4x mais
+  lento. `veryfast -crf 20` fica.
+- **Dois ffmpeg em paralelo é o ponto ótimo.** Serial leva 78,6s para os três
+  formatos de um corte, dois em paralelo 62,8s, três em paralelo 63,0s — o
+  terceiro não cabe em 4 núcleos.
+- **`sendcmd` custa caro e escala com o número de comandos.** Metade deles era
+  `crop y`, que nunca muda (a altura do recorte é sempre a da fonte). Trocar o
+  `sendcmd` por uma expressão de crop foi pior: o ffmpeg reavalia a expressão
+  por quadro e uma expressão longa nem compila.
+- **Blur em resolução cheia é desperdício.** O fundo desfocado agora é
+  produzido a 1/6 da resolução e ampliado de volta — visualmente igual, ~1/36
+  do trabalho.
+
+### Ainda na mesa
+
+Download e transcrição somam 45% do job e são espera de rede, não CPU. O maior
+ganho restante é **baixar o áudio primeiro e transcrever enquanto o vídeo
+baixa** — esconderia os ~6 min de transcrição atrás do download. Exige
+reorganizar o começo do pipeline (progresso, cancelamento, `resume`), então
+ficou de fora desta passada.
+
 ## Regras duras do produto (SPEC)
 
 - Nunca corta no meio de palavra: fronteira por word-timestamp + folga de
@@ -365,6 +480,40 @@ out/87_hook-fulano/
   sem mudar a forma do prompt.
 - **`out/` e `work/` não têm expiração automática** (SPEC §15 pede limpar
   `work/` antigo). Hoje é manual.
+
+## Armadilhas já pagas
+
+Coisas que quebraram de um jeito silencioso e agora têm teste ou comentário
+segurando. Antes de "simplificar" algum destes pontos, leia o porquê.
+
+- **Pontuação nas palavras do STT.** O endpoint devolve `segments[].text`
+  pontuado e `words[]` sem nenhuma pontuação. Como toda a lógica de fronteira
+  pergunta "esta palavra termina a frase?", sem reancorar a pontuação
+  (`transcribe.attach_punctuation`) o `context_complete` era **sempre** falso,
+  todo corte levava o teto de score de trecho truncado (45) e nada passava do
+  limiar de 60. O pipeline terminava "com sucesso" entregando só reprovados.
+- **Palavra em dois segmentos.** A fatia por segmento usava folgas que se
+  sobrepunham: 7% das palavras de um podcast de 2h apareciam duas vezes, e
+  vazavam repetidas no excerpt e na legenda ("direitinho Ele Ele era"). Agora
+  cada palavra pertence a um segmento só (`_assign_words_to_segments`).
+- **48 kHz obrigatório no áudio.** O filtro `loudnorm` reamostra internamente
+  para 192 kHz; sem `-ar` explícito o AAC saía em **96 kHz**, que o ffmpeg lê
+  numa boa mas nenhum navegador decodifica — o `<video>` trava sem imagem, sem
+  som e sem mensagem de erro. `audio.AUDIO_ENCODE_ARGS` é o único lugar que
+  define isso, e `tests/test_render.py` trava a taxa.
+- **`response_format` não é universal.** Vários modelos da OpenRouter recusam
+  `{"type": "json_object"}`. `chat_json` tenta sem ele no retry e
+  `parse_json_response` aceita JSON dentro de cerca ```json ou depois de uma
+  frase de introdução — antes, escolher Claude ou Llama num papel de texto fazia
+  toda chamada falhar e o pipeline cair calado no fallback.
+- **`player_client` do YouTube é do yt-dlp, não nosso.** Fixar `["web","ios","mweb"]` parecia inofensivo e congelou o projeto num conjunto que hoje devolve **só o formato 18 (360p progressivo)**: todo corte passou a sair de 360p, com o 9:16 recortando 202x360 para ampliar 5x. O padrão do yt-dlp é mantido upstream e entrega os formatos adaptativos até 1080p. `CLIP_YTDLP_PLAYER_CLIENT` existe como escape, e deve ficar vazio.
+- **"Repetiu muito" não é alucinação.** O Whisper inventa boilerplate em cima de silêncio (51 segmentos de `www.opusdei.tp` num podcast, um deles ancorando o começo de um corte). Mas num podcast de rap o refrão repete, e `"Tá ligado?"` apareceu 30 vezes por ser bordão real de quem falava — nem o ritmo de fala separa os dois casos. O filtro só derruba o que **também** casa com padrão de URL ou crédito de legenda.
+- **Estender o corte cresce pelo fim.** O modelo escolheu aquele início por um motivo. A versão anterior puxava o começo para trás por uma fração fixa da diferença e abria o corte no meio do assunto anterior; agora só o fim cresce, parando em fim de frase, e o começo só recua se o fim não bastar.
+- **Fallback de copy é sintoma, não estilo.** Quando o modelo de textos falha, o
+  corte ainda sai com título de template, mas agora `meta.json` registra
+  `copy_source: "fallback"`, o job ganha uma nota no resumo e a tela avisa. Ficar
+  em silêncio fazia todo corte sair com o mesmo título genérico sem ninguém
+  entender por quê.
 
 ## Testes
 

@@ -7,6 +7,8 @@ from importlib import resources
 from typing import Any
 
 from .boundaries import (
+    VERTICAL_EXCEEDS_CAP,
+    extend_window_to_minimum,
     fit_vertical_window,
     hook_text,
     segment_text_in_window,
@@ -137,14 +139,35 @@ def generate_candidates(
         cand = _parse_candidate(raw, i)
         if cand is None:
             continue
-        snapped = _snap_result(cand.window_16x9, words, transcript, pad_before, pad_after)
-        cand.window_16x9 = Window(start=snapped.start, end=snapped.end)
-        cand.context_complete = cand.context_complete and snapped.context_complete
-        _attach_transcript_text(cand, words, transcript)
-        _resolve_vertical(cand, words, transcript, settings, pad_before, pad_after)
-        candidates.append(cand)
+        finalized = finalize_candidate_windows(
+            cand, words, transcript, settings, pad_before, pad_after
+        )
+        if finalized is not None:
+            candidates.append(finalized)
 
     return candidates
+
+
+def finalize_candidate_windows(
+    cand: Candidate,
+    words,
+    transcript: Transcript,
+    settings: Settings,
+    pad_before: float,
+    pad_after: float,
+) -> Candidate | None:
+    """Ajusta 16:9 ≥ 60s e 9:16 45–90s com contexto fechado, mesmo em cache antigo."""
+    snapped = _snap_result(cand.window_16x9, words, transcript, pad_before, pad_after)
+    cand.window_16x9 = Window(start=snapped.start, end=snapped.end)
+    cand.context_complete = cand.context_complete and snapped.context_complete
+    _ensure_horizontal_min(cand, words, transcript, settings, pad_before, pad_after)
+    _attach_transcript_text(cand, words, transcript)
+    _resolve_vertical(cand, words, transcript, settings, pad_before, pad_after)
+    source_s = float(transcript.duration or 0.0)
+    floor = settings.horizontal_min_s * 0.85
+    if source_s >= floor and cand.window_16x9.duration_s < floor:
+        return None
+    return cand
 
 
 def _attach_transcript_text(cand: Candidate, words, transcript: Transcript) -> None:
@@ -188,25 +211,29 @@ def _resolve_vertical(
         result = _snap_result(proposed, words, transcript, pad_before, pad_after)
         if result.duration_s > settings.vertical_max_s:
             cand.window_9x16 = None
-            cand.vertical_skip_reason = "context_exceeds_90s"
+            cand.vertical_skip_reason = VERTICAL_EXCEEDS_CAP
         else:
             cand.window_9x16 = Window(start=result.start, end=result.end)
             cand.vertical_context_complete = result.context_complete
         return
 
+    needed_v = max(settings.vertical_min_s, settings.vertical_min_shrunk_s)
+    source_s = float(transcript.duration or 0.0)
+    if source_s and source_s < needed_v:
+        needed_v = max(8.0, source_s * 0.85)
     fitted, skip_reason = fit_vertical_window(
         proposed.start,
         proposed.end,
         words,
         max_duration_s=settings.vertical_max_s,
-        min_duration_s=settings.vertical_min_shrunk_s,
+        min_duration_s=needed_v,
         pad_before_s=pad_before,
         pad_after_s=pad_after,
         media_duration=transcript.duration or None,
     )
     if fitted is None:
         cand.window_9x16 = None
-        cand.vertical_skip_reason = skip_reason or "context_exceeds_90s"
+        cand.vertical_skip_reason = skip_reason or VERTICAL_EXCEEDS_CAP
         return
 
     cand.window_9x16 = Window(start=fitted.start, end=fitted.end)
@@ -215,6 +242,40 @@ def _resolve_vertical(
     # fecha contexto por conta própria, não só se o momento inteiro fechava.
     cand.vertical_context_complete = fitted.context_complete
     cand.vertical_shrunk = fitted.end < cand.window_16x9.end - 1e-3
+
+
+
+def _ensure_horizontal_min(
+    cand: Candidate,
+    words,
+    transcript: Transcript,
+    settings: Settings,
+    pad_before: float,
+    pad_after: float,
+) -> None:
+    """Garante 16:9 com pelo menos ~60s, estendendo até fechar o contexto."""
+    needed = settings.horizontal_min_s
+    window = cand.window_16x9
+    if window.duration_s >= needed:
+        return
+    source_s = float(transcript.duration or 0.0)
+    if source_s and source_s < needed:
+        # Fonte menor que o piso: esticar aqui só serviria para engolir o vídeo
+        # inteiro e desfazer a janela que o modelo escolheu.
+        return
+    if not words:
+        return
+    snapped = extend_window_to_minimum(
+        window.start,
+        window.end,
+        words,
+        min_duration_s=needed,
+        pad_before_s=pad_before,
+        pad_after_s=pad_after,
+        media_duration=transcript.duration or None,
+    )
+    cand.window_16x9 = Window(start=snapped.start, end=snapped.end)
+    cand.context_complete = cand.context_complete and snapped.context_complete
 
 
 def _snap_result(

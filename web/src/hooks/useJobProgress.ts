@@ -160,6 +160,12 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
     [],
   );
 
+  const applySubtitles = useCallback((slug: string, subtitles: NonNullable<Clip["subtitles"]>) => {
+    setDetails((current) =>
+      current.map((clip) => (clip.slug === slug ? { ...clip, subtitles } : clip)),
+    );
+  }, []);
+
   // O card aparece no instante em que o pipeline registra o corte (via SSE) e
   // vai ganhando meta.json/artefatos conforme o job avança — em vez de só
   // surgir no fim, quando a listagem em disco fica pronta.
@@ -168,7 +174,7 @@ export function useJobProgress(jobId: string | null, onTerminal?: () => void) {
     [progress?.clips, details],
   );
 
-  return { progress, clips, log, live, error, reload, applyRating };
+  return { progress, clips, log, live, error, reload, applyRating, applySubtitles };
 }
 
 const EMPTY_CLIP: Omit<Clip, "slug" | "score" | "status" | "formats" | "vertical_skipped"> = {

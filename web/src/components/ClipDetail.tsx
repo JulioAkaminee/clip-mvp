@@ -1,438 +1,371 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, artifactUrl, posterUrl } from "../lib/api";
+import type { Clip, SocialCopy } from "../lib/types";
 import {
-  ARTIFACT_LABELS,
-  SKIP_REASONS,
-  VIDEO_ARTIFACTS,
-  copyToClipboard,
-  formatDuration,
+  BREAKDOWN_LABELS,
+  FORMATS,
+  humanDuration,
   scoreRing,
   scoreTone,
+  scoreVerdict,
+  skipReasonText,
+  type FormatInfo,
 } from "../lib/format";
-import type { Clip } from "../lib/types";
-import { Badge, Button, Segmented, TextInput, cx } from "./ui";
-
-type VideoArtifact = (typeof VIDEO_ARTIFACTS)[number];
-
-const VIDEO_LABELS: Record<string, string> = {
-  "vertical_facetrack.mp4": "9:16 face tracking",
-  "vertical_center.mp4": "9:16 center",
-  "horizontal_16x9.mp4": "16:9",
-};
-
-const BREAKDOWN_LABELS: Record<string, string> = {
-  hook: "Hook (3s)",
-  emocao: "Emoção",
-  citavel: "Citável",
-  arco: "Arco completo",
-};
-
-const BREAKDOWN_COLORS: Record<string, string> = {
-  hook: "from-brand-600 to-brand-400",
-  emocao: "from-fuchsia-600 to-fuchsia-400",
-  citavel: "from-amber-500 to-amber-300",
-  arco: "from-lime-600 to-lime-300",
-};
-
-const SPEAKER_LABELS: Record<string, string> = {
-  diarization: "diarização (fala → rosto)",
-  activity_proxy: "proxy de atividade facial",
-  unavailable: "sem diarização",
-};
-
-export function ClipDetail({
-  clip,
-  jobId,
-  onClose,
-  onRated,
-}: {
-  clip: Clip;
-  jobId: string;
-  onClose: () => void;
-  onRated: (slug: string, verdict: "good" | "bad", note: string) => void;
-}) {
-  const available = useMemo(
-    () => VIDEO_ARTIFACTS.filter((name) => clip.artifacts[name]),
-    [clip.artifacts],
-  );
-  const [tab, setTab] = useState<VideoArtifact>(available[0] ?? "horizontal_16x9.mp4");
-  const [note, setNote] = useState(clip.rating_note ?? "");
-  const [rating, setRating] = useState(clip.rating);
-  const [busy, setBusy] = useState(false);
-  const [showSafeArea, setShowSafeArea] = useState(false);
-
-  // Os artefatos chegam depois do card (o render termina um formato por vez):
-  // se a aba escolhida ainda não existe, cai na primeira disponível.
-  useEffect(() => {
-    if (available.length > 0 && !available.includes(tab)) setTab(available[0]);
-  }, [available, tab]);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    document.body.style.overflow = "hidden";
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      document.body.style.overflow = "";
-    };
-  }, [onClose]);
-
-  const isVertical = tab.startsWith("vertical");
-  const horizontal = clip.windows?.horizontal_16x9;
-  const vertical = clip.windows?.vertical_9x16;
-  const speakerMethod = clip.speaker_matching?.method;
-
-  const rate = async (verdict: "good" | "bad") => {
-    setBusy(true);
-    try {
-      await api.rate(jobId, clip.slug, verdict, note);
-      setRating(verdict);
-      onRated(clip.slug, verdict, note);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-ink-950/85 p-3 backdrop-blur-sm sm:p-6"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-      role="dialog"
-      aria-modal
-      aria-label={`Corte ${clip.title}`}
-    >
-      <div className="panel my-auto w-full max-w-5xl overflow-hidden fade-up">
-        <header className="flex items-start justify-between gap-4 border-b border-white/8 px-5 py-4">
-          <div className="min-w-0 space-y-1">
-            <div className="flex items-center gap-2">
-              <span
-                className={cx(
-                  "grid size-9 place-items-center rounded-xl border font-mono text-sm font-semibold",
-                  scoreRing(clip.score),
-                  scoreTone(clip.score),
-                )}
-              >
-                {clip.score ?? "—"}
-              </span>
-              <h2 className="truncate text-base font-semibold text-white">{clip.title}</h2>
-            </div>
-            <p className="font-mono text-[0.72rem] text-mist-400">{clip.out_dir ?? clip.slug}</p>
-          </div>
-          <Button variant="ghost" size="sm" onClick={onClose} aria-label="Fechar">
-            ✕
-          </Button>
-        </header>
-
-        <div className="grid gap-5 p-5 lg:grid-cols-[minmax(0,1fr)_20rem]">
-          <div className="space-y-4">
-            {available.length > 0 ? (
-              <>
-                <Segmented<VideoArtifact>
-                  value={tab}
-                  onChange={setTab}
-                  options={available.map((name) => ({ value: name, label: VIDEO_LABELS[name] }))}
-                />
-                <div
-                  className={cx(
-                    "relative mx-auto overflow-hidden rounded-2xl border border-white/10 bg-black",
-                    isVertical ? "max-w-[19rem]" : "w-full",
-                  )}
-                >
-                  <video
-                    key={`${clip.slug}-${tab}`}
-                    src={artifactUrl(jobId, clip.slug, tab)}
-                    poster={posterUrl(jobId, clip.slug)}
-                    controls
-                    preload="metadata"
-                    className={cx("w-full", isVertical ? "aspect-[9/16]" : "aspect-video")}
-                  />
-                  {isVertical && showSafeArea && <SafeAreaMask />}
-                </div>
-
-                {isVertical && (
-                  <label className="flex cursor-pointer items-center justify-center gap-2 text-[0.74rem] text-mist-400">
-                    <input
-                      type="checkbox"
-                      checked={showSafeArea}
-                      onChange={(event) => setShowSafeArea(event.target.checked)}
-                      className="size-3.5 accent-brand-500"
-                    />
-                    Mostrar safe area do TikTok/Shorts
-                  </label>
-                )}
-              </>
-            ) : (
-              <p className="rounded-xl border border-dashed border-white/12 px-4 py-8 text-center text-[0.82rem] text-mist-400">
-                {clip.status === "running"
-                  ? "Renderizando este corte…"
-                  : "Nenhum vídeo exportado para este corte."}
-              </p>
-            )}
-
-            {clip.vertical_skipped && (
-              <p className="rounded-xl border border-amber-300/25 bg-amber-300/8 px-4 py-3 text-[0.8rem] leading-relaxed text-amber-100">
-                {SKIP_REASONS[clip.vertical_skipped] ?? clip.vertical_skipped}
-              </p>
-            )}
-
-            <div className="grid gap-3 sm:grid-cols-2">
-              <WindowCard
-                title="16:9 (YouTube)"
-                window={horizontal}
-                note="duração escolhida pela IA, sem teto fixo"
-              />
-              <WindowCard
-                title="9:16 (Shorts / TikTok)"
-                window={vertical}
-                note={
-                  vertical?.shrunk_from_16x9
-                    ? "encolhido a partir do 16:9 para caber em 90s, ainda fechando frase"
-                    : "máximo 90s, sempre em fronteira de frase"
-                }
-              />
-            </div>
-
-            <section className="space-y-2 rounded-2xl border border-white/8 bg-white/3 p-4">
-              <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-                Downloads
-              </h3>
-              <ul className="grid gap-1 sm:grid-cols-2">
-                {Object.keys(clip.artifacts).map((name) => (
-                  <li key={name}>
-                    <a
-                      href={artifactUrl(jobId, clip.slug, name, true)}
-                      download
-                      className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-[0.78rem] text-mist-300 underline-offset-2 transition-colors hover:bg-white/6 hover:text-white hover:underline"
-                    >
-                      <span>{ARTIFACT_LABELS[name] ?? name}</span>
-                      <span className="font-mono text-[0.68rem] text-mist-400">↓</span>
-                    </a>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          </div>
-
-          <aside className="space-y-4">
-            <section className="space-y-2.5 rounded-2xl border border-white/8 bg-white/3 p-4">
-              <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-                Score {clip.score ?? "—"}/100
-              </h3>
-              <ul className="space-y-2">
-                {Object.entries(clip.breakdown ?? {}).map(([key, value]) => (
-                  <li key={key} className="space-y-1">
-                    <div className="flex justify-between text-[0.74rem]">
-                      <span className="text-mist-300">{BREAKDOWN_LABELS[key] ?? key}</span>
-                      <span className="font-mono text-mist-400">{Math.round(value)}/25</span>
-                    </div>
-                    <div className="h-1 overflow-hidden rounded-full bg-white/8">
-                      <div
-                        className={cx(
-                          "h-full rounded-full bg-gradient-to-r",
-                          BREAKDOWN_COLORS[key] ?? "from-brand-600 to-brand-400",
-                        )}
-                        style={{ width: `${(Math.min(25, value) / 25) * 100}%` }}
-                      />
-                    </div>
-                  </li>
-                ))}
-              </ul>
-              {clip.reason && (
-                <p className="border-t border-white/8 pt-2.5 text-[0.76rem] leading-snug text-mist-400">
-                  {clip.reason}
-                </p>
-              )}
-              <div className="flex flex-wrap gap-1.5">
-                {clip.context_complete != null && (
-                  <Badge tone={clip.context_complete ? "good" : "warn"}>
-                    {clip.context_complete ? "contexto fechado" : "contexto aberto"}
-                  </Badge>
-                )}
-                {speakerMethod && (
-                  <Badge tone={speakerMethod === "diarization" ? "neutral" : "warn"}>
-                    {SPEAKER_LABELS[speakerMethod] ?? speakerMethod}
-                  </Badge>
-                )}
-              </div>
-            </section>
-
-            <SocialPanel clip={clip} />
-
-            <section className="space-y-2.5 rounded-2xl border border-white/8 bg-white/3 p-4">
-              <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-                Este corte presta?
-              </h3>
-              <p className="text-[0.74rem] leading-snug text-mist-400">
-                O veredicto vai para <code className="text-mist-300">work/feedback.jsonl</code> e
-                entra como few-shot nos próximos prompts de candidatos e score.
-              </p>
-              <TextInput
-                value={note}
-                onChange={(event) => setNote(event.target.value)}
-                placeholder="nota opcional (ex: começou cedo demais)"
-              />
-              <div className="flex gap-2">
-                <Button
-                  size="sm"
-                  variant={rating === "good" ? "primary" : "outline"}
-                  onClick={() => void rate("good")}
-                  loading={busy}
-                  className="flex-1"
-                >
-                  Bom
-                </Button>
-                <Button
-                  size="sm"
-                  variant={rating === "bad" ? "danger" : "outline"}
-                  onClick={() => void rate("bad")}
-                  loading={busy}
-                  className="flex-1"
-                >
-                  Ruim
-                </Button>
-              </div>
-            </section>
-          </aside>
-        </div>
-      </div>
-    </div>
-  );
-}
+import { useCountUp } from "../hooks/useCountUp";
+import { ClipPlayer } from "./ClipPlayer";
+import { SubtitleStudio, type SubtitleConfig } from "./SubtitleStudio";
+import {
+  Button,
+  Callout,
+  Card,
+  CopyButton,
+  Disclosure,
+  LinkButton,
+  Tabs,
+  cx,
+} from "./ui";
 
 /**
- * Máscara da safe area do 9:16 (SPEC §14.5).
- *
- * As frações são as mesmas que `subtitles.build_ass` usa para posicionar o
- * burn-in — a spec exige que preview e burn-in respeitem a mesma máscara, e sem
- * isso não havia como conferir no preview se a legenda vai cair atrás da UI do
- * TikTok antes de publicar.
+ * A tela de um corte. A ordem responde à pergunta "posso publicar isso?":
+ * primeiro assistir, depois os textos prontos para colar, depois baixar — e só
+ * então o porquê da nota, para quem quiser auditar.
  */
-function SafeAreaMask() {
-  return (
-    <div className="pointer-events-none absolute inset-0" aria-hidden>
-      {/* ~20% inferior: onde ficam caption, perfil e botões do app */}
-      <div className="absolute inset-x-0 bottom-0 h-[20%] border-t border-dashed border-amber-300/50 bg-amber-300/10">
-        <span className="absolute bottom-1 left-1/2 -translate-x-1/2 whitespace-nowrap rounded bg-ink-950/80 px-1.5 py-0.5 text-[0.6rem] font-medium text-amber-200">
-          UI do app — 20%
-        </span>
-      </div>
-      {/* margens laterais apertadas */}
-      <div className="absolute inset-y-0 left-0 w-[8%] bg-amber-300/8" />
-      <div className="absolute inset-y-0 right-0 w-[8%] bg-amber-300/8" />
-      <div className="absolute inset-x-[8%] bottom-[20%] top-0 border border-dashed border-lime-300/30" />
-    </div>
-  );
-}
-
-function WindowCard({
-  title,
-  window: info,
-  note,
+export function ClipDetail({
+  jobId,
+  clip,
+  onBack,
+  onRated,
+  onSubtitlesChanged,
 }: {
-  title: string;
-  window: { start: number; end: number; duration_s: number } | undefined;
-  note?: string;
+  jobId: string;
+  clip: Clip;
+  onBack: () => void;
+  onRated: (slug: string, verdict: "good" | "bad", note: string) => void;
+  onSubtitlesChanged: (slug: string, subtitles: NonNullable<Clip["subtitles"]>) => void;
 }) {
-  return (
-    <div className="rounded-2xl border border-white/8 bg-white/3 p-3.5">
-      <h4 className="text-[0.74rem] font-semibold text-mist-200">{title}</h4>
-      {info ? (
-        <>
-          <p className="mt-1 font-mono text-lg text-white">{formatDuration(info.duration_s)}</p>
-          <p className="font-mono text-[0.7rem] text-mist-400">
-            {formatDuration(info.start)} → {formatDuration(info.end)}
-          </p>
-        </>
-      ) : (
-        <p className="mt-1 text-[0.8rem] text-mist-400">não exportado</p>
-      )}
-      {note && <p className="mt-1.5 text-[0.7rem] leading-snug text-mist-400">{note}</p>}
-    </div>
+  const available = useMemo(
+    () => FORMATS.filter((format) => Boolean(clip.artifacts[format.file as never])),
+    [clip.artifacts],
   );
-}
+  const [active, setActive] = useState<FormatInfo | null>(available[0] ?? null);
+  const current = active && available.includes(active) ? active : (available[0] ?? null);
+  const [rating, setRating] = useState(clip.rating);
+  const [savingStyle, setSavingStyle] = useState(false);
+  const shownScore = useCountUp(clip.score);
 
-function SocialPanel({ clip }: { clip: Clip }) {
-  const [platform, setPlatform] = useState<"yt_short" | "yt_long" | "tiktok">("yt_short");
-  const [copied, setCopied] = useState<string | null>(null);
-  const youtube = clip.youtube ?? {};
-  const tiktok = clip.tiktok ?? {};
-  const hasYoutube = Object.keys(youtube).length > 0;
-  const hasTiktok = Object.keys(tiktok).length > 0;
+  // Esc volta para a grade: a triagem é ida e volta, e alcançar o botão
+  // "Voltar" com o mouse a cada corte quebra o ritmo.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (event.key === "Escape") onBack();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onBack]);
 
-  const copy = async (label: string, value: string) => {
+  const subtitles: SubtitleConfig = {
+    style: clip.subtitles?.style ?? "viral",
+    positionV: clip.subtitles?.position_v ?? 0.2,
+    fontSize: clip.subtitles?.font_size ?? 1,
+    textColor: clip.subtitles?.color ?? "#FFDE00",
+    outlineColor: clip.subtitles?.outline_color ?? "#000000",
+    uppercase: clip.subtitles?.uppercase ?? true,
+    highlight: clip.subtitles?.highlight ?? "pop",
+    highlightColor: clip.subtitles?.highlight_color ?? "#FFFFFF",
+  };
+
+  const rate = async (verdict: "good" | "bad") => {
+    setRating(verdict);
     try {
-      await copyToClipboard(value);
-      setCopied(label);
-      setTimeout(() => setCopied(null), 1600);
+      await api.rate(jobId, clip.slug, verdict);
+      onRated(clip.slug, verdict, "");
     } catch {
-      setCopied(null);
+      setRating(clip.rating);
     }
   };
 
-  if (!hasYoutube && !hasTiktok) {
-    return (
-      <section className="rounded-2xl border border-white/8 bg-white/3 p-4 text-[0.78rem] text-mist-400">
-        Títulos e hashtags aparecem quando o estágio de textos terminar.
-      </section>
-    );
-  }
+  const saveSubtitles = async (next: SubtitleConfig) => {
+    setSavingStyle(true);
+    const payload = {
+      style: next.style,
+      position_v: next.positionV,
+      font_size: next.fontSize,
+      color: next.textColor,
+      outline_color: next.outlineColor,
+      uppercase: next.uppercase,
+      highlight: next.highlight,
+      highlight_color: next.highlightColor,
+    };
+    try {
+      const saved = await api.updateSubtitles(jobId, clip.slug, payload);
+      onSubtitlesChanged(clip.slug, saved.subtitles);
+    } catch {
+      onSubtitlesChanged(clip.slug, payload);
+    } finally {
+      setSavingStyle(false);
+    }
+  };
 
-  const options = [
-    ...(hasYoutube ? [{ value: "yt_short" as const, label: "Shorts" }] : []),
-    ...(hasYoutube ? [{ value: "yt_long" as const, label: "YT 16:9" }] : []),
-    ...(hasTiktok ? [{ value: "tiktok" as const, label: "TikTok" }] : []),
-  ];
-
-  const rows: { label: string; value: string }[] =
-    platform === "tiktok"
-      ? [
-          { label: "Caption", value: tiktok.caption ?? "" },
-          { label: "Hashtags", value: (tiktok.hashtags ?? []).join(" ") },
-        ]
-      : platform === "yt_short"
-        ? [
-            { label: "Título", value: youtube.shorts_title ?? youtube.title ?? "" },
-            { label: "Descrição", value: youtube.description ?? "" },
-            { label: "Hashtags", value: (youtube.hashtags ?? []).join(" ") },
-          ]
-        : [
-            { label: "Título", value: youtube.long_title ?? youtube.title ?? "" },
-            { label: "Descrição", value: youtube.description ?? "" },
-            { label: "Tags", value: (youtube.tags ?? []).join(", ") },
-          ];
+  const captionsFile = current?.vertical ? "captions_9x16.json" : "captions.json";
+  const skipText = skipReasonText(clip.vertical_skipped);
 
   return (
-    <section className="space-y-2.5 rounded-2xl border border-white/8 bg-white/3 p-4">
-      <h3 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-        Texto para publicar
-      </h3>
-      <Segmented size="sm" value={platform} onChange={setPlatform} options={options} />
-      <ul className="space-y-2">
-        {rows
-          .filter((row) => row.value)
-          .map((row) => (
-            <li key={row.label} className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[0.7rem] uppercase tracking-wide text-mist-400">
-                  {row.label}
-                </span>
-                <button
-                  onClick={() => void copy(row.label, row.value)}
-                  className="text-[0.68rem] text-brand-400 hover:text-brand-500"
-                >
-                  {copied === row.label ? "copiado" : "copiar"}
-                </button>
+    <div className="space-y-5">
+      <div className="flex items-center gap-3 pt-2">
+        <Button variant="ghost" size="sm" onClick={onBack} title="Esc">
+          ← Voltar
+        </Button>
+        {clip.score != null && (
+          <span
+            className={cx(
+              "rounded-full border px-2.5 py-0.5 text-[0.8rem] font-semibold",
+              scoreRing(clip.score),
+              scoreTone(clip.score),
+            )}
+          >
+            <span className="tabular-nums">{shownScore ?? clip.score}</span> / 100
+          </span>
+        )}
+        <span className={cx("truncate text-[0.8rem]", scoreTone(clip.score))}>
+          {scoreVerdict(clip.score)}
+        </span>
+      </div>
+
+      <h1 className="text-xl leading-snug font-semibold text-white">
+        {clip.youtube?.shorts_title || clip.title || clip.slug.replace(/-/g, " ")}
+      </h1>
+
+      {skipText && (
+        <Callout tone="warn" title="Este momento não virou vídeo vertical">
+          <p>{skipText}</p>
+        </Callout>
+      )}
+
+      {clip.copy_source === "fallback" && (
+        <Callout tone="warn" title="Os textos abaixo são automáticos, não foram escritos pela IA">
+          <p>
+            O modelo de textos não respondeu para este corte. Os títulos e hashtags são um
+            preenchimento genérico — vale reescrever antes de publicar, ou trocar o modelo em
+            Configurações e rodar de novo.
+          </p>
+        </Callout>
+      )}
+
+      {current ? (
+        <Card className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Tabs
+              value={current.key}
+              onChange={(key) => setActive(FORMATS.find((f) => f.key === key) ?? null)}
+              options={FORMATS.map((format) => ({
+                value: format.key,
+                label: format.name,
+                disabled: !available.includes(format),
+              }))}
+            />
+            <span className="text-[0.72rem] text-mist-400">{current.where}</span>
+          </div>
+
+          <ClipPlayer
+            key={current.file}
+            src={artifactUrl(jobId, clip.slug, current.file)}
+            // Cada orientação tem o seu quadro: usar o pôster 16:9 no player
+            // vertical deixava a cena encaixotada entre tarjas pretas, e não
+            // usar nenhum deixava um retângulo preto enquanto o vídeo carrega.
+            poster={posterUrl(jobId, clip.slug, current.vertical ? "vertical" : "horizontal")}
+            vertical={current.vertical}
+            captionsUrl={
+              clip.artifacts[captionsFile as never]
+                ? artifactUrl(jobId, clip.slug, captionsFile)
+                : undefined
+            }
+            captionStyle={clip.subtitles}
+          />
+
+          <div className="flex flex-wrap items-center gap-2 border-t border-white/8 pt-3">
+            <LinkButton
+              size="sm"
+              variant="primary"
+              href={artifactUrl(jobId, clip.slug, current.file, true)}
+              download
+            >
+              Baixar este vídeo
+            </LinkButton>
+            {clip.artifacts["captions.srt" as never] && (
+              <LinkButton
+                size="sm"
+                href={artifactUrl(
+                  jobId,
+                  clip.slug,
+                  current.vertical ? "captions_9x16.srt" : "captions.srt",
+                  true,
+                )}
+                download
+              >
+                Legenda .srt
+              </LinkButton>
+            )}
+            <span className="ml-auto flex items-center gap-1.5">
+              <span className="text-[0.72rem] text-mist-400">Este corte ficou bom?</span>
+              <Button
+                size="sm"
+                variant={rating === "good" ? "primary" : "outline"}
+                onClick={() => void rate("good")}
+                aria-pressed={rating === "good"}
+              >
+                Sim
+              </Button>
+              <Button
+                size="sm"
+                variant={rating === "bad" ? "danger" : "outline"}
+                onClick={() => void rate("bad")}
+                aria-pressed={rating === "bad"}
+              >
+                Não
+              </Button>
+            </span>
+          </div>
+          <p className="text-[0.7rem] text-mist-400">
+            A resposta ensina a ferramenta o seu gosto e influencia os próximos vídeos.
+          </p>
+        </Card>
+      ) : (
+        <Card>
+          <p className="text-[0.85rem] text-mist-400">Este corte ainda não tem vídeo pronto.</p>
+        </Card>
+      )}
+
+      <section className="space-y-3">
+        <h2 className="text-[0.9rem] font-semibold text-mist-200">Pronto para colar</h2>
+        <CopyBlocks clip={clip} />
+      </section>
+
+      <Disclosure summary="Mudar o estilo da legenda" hint="Vale para os próximos cortes deste vídeo">
+        <SubtitleStudio config={subtitles} onChange={(next) => void saveSubtitles(next)} />
+        <p className="text-[0.72rem] text-mist-400">
+          {savingStyle
+            ? "Salvando…"
+            : "O estilo fica guardado neste corte. Os vídeos já montados mantêm a legenda antiga; rode o vídeo de novo para queimar a nova."}
+        </p>
+      </Disclosure>
+
+      <Disclosure summary="Por que essa nota" hint="Como a ferramenta avaliou este momento">
+        <div className="grid gap-3 sm:grid-cols-2">
+          {Object.entries(BREAKDOWN_LABELS).map(([key, meta]) => {
+            const value = clip.breakdown[key] ?? 0;
+            return (
+              <div key={key} className="space-y-1">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-[0.8rem] font-medium text-mist-200">{meta.name}</span>
+                  <span className="font-mono text-[0.75rem] text-mist-400">
+                    {Math.round(value)}/25
+                  </span>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded-full bg-white/8">
+                  <div
+                    className="h-full rounded-full bg-brand-500/80"
+                    style={{ width: `${Math.max(2, Math.min(100, (value / 25) * 100))}%` }}
+                  />
+                </div>
+                <p className="text-[0.7rem] text-mist-400">{meta.help}</p>
               </div>
-              <p className="rounded-lg bg-ink-950/60 px-2.5 py-1.5 text-[0.76rem] leading-snug text-mist-200">
-                {row.value}
-              </p>
-            </li>
-          ))}
-      </ul>
-    </section>
+            );
+          })}
+        </div>
+        {clip.reason && (
+          <p className="rounded-xl border border-white/8 bg-white/3 p-3 text-[0.8rem] leading-relaxed text-mist-300">
+            {clip.reason}
+          </p>
+        )}
+        <dl className="grid gap-2 text-[0.75rem] sm:grid-cols-2">
+          {clip.windows.horizontal_16x9 && (
+            <div>
+              <dt className="text-mist-400">Trecho horizontal</dt>
+              <dd className="text-mist-200">
+                {humanDuration(clip.windows.horizontal_16x9.duration_s)} · começa em{" "}
+                {humanDuration(clip.windows.horizontal_16x9.start)} do vídeo original
+              </dd>
+            </div>
+          )}
+          {clip.windows.vertical_9x16 && (
+            <div>
+              <dt className="text-mist-400">Trecho vertical</dt>
+              <dd className="text-mist-200">
+                {humanDuration(clip.windows.vertical_9x16.duration_s)}
+                {clip.windows.vertical_9x16.shrunk_from_16x9 && " · recortado do horizontal"}
+              </dd>
+            </div>
+          )}
+        </dl>
+      </Disclosure>
+    </div>
+  );
+}
+
+/** Os textos sociais, cada um com o seu botão de copiar ao lado. */
+function CopyBlocks({ clip }: { clip: Clip }) {
+  const yt: SocialCopy = clip.youtube ?? {};
+  const tk: SocialCopy = clip.tiktok ?? {};
+  const hashtags = (list?: string[]) => (list ?? []).join(" ");
+
+  const blocks: { group: string; items: { label: string; value: string; long?: boolean }[] }[] = [
+    {
+      group: "YouTube Shorts",
+      items: [
+        { label: "Título", value: yt.shorts_title ?? "" },
+        { label: "Descrição", value: yt.description ?? "", long: true },
+        { label: "Hashtags", value: hashtags(yt.hashtags) },
+      ],
+    },
+    {
+      group: "YouTube (horizontal)",
+      items: [
+        { label: "Título", value: yt.horizontal_title || yt.long_title || "" },
+        { label: "Descrição", value: yt.horizontal_description ?? "", long: true },
+        { label: "Tags", value: (yt.tags ?? []).join(", ") },
+      ],
+    },
+    {
+      group: "TikTok",
+      items: [
+        { label: "Legenda", value: tk.caption || tk.title || "", long: true },
+        { label: "Hashtags", value: hashtags(tk.hashtags) },
+      ],
+    },
+  ];
+
+  return (
+    <div className="grid gap-3 lg:grid-cols-3">
+      {blocks.map((block) => (
+        <Card key={block.group} className="space-y-3 p-4">
+          <h3 className="text-[0.8rem] font-semibold text-mist-200">{block.group}</h3>
+          {block.items
+            .filter((item) => item.value)
+            .map((item) => (
+              <div key={item.label} className="space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[0.68rem] tracking-wide text-mist-400 uppercase">
+                    {item.label}
+                  </span>
+                  <CopyButton value={item.value} />
+                </div>
+                <p
+                  className={cx(
+                    "rounded-lg border border-white/8 bg-black/25 p-2.5 text-[0.78rem] leading-relaxed break-words text-mist-200",
+                    item.long && "whitespace-pre-line",
+                  )}
+                >
+                  {item.value}
+                </p>
+              </div>
+            ))}
+          {block.items.every((item) => !item.value) && (
+            <p className="text-[0.75rem] text-mist-400">Sem texto gerado para esta rede.</p>
+          )}
+        </Card>
+      ))}
+    </div>
   );
 }

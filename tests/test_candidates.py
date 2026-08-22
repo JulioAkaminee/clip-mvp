@@ -5,9 +5,11 @@ from __future__ import annotations
 from clip_mvp.candidates import (
     auto_count_range,
     candidate_pool_size,
+    finalize_candidate_windows,
     generate_candidates,
     resolve_target_range,
 )
+from clip_mvp.models import Candidate, Window
 from clip_mvp.config import Settings
 from clip_mvp.models import Segment, Transcript, Word
 
@@ -179,4 +181,30 @@ def test_long_context_shrinks_vertical_instead_of_dropping_it():
         assert cand.vertical_skip_reason is None
     else:
         assert cand.vertical_skip_reason == "context_exceeds_90s"
+
+
+def test_finalize_enforces_45s_vertical_and_60s_horizontal():
+    words = []
+    for i in range(90):
+        terminal = "." if i % 8 == 7 else ""
+        words.append(Word(start=float(i), end=float(i) + 0.8, text=f"fala{i}{terminal}"))
+    seg = Segment(id=0, start=0.0, end=90.0, text=" ".join(w.text for w in words), words=words)
+    transcript = Transcript(
+        language="pt", duration=90.0, segments=[seg], source="fixture", has_word_timestamps=True
+    )
+    settings = Settings(openrouter_api_key="test-key")
+    cand = Candidate(
+        id="c1",
+        title="Momento curto",
+        text_excerpt="trecho",
+        window_16x9=Window(start=10.0, end=25.0),
+        window_9x16=Window(start=12.0, end=22.0),
+        context_complete=True,
+    )
+    out = finalize_candidate_windows(cand, words, transcript, settings, 0.2, 0.4)
+    assert out is not None
+    assert out.window_16x9.duration_s >= 51.0
+    assert out.window_9x16 is not None
+    assert out.window_9x16.duration_s >= 45.0
+    assert out.window_9x16.duration_s <= 90.0
     assert cand.window_16x9.duration_s > 0

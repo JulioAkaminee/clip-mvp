@@ -10,6 +10,32 @@ export type FormatKey = "face" | "9x16" | "16x9";
 export type CaptionMode = "burn" | "sidecar" | "both";
 export type Platform = "yt" | "tiktok";
 export type Mode = "auto" | "more" | "count";
+export type SubtitleStyle = "viral" | "minimal" | "cyber" | "gradient" | "punchy";
+export type HighlightMode = "none" | "pop" | "fill" | "karaoke" | "pulse";
+
+export interface ProbeEstimate {
+  /** Custo aproximado na OpenRouter, em dólares. */
+  cost_usd: number;
+  /** Tempo total previsto do job, em segundos. */
+  seconds: number;
+  clips_min: number;
+  clips_max: number;
+}
+
+export interface VideoProbeResult {
+  ok: boolean;
+  estimate?: ProbeEstimate | null;
+  title: string;
+  duration_s: number;
+  thumbnail: string | null;
+  uploader: string;
+  youtube_id: string | null;
+  is_youtube: boolean;
+  view_count?: number | null;
+  description?: string;
+  preview_note?: string;
+  error?: string;
+}
 
 /** Nomes dos arquivos de vídeo produzidos por clipe. */
 export type ArtifactName =
@@ -18,6 +44,8 @@ export type ArtifactName =
   | "horizontal_16x9.mp4"
   | "captions.srt"
   | "captions_9x16.srt"
+  | "captions.json"
+  | "captions_9x16.json"
   | "captions_16x9.ass"
   | "captions_9x16.ass"
   | "meta.json"
@@ -77,6 +105,7 @@ export interface JobSummary {
   /** Cortes acima do limiar mas muito abaixo do melhor deste vídeo (SPEC §3.5). */
   below_floor_removed: number;
   quality_floor: number | null;
+  best_score: number | null;
   dry_run: boolean;
   cost_estimate: CostEstimate | null;
   notes: string[];
@@ -109,6 +138,7 @@ export interface JobProgress {
   source_minutes: number;
   result: { summary: JobSummary } | null;
   source_url?: string;
+  source_title?: string;
   running?: boolean;
   /** Job abandonado (processo morto / servidor reiniciado), não em execução. */
   stale?: boolean;
@@ -117,6 +147,8 @@ export interface JobProgress {
 export interface JobListItem {
   job_id: string;
   source_url?: string;
+  /** Título do vídeo de origem. Toda URL de YouTube tem a mesma cara. */
+  source_title?: string;
   status?: JobStatus;
   percent?: number;
   stage?: string;
@@ -144,6 +176,8 @@ export interface WindowInfo {
 export interface SocialCopy {
   shorts_title?: string;
   long_title?: string;
+  horizontal_title?: string;
+  horizontal_description?: string;
   title?: string;
   description?: string;
   caption?: string;
@@ -168,6 +202,18 @@ export interface Clip {
   boundaries: Record<string, unknown>;
   youtube: SocialCopy;
   tiktok: SocialCopy;
+  /** "llm" quando a IA escreveu os textos; "fallback" quando ela falhou. */
+  copy_source?: "llm" | "fallback";
+  subtitles?: {
+    style?: SubtitleStyle;
+    position_v?: number;
+    font_size?: number;
+    color?: string;
+    outline_color?: string;
+    uppercase?: boolean;
+    highlight?: HighlightMode;
+    highlight_color?: string;
+  };
   artifacts: Partial<Record<ArtifactName, string>>;
   rating: "good" | "bad" | null;
   rating_note: string | null;
@@ -283,6 +329,14 @@ export interface JobRequest {
   platforms: Platform[];
   dry_run: boolean;
   budget: number | null;
+  subtitle_style?: SubtitleStyle;
+  subtitle_position_v?: number | null;
+  subtitle_font_size?: number;
+  subtitle_color?: string;
+  subtitle_outline_color?: string;
+  subtitle_uppercase?: boolean;
+  subtitle_highlight?: HighlightMode;
+  subtitle_highlight_color?: string;
 }
 
 export interface LogLine {

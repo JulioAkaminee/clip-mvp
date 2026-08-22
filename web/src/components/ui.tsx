@@ -1,4 +1,10 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import { useEffect, useState } from "react";
+import type {
+  AnchorHTMLAttributes,
+  ButtonHTMLAttributes,
+  InputHTMLAttributes,
+  ReactNode,
+} from "react";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -328,5 +334,289 @@ export function EmptyState({
       {description && <p className="max-w-sm text-[0.82rem] text-mist-400">{description}</p>}
       {children}
     </div>
+  );
+}
+
+/**
+ * Aviso com uma ação clara. Um erro sem próximo passo só transfere o problema
+ * para quem está lendo, então `action` faz parte do componente.
+ */
+export function Callout({
+  tone = "info",
+  title,
+  children,
+  action,
+}: {
+  tone?: "info" | "warn" | "bad" | "good";
+  title: string;
+  children?: ReactNode;
+  action?: ReactNode;
+}) {
+  const tones = {
+    info: "border-brand-400/25 bg-brand-500/8",
+    warn: "border-amber-300/25 bg-amber-300/8",
+    bad: "border-red-400/25 bg-red-500/8",
+    good: "border-lime-300/25 bg-lime-300/8",
+  };
+  const icons = { info: "i", warn: "!", bad: "!", good: "✓" };
+  const iconTones = {
+    info: "bg-brand-500/25 text-brand-400",
+    warn: "bg-amber-300/20 text-amber-200",
+    bad: "bg-red-500/20 text-red-200",
+    good: "bg-lime-300/20 text-lime-300",
+  };
+  return (
+    <div className={cx("flex gap-3 rounded-2xl border p-4", tones[tone])}>
+      <span
+        className={cx(
+          "mt-0.5 grid size-5 shrink-0 place-items-center rounded-full text-[0.7rem] font-bold",
+          iconTones[tone],
+        )}
+        aria-hidden
+      >
+        {icons[tone]}
+      </span>
+      <div className="min-w-0 flex-1 space-y-2">
+        <p className="text-[0.85rem] font-semibold text-mist-200">{title}</p>
+        {children && <div className="text-[0.8rem] leading-relaxed text-mist-300">{children}</div>}
+        {action && <div className="flex flex-wrap gap-2 pt-0.5">{action}</div>}
+      </div>
+    </div>
+  );
+}
+
+/** Copia um texto e confirma na própria etiqueta do botão. */
+export function CopyButton({
+  value,
+  label = "Copiar",
+  className,
+  size = "sm",
+}: {
+  value: string;
+  label?: string;
+  className?: string;
+  size?: "sm" | "md";
+}) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1800);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  return (
+    <Button
+      size={size}
+      variant={copied ? "primary" : "outline"}
+      className={className}
+      disabled={!value}
+      onClick={() => {
+        void navigator.clipboard
+          .writeText(value)
+          .then(() => setCopied(true))
+          .catch(() => setCopied(false));
+      }}
+    >
+      {copied ? "Copiado" : label}
+    </Button>
+  );
+}
+
+/**
+ * Seção que começa fechada. É o mecanismo que deixa a tela inicial com um
+ * campo só sem esconder nenhum controle de quem procura por ele.
+ */
+export function Disclosure({
+  summary,
+  hint,
+  children,
+  defaultOpen = false,
+}: {
+  summary: string;
+  hint?: string;
+  children: ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="rounded-2xl border border-white/10 bg-ink-950/40">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-label={summary}
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+      >
+        <span>
+          <span className="block text-[0.85rem] font-medium text-mist-200">{summary}</span>
+          {hint && <span className="block text-[0.72rem] text-mist-400">{hint}</span>}
+        </span>
+        <span
+          className={cx(
+            "shrink-0 text-mist-400 transition-transform duration-200",
+            open && "rotate-180",
+          )}
+          aria-hidden
+        >
+          ▾
+        </span>
+      </button>
+      {open && <div className="space-y-4 border-t border-white/8 px-4 py-4 fade-up">{children}</div>}
+    </div>
+  );
+}
+
+/** Opção grande e clicável, com nome e explicação. Usada em vez de select. */
+export function ChoiceCard({
+  selected,
+  onSelect,
+  title,
+  description,
+  badge,
+  disabled,
+}: {
+  selected: boolean;
+  onSelect: () => void;
+  title: string;
+  description?: string;
+  badge?: ReactNode;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      disabled={disabled}
+      onClick={onSelect}
+      className={cx(
+        "flex w-full items-start gap-3 rounded-xl border p-3 text-left transition-all",
+        "disabled:cursor-not-allowed disabled:opacity-45",
+        selected
+          ? "border-brand-400/60 bg-brand-500/10"
+          : "border-white/10 bg-white/3 hover:border-white/25 hover:bg-white/6",
+      )}
+    >
+      <span
+        className={cx(
+          "mt-0.5 grid size-4 shrink-0 place-items-center rounded-full border-2 transition-colors",
+          selected ? "border-brand-400" : "border-white/25",
+        )}
+        aria-hidden
+      >
+        {selected && <span className="size-1.5 rounded-full bg-brand-400" />}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-2">
+          <span className="text-[0.85rem] font-medium text-mist-200">{title}</span>
+          {badge}
+        </span>
+        {description && (
+          <span className="mt-0.5 block text-[0.75rem] leading-relaxed text-mist-400">
+            {description}
+          </span>
+        )}
+      </span>
+    </button>
+  );
+}
+
+/** Barra de abas simples (usada para trocar de formato no player). */
+export function Tabs<T extends string>({
+  value,
+  options,
+  onChange,
+}: {
+  value: T;
+  options: { value: T; label: string; disabled?: boolean }[];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div role="tablist" className="flex flex-wrap gap-1.5">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          role="tab"
+          type="button"
+          disabled={option.disabled}
+          aria-selected={value === option.value}
+          onClick={() => onChange(option.value)}
+          className={cx(
+            "rounded-lg px-3 py-1.5 text-[0.78rem] font-medium transition-all disabled:cursor-not-allowed disabled:opacity-35",
+            value === option.value
+              ? "bg-white/12 text-mist-200"
+              : "text-mist-400 hover:bg-white/6 hover:text-mist-200",
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function Skeleton({ className }: { className?: string }) {
+  return <div className={cx("animate-pulse rounded-lg bg-white/6", className)} aria-hidden />;
+}
+
+/** Rótulo + valor, para os pares de informação que se repetem nas telas. */
+export function Stat({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: ReactNode;
+  tone?: string;
+}) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[0.68rem] tracking-wide text-mist-400 uppercase">{label}</p>
+      <p className={cx("truncate text-[0.9rem] font-medium text-mist-200", tone)}>{value}</p>
+    </div>
+  );
+}
+
+/**
+ * Âncora com aparência de botão. Download é navegação, não ação de script:
+ * embrulhar um `<a download>` dentro de `<button>` produz HTML inválido e o
+ * teclado passa duas vezes pelo mesmo alvo.
+ */
+export function LinkButton({
+  href,
+  children,
+  variant = "outline",
+  size = "md",
+  download,
+  className,
+  ...rest
+}: {
+  href: string;
+  children: ReactNode;
+  variant?: "primary" | "ghost" | "outline";
+  size?: "sm" | "md";
+  download?: boolean;
+  className?: string;
+} & Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "href" | "className">) {
+  const sizes = { sm: "px-3 py-1.5 text-[0.8rem]", md: "px-4 py-2.5 text-sm" };
+  const variants = {
+    primary: "bg-brand-500 text-white shadow-lg shadow-brand-600/25 hover:bg-brand-400",
+    outline: "border border-white/12 bg-white/4 text-mist-200 hover:border-white/25 hover:bg-white/8",
+    ghost: "text-mist-400 hover:bg-white/6 hover:text-mist-200",
+  };
+  return (
+    <a
+      href={href}
+      download={download}
+      className={cx(
+        "inline-flex items-center justify-center gap-2 rounded-xl font-medium transition-all duration-150",
+        sizes[size],
+        variants[variant],
+        className,
+      )}
+      {...rest}
+    >
+      {children}
+    </a>
   );
 }

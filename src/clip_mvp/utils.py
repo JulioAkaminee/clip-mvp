@@ -85,3 +85,37 @@ def run_ffmpeg(args: list[str], quiet: bool = True) -> None:
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def source_title(job_dir: Path) -> str:
+    """Título do vídeo de origem, para a lista de jobs.
+
+    Todo job de YouTube tem a mesma URL visível (`youtube.com/watch`), então a
+    lista lateral mostrava a mesma linha para todos — impossível dizer qual é
+    qual. O título real vem do `source.info.json` que o yt-dlp grava junto com
+    o download.
+
+    Fica cacheado em `job.json` na primeira leitura: jobs criados antes desta
+    função não têm o campo, e reler o `.info.json` (que passa de 1MB) a cada
+    listagem seria desperdício.
+    """
+    job_dir = Path(job_dir)
+    job_file = job_dir / "job.json"
+    meta = read_json(job_file) if job_file.is_file() else {}
+    cached = (meta.get("source_title") or "").strip()
+    if cached:
+        return cached
+
+    info_file = job_dir / "source.info.json"
+    if not info_file.is_file():
+        return ""
+    try:
+        title = str(read_json(info_file).get("title") or "").strip()
+    except Exception:  # noqa: BLE001 - título é conforto, não pode quebrar a lista
+        return ""
+    if title and meta:
+        try:
+            write_json(job_file, {**meta, "source_title": title})
+        except Exception:  # noqa: BLE001
+            pass
+    return title

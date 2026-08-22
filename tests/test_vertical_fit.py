@@ -8,7 +8,11 @@ nada — então nesse caso o certo é a segunda.
 
 from __future__ import annotations
 
-from clip_mvp.boundaries import MIN_SHRUNK_VERTICAL_S, fit_vertical_window
+from clip_mvp.boundaries import (
+    MIN_SHRUNK_VERTICAL_S,
+    VERTICAL_TOO_SHORT,
+    fit_vertical_window,
+)
 from clip_mvp.candidates import generate_candidates
 from clip_mvp.config import Settings
 from clip_mvp.meta import build_meta
@@ -78,13 +82,21 @@ class TestShrinkFloor:
         assert MIN_SHRUNK_VERTICAL_S <= fitted.duration_s <= 90.0
         assert fitted.ends_on_sentence is True
 
-    def test_a_window_that_already_fits_ignores_the_floor(self):
-        """Um momento naturalmente curto não é encolhimento; o piso não se aplica."""
+    def test_a_window_below_the_floor_is_refused_as_too_short(self):
+        """Trecho curto demais não vira Short — e o motivo diz isso, não 'passou de 90s'."""
         words = _words([(0.0, 1.0, "Curto"), (1.1, 2.0, "assim.")])
         fitted, reason = fit_vertical_window(0.0, 2.0, words, max_duration_s=90.0)
+        assert fitted is None
+        assert reason == VERTICAL_TOO_SHORT
+
+    def test_a_window_that_already_fits_is_kept(self):
+        """Dentro da faixa (piso ≤ duração ≤ teto) a janela passa intacta."""
+        words = _words([(0.0, 1.0, "Curto"), (1.1, 2.0, "assim.")])
+        fitted, reason = fit_vertical_window(
+            0.0, 2.0, words, max_duration_s=90.0, min_duration_s=1.0
+        )
         assert reason is None
         assert fitted is not None
-        assert fitted.duration_s < MIN_SHRUNK_VERTICAL_S
 
 
 class TestVerticalHonesty:

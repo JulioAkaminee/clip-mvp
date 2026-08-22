@@ -44,13 +44,13 @@ STAGE_ORDER: tuple[str, ...] = (
 STAGE_LABELS: dict[str, str] = {
     "queued": "Na fila",
     "download": "Baixando vídeo",
-    "transcribe": "Transcrevendo áudio (PT-BR)",
-    "candidates": "Procurando momentos com contexto fechado",
-    "score": "Avaliando potencial de viralização",
-    "select": "Selecionando os melhores cortes",
-    "captions": "Gerando legendas",
-    "render": "Renderizando cortes",
-    "meta": "Escrevendo títulos, hashtags e captions",
+    "transcribe": "Ouvindo o áudio",
+    "candidates": "Escolhendo os melhores momentos",
+    "score": "Dando nota de viralização",
+    "select": "Separando os cortes finais",
+    "captions": "Sincronizando legendas com a fala",
+    "render": "Montando os vídeos",
+    "meta": "Escrevendo título e hashtags",
     "done": "Concluído",
     "error": "Erro",
     "canceled": "Cancelado",
@@ -112,6 +112,35 @@ STAGE_COSTS: dict[str, StageCostModel] = {
     # 1 chamada de LLM por clipe (em paralelo limitado).
     "meta": StageCostModel(base=4.0, per_unit=3.0),
 }
+
+
+def predict_total_seconds(
+    source_minutes: float,
+    *,
+    candidates: int,
+    clips: int,
+    render_files_per_clip: int = 2,
+) -> float:
+    """Quanto o job inteiro deve levar, antes de existir qualquer medição.
+
+    Alimenta a estimativa que a tela mostra **antes** de a pessoa apertar o
+    botão: "isso vai levar uns 12 min e custar uns US$ 0,30" é a diferença
+    entre esperar tranquilo e achar que travou.
+    """
+    units = {
+        "download": 1.0,
+        "transcribe": max(1.0, source_minutes / 10.0),
+        "candidates": 1.0,
+        "score": float(max(1, candidates)),
+        "select": 1.0,
+        "captions": float(max(1, clips)),
+        "render": float(max(1, clips) * max(1, render_files_per_clip)),
+        "meta": float(max(1, clips)),
+    }
+    return sum(
+        model.predict(source_minutes, units.get(name, 1.0))
+        for name, model in STAGE_COSTS.items()
+    )
 
 
 def stage_label(stage: str) -> str:

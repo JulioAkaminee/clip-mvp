@@ -10,12 +10,94 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from .config import OPENROUTER_BASE_URL, Settings
+from .config import DEFAULT_STT_MODEL, OPENROUTER_BASE_URL, Settings
+
+DEFAULT_STT_FALLBACK = DEFAULT_STT_MODEL  # openai/whisper-1
+
+#: Modelos que o endpoint OpenAI-compatible /audio/transcriptions realmente aceita.
+WHISPER_MODEL_MARKERS = ("whisper", "gpt-4o-transcribe", "gpt-4o-mini-transcribe")
+
+
+def is_whisper_compatible(model_id: str) -> bool:
+    lowered = (model_id or "").strip().lower()
+    return any(marker in lowered for marker in WHISPER_MODEL_MARKERS)
+
+
+def resolve_transcription_model(model_id: str) -> str:
+    """Garante um modelo aceito pelo endpoint de transcrição.
+
+    Gemini, Claude, Llama e GPT-4o de chat NÃO implementam /audio/transcriptions.
+    Colocá-los no papel de STT gerava BadRequestError opaco no meio do job.
+    """
+    if is_whisper_compatible(model_id):
+        return model_id.strip()
+    return DEFAULT_STT_FALLBACK
+
+
+def is_audio_endpoint_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    markers = (
+        "badrequesterror",
+        "400",
+        "invalid model",
+        "does not support",
+        "not a valid model",
+        "audio/transcriptions",
+        "unsupported",
+        "unknown model",
+        "no such model",
+    )
+    return any(marker in text for marker in markers)
+
+_JSON_MODE_MARKERS = (
+    "response_format",
+    "json_object",
+    "json mode",
+    "not supported",
+    "unsupported",
+    "does not support",
+)
+
+
+def _rejects_json_mode(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _JSON_MODE_MARKERS)
+
+
+def parse_json_response(text: str | None) -> dict[str, Any]:
+    """Lê o JSON da resposta mesmo quando o modelo enfeita a saída.
+
+    Sem `response_format`, é comum o modelo devolver o objeto dentro de uma
+    cerca ```json ou depois de uma frase de introdução. Falhar nisso jogava
+    fora uma resposta perfeitamente boa.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("resposta vazia do modelo")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    fence = re.search(r"```(?:json)?\s*(.+?)```", raw, re.DOTALL)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(raw[start : end + 1])
+    raise ValueError("a resposta do modelo não continha JSON")
+
 
 #: Timeout do catálogo/validação de chave. É uma chamada de UI: melhor falhar
 #: rápido com mensagem do que deixar a tela girando.
@@ -55,9 +137,21 @@ class OpenRouterClient:
         `model` sobrepõe o papel de STT — a diarização usa isso para pedir um
         modelo com speaker labels sem trocar o STT do job (SPEC §9).
         """
+        requested = (model or self.settings.stt_model or "").strip()
+        resolved = resolve_transcription_model(requested)
+        try:
+            return self._transcribe_once(audio_path, language=language, model=resolved)
+        except Exception as exc:
+            if not is_audio_endpoint_error(exc) or resolved == DEFAULT_STT_FALLBACK:
+                raise
+            # Modelo de chat/vision foi colocado no papel de STT (ex. Gemini Flash).
+            # O endpoint /audio/transcriptions só aceita Whisper — cai no fallback.
+            return self._transcribe_once(audio_path, language=language, model=DEFAULT_STT_FALLBACK)
+
+    def _transcribe_once(self, audio_path: Path, *, language: str, model: str) -> dict[str, Any]:
         with open(audio_path, "rb") as f:
             resp = self.client.audio.transcriptions.create(
-                model=model or self.settings.stt_model,
+                model=model,
                 file=f,
                 language=language,
                 response_format="verbose_json",
@@ -90,17 +184,29 @@ class OpenRouterClient:
                 }
             )
 
-        resp = self.client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": content},
-            ],
-        )
-        text = resp.choices[0].message.content
-        return json.loads(text)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ]
+        try:
+            resp = self.client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Nem todo modelo da OpenRouter aceita `response_format`. Sem este
+            # retry, escolher Claude ou Llama para um papel de texto fazia a
+            # chamada falhar sempre e o pipeline cair calado no fallback.
+            if not _rejects_json_mode(exc):
+                raise
+            resp = self.client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=messages,
+            )
+        return parse_json_response(resp.choices[0].message.content)
 
 
 def image_to_b64(path: Path) -> str:

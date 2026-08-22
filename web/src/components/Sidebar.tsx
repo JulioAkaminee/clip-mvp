@@ -1,15 +1,19 @@
-import { formatMinutes, formatRelative, shortenUrl } from "../lib/format";
 import type { Health, JobListItem } from "../lib/types";
-import { Badge, Button, StatusDot, cx } from "./ui";
+import { prettyUrl, timeAgo } from "../lib/format";
+import { ProgressBar, StatusDot, cx } from "./ui";
 
-const STATUS_LABEL: Record<string, string> = {
+const STATUS_WORD: Record<string, string> = {
+  running: "processando",
   queued: "na fila",
-  running: "rodando",
   done: "pronto",
-  error: "erro",
+  error: "parou",
   canceled: "cancelado",
 };
 
+/**
+ * Navegação. Um botão para começar, a lista do que já foi feito e as
+ * configurações — nesta ordem, porque é a frequência com que se usa cada um.
+ */
 export function Sidebar({
   jobs,
   selectedId,
@@ -21,181 +25,121 @@ export function Sidebar({
 }: {
   jobs: JobListItem[];
   selectedId: string | null;
-  screen: "new" | "settings" | "job";
+  screen: string;
   health: Health | null;
   onSelect: (id: string) => void;
   onNew: () => void;
   onSettings: () => void;
 }) {
+  const needsSetup = health != null && !health.openrouter_key;
+
   return (
-    <aside className="flex h-full min-h-0 w-full flex-col gap-4 border-white/8 lg:w-80 lg:border-r lg:pr-5">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight text-white">
-            <span className="grid size-7 place-items-center rounded-lg bg-gradient-to-br from-brand-400 to-brand-600 text-[0.7rem] font-bold text-white">
-              CM
-            </span>
-            clip<span className="text-mist-400">-mvp</span>
-          </h1>
-          <p className="mt-1 text-[0.75rem] text-mist-400">
-            Cortes automáticos com contexto fechado
+    <nav className="panel flex h-full w-full flex-col gap-3 p-3 lg:w-64" aria-label="Navegação">
+      <div className="px-1 pt-1">
+        <p className="text-[0.95rem] font-semibold text-white">clip</p>
+        <p className="text-[0.7rem] text-mist-400">cortes automáticos</p>
+      </div>
+
+      <button
+        type="button"
+        onClick={onNew}
+        className={cx(
+          "w-full rounded-xl px-3 py-2.5 text-[0.85rem] font-medium transition-all",
+          screen === "new"
+            ? "bg-brand-500 text-white shadow-lg shadow-brand-600/25"
+            : "border border-white/12 bg-white/4 text-mist-200 hover:border-white/25 hover:bg-white/8",
+        )}
+      >
+        + Novo corte
+      </button>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {jobs.length === 0 ? (
+          <p className="px-1 py-4 text-[0.75rem] leading-relaxed text-mist-400">
+            Seus vídeos processados aparecem aqui.
           </p>
-        </div>
-        <div className="flex shrink-0 flex-col gap-1.5">
-          <Button size="sm" variant="primary" onClick={onNew} title="Novo job">
-            + Novo
-          </Button>
-          <Button
-            size="sm"
-            variant={screen === "settings" ? "primary" : "outline"}
-            onClick={onSettings}
-            title="Configurações da OpenRouter"
-          >
-            Configurações
-          </Button>
-        </div>
-      </div>
-
-      <HealthPanel health={health} onSettings={onSettings} />
-
-      <div className="flex min-h-0 flex-1 flex-col gap-2">
-        <div className="flex items-center justify-between px-1">
-          <h2 className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-            Jobs
-          </h2>
-          <span className="text-[0.72rem] text-mist-400">{jobs.length}</span>
-        </div>
-        <div className="-mx-1 min-h-0 flex-1 space-y-1.5 overflow-y-auto px-1 pb-2">
-          {jobs.length === 0 && (
-            <p className="rounded-xl border border-dashed border-white/10 px-3 py-6 text-center text-[0.78rem] text-mist-400">
-              Nenhum job ainda. Cole um link para começar.
+        ) : (
+          <>
+            <p className="px-1 pt-2 pb-1.5 text-[0.66rem] tracking-wider text-mist-400 uppercase">
+              Recentes
             </p>
-          )}
-          {jobs.map((job) => {
-            const active = job.status === "running" || job.status === "queued";
-            return (
-              <button
-                key={job.job_id}
-                onClick={() => onSelect(job.job_id)}
-                className={cx(
-                  "w-full rounded-xl border px-3 py-2.5 text-left transition-colors",
-                  screen === "job" && selectedId === job.job_id
-                    ? "border-brand-400/45 bg-brand-500/10"
-                    : "border-white/8 bg-white/3 hover:border-white/20 hover:bg-white/6",
-                )}
-              >
-                <span className="flex items-center gap-2">
-                  <StatusDot status={job.status ?? "pending"} />
-                  <span
-                    className="min-w-0 flex-1 truncate text-[0.82rem] font-medium text-mist-200"
-                    title={job.source_url || job.job_id}
-                  >
-                    {shortenUrl(job.source_url, 26) || job.job_id}
-                  </span>
-                  {active && (
-                    <span className="shrink-0 font-mono text-[0.7rem] text-brand-400">
-                      {Math.round(job.percent ?? 0)}%
-                    </span>
-                  )}
-                </span>
-                <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 pl-4 text-[0.7rem] text-mist-400">
-                  <span>{STATUS_LABEL[job.status ?? ""] ?? "sem progresso"}</span>
-                  <span aria-hidden>·</span>
-                  <span>{formatRelative(job.updated_at)}</span>
-                  {job.clips_total ? (
-                    <>
-                      <span aria-hidden>·</span>
-                      <span>
-                        {job.clips_done}/{job.clips_total} cortes
+            <ul className="space-y-0.5">
+              {jobs.map((job) => {
+                const selected = screen === "job" && job.job_id === selectedId;
+                const active = job.status === "running" || job.status === "queued";
+                // Enquanto o download não termina não existe título: aí a URL
+                // é o único identificador que temos.
+                const label = job.source_title?.trim() || prettyUrl(job.source_url) || job.job_id;
+                return (
+                  <li key={job.job_id}>
+                    <button
+                      type="button"
+                      onClick={() => onSelect(job.job_id)}
+                      aria-current={selected ? "page" : undefined}
+                      aria-label={`${label} — ${
+                        job.stale
+                          ? "interrompido"
+                          : active
+                            ? `${Math.round(job.percent ?? 0)}% processado`
+                            : (STATUS_WORD[job.status ?? ""] ?? "")
+                      }`}
+                      className={cx(
+                        "w-full space-y-1 rounded-lg px-2.5 py-2 text-left transition-colors",
+                        selected ? "bg-white/10" : "hover:bg-white/6",
+                      )}
+                    >
+                      <span className="flex items-center gap-1.5">
+                        <StatusDot status={job.stale ? "error" : (job.status ?? "pending")} />
+                        <span className="min-w-0 flex-1 truncate text-[0.78rem] text-mist-200">
+                          {label}
+                        </span>
                       </span>
-                    </>
-                  ) : null}
-                  {job.source_minutes ? (
-                    <>
-                      <span aria-hidden>·</span>
-                      <span>{formatMinutes(job.source_minutes)}</span>
-                    </>
-                  ) : null}
-                </span>
-                {active && job.eta_text && (
-                  <span className="mt-0.5 block pl-4 text-[0.7rem] text-brand-400">
-                    {job.eta_text}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
+                      <span className="flex items-baseline justify-between gap-2 pl-3">
+                        <span className="text-[0.68rem] text-mist-400">
+                          {job.stale
+                            ? "interrompido"
+                            : active
+                              ? `${Math.round(job.percent ?? 0)}%`
+                              : `${STATUS_WORD[job.status ?? ""] ?? ""}${
+                                  job.clips_done ? ` · ${job.clips_done} cortes` : ""
+                                }`}
+                        </span>
+                        <span className="text-[0.66rem] text-mist-400">
+                          {timeAgo(job.updated_at)}
+                        </span>
+                      </span>
+                      {active && (
+                        <span className="block pl-3">
+                          <ProgressBar value={(job.percent ?? 0) / 100} active />
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
       </div>
-    </aside>
-  );
-}
 
-function HealthPanel({
-  health,
-  onSettings,
-}: {
-  health: Health | null;
-  onSettings: () => void;
-}) {
-  if (!health) {
-    return (
-      <div className="rounded-xl border border-white/8 bg-white/3 px-3 py-2.5 text-[0.75rem] text-mist-400">
-        Verificando ambiente…
-      </div>
-    );
-  }
-  const items = [
-    { label: "ffmpeg", ok: health.ffmpeg, hint: "render e legendas" },
-    { label: "yt-dlp", ok: health.yt_dlp, hint: "download da fonte" },
-    { label: "MediaPipe", ok: health.mediapipe, hint: "face tracking do 9:16" },
-    { label: "OpenRouter", ok: health.openrouter_key, hint: "STT + LLM + vision" },
-  ];
-  const missing = items.filter((item) => !item.ok);
-  return (
-    <div className="space-y-2 rounded-xl border border-white/8 bg-white/3 p-3">
-      <div className="flex items-center justify-between">
-        <span className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-mist-400">
-          Ambiente
-        </span>
-        <Badge tone={missing.length === 0 ? "good" : "warn"}>
-          {missing.length === 0 ? "pronto" : `${missing.length} pendência(s)`}
-        </Badge>
-      </div>
-      <ul className="grid grid-cols-2 gap-1.5">
-        {items.map((item) => (
-          <li
-            key={item.label}
-            title={item.hint}
-            className="flex items-center gap-1.5 text-[0.74rem] text-mist-300"
-          >
-            <span
-              className={cx("size-1.5 rounded-full", item.ok ? "bg-lime-300" : "bg-amber-300/80")}
-            />
-            {item.label}
-          </li>
-        ))}
-      </ul>
-      {health.openrouter_key ? (
-        <p className="text-[0.7rem] leading-snug text-mist-400">
-          OpenRouter {health.openrouter_key_masked ?? "configurada"}
-          {health.openrouter_key_source === "ui" ? " (pela interface)" : " (pelo .env)"}.
-        </p>
-      ) : (
-        <p className="text-[0.7rem] leading-snug text-mist-400">
-          Sem chave o job para no primeiro passo de IA.{" "}
-          <button type="button" onClick={onSettings} className="text-brand-400 hover:underline">
-            Abrir Configurações
-          </button>{" "}
-          para colar a chave da OpenRouter.
-        </p>
-      )}
-      {!health.mediapipe && (
-        <p className="text-[0.7rem] leading-snug text-mist-400">
-          Sem MediaPipe o <code className="text-mist-300">vertical_facetrack</code> não é gerado.
-          Instale com <code className="text-mist-300">pip install -e '.[facetrack]'</code>.
-        </p>
-      )}
-    </div>
+      <button
+        type="button"
+        onClick={onSettings}
+        aria-label={needsSetup ? "Configurações — falta a chave" : "Configurações"}
+        className={cx(
+          "flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-[0.82rem] transition-colors",
+          screen === "settings"
+            ? "bg-white/10 text-mist-200"
+            : "text-mist-400 hover:bg-white/6 hover:text-mist-200",
+        )}
+      >
+        <span>Configurações</span>
+        {needsSetup && (
+          <span className="rounded-full bg-amber-300/20 px-1.5 py-0.5 text-[0.62rem] text-amber-200">
+            falta a chave
+          </span>
+        )}
+      </button>
+    </nav>
   );
 }

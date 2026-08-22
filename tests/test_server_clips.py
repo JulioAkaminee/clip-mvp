@@ -108,7 +108,7 @@ class TestHealthAndConfig:
         body = client.get("/api/config").json()
         assert body["vertical_max_s"] == 90.0
         assert body["pad_ms"] == [200, 400]
-        assert body["formats"] == ["face", "9x16", "16x9"]
+        assert body["formats"] == ["face", "16x9"]
         assert [stage["name"] for stage in body["stages"]][0] == "download"
         assert len(body["target_ranges"]) == 4
 
@@ -234,3 +234,21 @@ class TestRating:
             f"/api/jobs/{job_id}/clips/nao-existe/rate", json={"verdict": "good"}
         )
         assert response.status_code == 404
+
+
+class TestNewestFolderWins:
+    def test_collect_clips_prefers_folder_with_newer_video(self, settings):
+        from clip_mvp.server import _clip_dir
+
+        old = settings.out_dir / f"40_{SLUG}"
+        new = settings.out_dir / f"45_{SLUG}"
+        old.mkdir(parents=True)
+        new.mkdir(parents=True)
+        (old / "horizontal_16x9.mp4").write_bytes(b"x" * 2_000_000)
+        newer = new / "horizontal_16x9.mp4"
+        newer.write_bytes(b"y" * 2_000_000)
+        import os, time
+        os.utime(old / "horizontal_16x9.mp4", (time.time() - 1000, time.time() - 1000))
+        os.utime(newer, (time.time(), time.time()))
+        chosen = _clip_dir(settings, SLUG, score=40)
+        assert chosen == new

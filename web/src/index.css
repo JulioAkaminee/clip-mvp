@@ -16,6 +16,11 @@
   --color-lime-glow: #9be15d;
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", monospace;
+
+  /* Curvas exponenciais: desaceleram forte no fim, que é o que faz o
+     movimento parecer físico em vez de mecânico. Sem bounce, sem elástico. */
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @layer base {
@@ -103,13 +108,40 @@
 }
 
 .fade-up {
-  animation: fade-up 0.24s ease-out both;
+  animation: fade-up 0.24s var(--ease-out-quart) both;
 }
 
+/* Entrada de um corte que acabou de ficar pronto.
+   Só o corte novo anima — os que já estavam na tela ficam parados. Animar a
+   grade inteira a cada atualização transformaria o progresso num piscar. */
+@keyframes clip-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.75rem) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.clip-in {
+  animation: clip-in 0.26s var(--ease-out-expo) both;
+}
+
+/* O estado final nunca depende da animação ter rodado: aqui o conteúdo já
+   está visível e só o movimento some. */
 @media (prefers-reduced-motion: reduce) {
   .progress-shimmer::after,
   .pulse-ring,
-  .fade-up {
+  .fade-up,
+  .clip-in {
     animation: none;
+  }
+
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
   }
 }

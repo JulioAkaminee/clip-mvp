@@ -1,150 +1,204 @@
-import { useState } from "react";
-import { posterUrl } from "../lib/api";
-import {
-  RENDER_FORMAT_LABELS,
-  VIDEO_ARTIFACTS,
-  formatDuration,
-  scoreRing,
-  scoreTone,
-} from "../lib/format";
+import { useEffect, useRef, useState } from "react";
+import { artifactUrl, posterUrl } from "../lib/api";
 import type { Clip } from "../lib/types";
-import { Badge, Spinner, cx } from "./ui";
+import { FORMATS, formatDuration, scoreBorder, scoreTone, scoreWord } from "../lib/format";
+import { cx } from "./ui";
 
-const FORMAT_ORDER = ["vertical_facetrack", "vertical_center", "horizontal_16x9"] as const;
-
-const FORMAT_TONE: Record<string, string> = {
-  done: "border-lime-300/35 bg-lime-300/10 text-lime-300",
-  running: "border-brand-400/50 bg-brand-500/15 text-brand-400",
-  error: "border-red-400/35 bg-red-500/12 text-red-200",
-  pending: "border-white/10 bg-white/4 text-mist-400",
-};
-
-const FORMAT_STATUS_LABEL: Record<string, string> = {
-  done: "exportado",
-  running: "renderizando",
-  error: "falhou",
-  pending: "na fila",
-};
-
+/**
+ * Um corte na bancada de triagem.
+ *
+ * A miniatura é **vertical**: o 9:16 é o que vai para o TikTok e o Shorts, e
+ * julgar o corte por um quadro 16:9 é olhar para um enquadramento que não vai
+ * ao ar — some justamente o que o face tracking fez.
+ *
+ * O card existe desde o instante em que o pipeline registra o corte, muito
+ * antes de o vídeo estar pronto, então precisa ser legível esperando,
+ * renderizando e pronto.
+ */
 export function ClipCard({
-  clip,
   jobId,
+  clip,
+  selected,
+  isNew,
   onOpen,
+  onFocus,
 }: {
-  clip: Clip;
   jobId: string;
+  clip: Clip;
+  selected: boolean;
+  isNew: boolean;
   onOpen: () => void;
+  onFocus: () => void;
 }) {
-  const horizontal = clip.windows?.horizontal_16x9;
-  const vertical = clip.windows?.vertical_9x16;
-  const rendering = clip.status === "running";
-  // O poster é gerado sob demanda a partir do primeiro export disponível, então
-  // ele pode não existir ainda (ou a extração pode falhar). Cair no placeholder
-  // é melhor que um ícone de imagem quebrada no meio da grade.
-  const [posterFailed, setPosterFailed] = useState(false);
-  const hasVideo = VIDEO_ARTIFACTS.some((name) => clip.artifacts[name]);
-  const showPoster = !posterFailed && (Boolean(clip.artifacts["poster.jpg"]) || hasVideo);
+  const done = clip.status === "done";
+  const failed = clip.status === "error";
+  const duration =
+    clip.windows.vertical_9x16?.duration_s ?? clip.windows.horizontal_16x9?.duration_s;
+  const title = clip.youtube?.shorts_title || clip.title || clip.slug.replace(/-/g, " ");
+  const rendering = FORMATS.find((format) => clip.formats[format.file] === "running");
+  const preview = FORMATS.find(
+    (format) => format.vertical && clip.formats[format.file] === "done",
+  );
+
+  const [scrubbing, setScrubbing] = useState(false);
+  const [posterLoaded, setPosterLoaded] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+
+  // A seleção vive no teclado, então o card precisa se trazer para a vista
+  // quando é escolhido de fora — senão navegar com as setas some da tela.
+  useEffect(() => {
+    if (selected) buttonRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selected]);
+
+  /**
+   * Passar o mouse avança o vídeo em vez de dar zoom no card: o movimento
+   * mostra o conteúdo. Fica mudo e volta ao começo ao sair — é prévia, não
+   * reprodução.
+   */
+  const startScrub = () => {
+    if (!preview) return;
+    setScrubbing(true);
+  };
+  const stopScrub = () => {
+    setScrubbing(false);
+    const el = videoRef.current;
+    if (el) {
+      el.pause();
+      el.currentTime = 0;
+    }
+  };
 
   return (
     <button
+      ref={buttonRef}
+      type="button"
       onClick={onOpen}
-      title={clip.title}
-      className="group panel overflow-hidden text-left transition-all hover:border-white/20 hover:shadow-xl hover:shadow-black/30 focus-visible:border-brand-400/60"
+      onFocus={onFocus}
+      onMouseEnter={startScrub}
+      onMouseLeave={stopScrub}
+      disabled={!done}
+      aria-label={
+        done
+          ? `Abrir o corte "${title}"${clip.score != null ? `, nota ${clip.score} de 100` : ""}`
+          : `${title} — ainda sendo gerado`
+      }
+      className={cx(
+        "group relative block w-full overflow-hidden rounded-xl bg-ink-950 text-left",
+        "ring-1 transition-[box-shadow,--tw-ring-color] duration-200",
+        isNew && "clip-in",
+        done ? "cursor-pointer" : "cursor-default",
+        selected
+          ? "ring-2 ring-brand-400"
+          : "ring-white/10 hover:ring-white/25",
+      )}
     >
-      <div className="relative aspect-video overflow-hidden bg-ink-850">
-        {showPoster ? (
-          <img
-            src={posterUrl(jobId, clip.slug)}
-            alt=""
-            loading="lazy"
-            onError={() => setPosterFailed(true)}
-            className="size-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-          />
+      <div className="relative aspect-[9/16] w-full overflow-hidden">
+        {done ? (
+          <>
+            {/* A miniatura pode estar sendo extraída ainda; sem isto o card
+                fica um retângulo preto que parece defeito. */}
+            {!posterLoaded && <div className="absolute inset-0 animate-pulse bg-white/5" aria-hidden />}
+            <img
+              src={posterUrl(jobId, clip.slug, "vertical")}
+              alt=""
+              loading="lazy"
+              onLoad={() => setPosterLoaded(true)}
+              className={cx(
+                "absolute inset-0 size-full object-cover transition-opacity duration-300",
+                posterLoaded && !(scrubbing && preview) ? "opacity-100" : "opacity-0",
+              )}
+            />
+            {preview && scrubbing && (
+              <video
+                ref={videoRef}
+                src={artifactUrl(jobId, clip.slug, preview.file)}
+                muted
+                loop
+                autoPlay
+                playsInline
+                preload="none"
+                aria-hidden
+                className="absolute inset-0 size-full object-cover"
+              />
+            )}
+          </>
         ) : (
-          <div className="grid size-full place-items-center gap-2 text-[0.78rem] text-mist-400">
-            {rendering ? (
-              <span className="flex items-center gap-2">
-                <Spinner className="size-3.5" /> renderizando…
+          <div className="grid size-full place-items-center bg-ink-900">
+            {failed ? (
+              <span className="px-4 text-center text-[0.75rem] text-red-200">
+                não foi possível gerar
               </span>
             ) : (
-              "aguardando render"
+              <span className="flex flex-col items-center gap-2 px-4 text-center">
+                <span
+                  className="size-6 animate-spin rounded-full border-2 border-white/15 border-t-brand-400"
+                  aria-hidden
+                />
+                <span className="text-[0.72rem] text-mist-400">
+                  {rendering ? rendering.name.toLowerCase() : "na fila"}
+                </span>
+              </span>
             )}
           </div>
         )}
 
-        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink-950 via-ink-950/70 to-transparent p-3">
-          <div className="flex items-end justify-between gap-2">
-            <span className="line-clamp-2 text-[0.82rem] font-medium leading-snug text-white">
-              {clip.title}
-            </span>
-            <span
-              className={cx(
-                "grid size-10 shrink-0 place-items-center rounded-xl border font-mono text-sm font-semibold",
-                scoreRing(clip.score),
-                scoreTone(clip.score),
-              )}
-              title="score de viralização"
-            >
-              {clip.score ?? "—"}
-            </span>
-          </div>
-        </div>
+        {/* O título fica por cima de um quadro qualquer — inclusive de uma
+            parede branca. A tarja precisa segurar contraste no pior caso, não
+            no melhor. */}
+        <div
+          className="pointer-events-none absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black via-black/80 to-transparent"
+          aria-hidden
+        />
 
-        {clip.rating && (
-          <span className="absolute left-2 top-2 rounded-full bg-ink-950/70 backdrop-blur-sm">
-            <Badge tone={clip.rating === "good" ? "good" : "bad"}>
-              {clip.rating === "good" ? "aprovado" : "reprovado"}
-            </Badge>
+        {clip.score != null && (
+          <span
+            className={cx(
+              "absolute top-2.5 left-2.5 rounded-md border bg-black/80 px-1.5 py-0.5",
+              "text-[0.8rem] font-semibold tabular-nums",
+              scoreBorder(clip.score),
+              scoreTone(clip.score),
+            )}
+          >
+            {clip.score}
           </span>
         )}
-      </div>
 
-      <div className="space-y-2.5 p-3.5">
-        {/* Status de render por formato: é isso que mostra o trabalho andando.
-            Os formatos entram como "na fila" antes de começar, então o card já
-            diz quantos arquivos aquele corte vai ter. */}
-        <div className="flex flex-wrap gap-1.5">
-          {FORMAT_ORDER.filter((key) => clip.formats[key]).map((key) => (
-            <span
-              key={key}
-              title={`${RENDER_FORMAT_LABELS[key]}: ${FORMAT_STATUS_LABEL[clip.formats[key]] ?? clip.formats[key]}`}
-              className={cx(
-                "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.7rem] font-medium",
-                FORMAT_TONE[clip.formats[key]] ?? "border-white/12 bg-white/6 text-mist-300",
-              )}
-            >
-              {clip.formats[key] === "running" && <Spinner className="size-2.5" />}
-              {RENDER_FORMAT_LABELS[key]}
-            </span>
-          ))}
-          {clip.vertical_skipped && <Badge tone="warn">9:16 descartado</Badge>}
-          {vertical?.shrunk_from_16x9 && (
-            <Badge tone="neutral" className="opacity-80">
-              9:16 encolhido
-            </Badge>
-          )}
-        </div>
-
-        <dl className="grid grid-cols-2 gap-1 text-[0.74rem]">
-          <div className="flex items-center gap-1.5">
-            <dt className="text-mist-400">16:9</dt>
-            <dd className="font-mono text-mist-200">
-              {formatDuration(horizontal?.duration_s ?? null)}
-            </dd>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <dt className="text-mist-400">9:16</dt>
-            <dd className="font-mono text-mist-200">
-              {vertical ? formatDuration(vertical.duration_s) : "—"}
-            </dd>
-          </div>
-        </dl>
-
-        {(clip.reason || clip.message) && (
-          <p className="line-clamp-2 text-[0.75rem] leading-snug text-mist-400">
-            {clip.reason || clip.message}
-          </p>
+        {clip.rating && (
+          <span
+            className={cx(
+              "absolute top-2.5 right-2.5 grid size-6 place-items-center rounded-md text-[0.7rem] font-semibold",
+              clip.rating === "good" ? "bg-lime-300 text-ink-950" : "bg-red-400 text-ink-950",
+            )}
+            title={clip.rating === "good" ? "marcado como bom" : "marcado como ruim"}
+          >
+            {clip.rating === "good" ? "✓" : "✕"}
+          </span>
         )}
+
+        <div className="absolute inset-x-0 bottom-0 space-y-1 p-3">
+          <p className="line-clamp-2 text-[0.85rem] leading-snug font-medium text-white">
+            {title}
+          </p>
+          <p className="flex items-center gap-1.5 truncate text-[0.7rem] text-white/75">
+            {duration != null && (
+              <span className="font-mono tabular-nums">{formatDuration(duration)}</span>
+            )}
+            {clip.vertical_skipped ? (
+              <>
+                <span aria-hidden>·</span>
+                <span className="text-amber-200">só horizontal</span>
+              </>
+            ) : (
+              clip.score != null && (
+                <>
+                  <span aria-hidden>·</span>
+                  <span className={scoreTone(clip.score)}>{scoreWord(clip.score)}</span>
+                </>
+              )
+            )}
+          </p>
+        </div>
       </div>
     </button>
   );

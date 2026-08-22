@@ -246,6 +246,15 @@ def validate_model_id(value: str, *, role: ModelRole | None = None) -> str:
             f"Id de modelo{where} inválido: use o formato `autor/modelo` da OpenRouter "
             "(ex.: `google/gemini-2.5-flash`), sem espaços."
         )
+    if role and role.key == "stt":
+        from .openrouter import is_whisper_compatible
+
+        if not is_whisper_compatible(model):
+            raise SettingsValidationError(
+                "O papel STT / Whisper usa o endpoint de transcrição da OpenRouter e só "
+                "aceita modelos Whisper (ex.: openai/whisper-1). Gemini, Claude, Llama e "
+                "GPT-4o de chat não transcrevem áudio nesse endpoint."
+            )
     return model
 
 

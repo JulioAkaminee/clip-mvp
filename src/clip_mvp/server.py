@@ -30,15 +30,19 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import shutil
+import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .candidates import auto_count_range, candidate_pool_size
 from .config import Settings, env_settings
@@ -58,7 +62,7 @@ from .settings_store import (
     validate_api_key,
     validate_model_id,
 )
-from .utils import make_job_id, read_json, run_ffmpeg
+from .utils import make_job_id, read_json, run_ffmpeg, source_title, write_json
 
 #: Build da UI React (``cd web && npm run build``).
 WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
@@ -70,18 +74,29 @@ CLIP_ARTIFACTS: tuple[str, ...] = (
     "horizontal_16x9.mp4",
     "captions.srt",
     "captions_9x16.srt",
+    "captions.json",
+    "captions_9x16.json",
     "captions_16x9.ass",
     "captions_9x16.ass",
     "meta.json",
     "poster.jpg",
+    "poster_9x16.jpg",
 )
 
-#: Ordem de preferência da fonte do thumbnail.
-POSTER_SOURCES: tuple[str, ...] = (
-    "horizontal_16x9.mp4",
-    "vertical_center.mp4",
-    "vertical_facetrack.mp4",
-)
+#: Fonte do thumbnail, por orientação.
+#:
+#: A grade de resultados mostra o **vertical**: é o 9:16 que vai para o TikTok
+#: e o Shorts, e julgar o corte por um quadro 16:9 é olhar para um
+#: enquadramento que não vai ao ar — some justamente o que o face tracking fez.
+POSTER_SOURCES: dict[str, tuple[str, ...]] = {
+    "horizontal": ("horizontal_16x9.mp4", "vertical_facetrack.mp4", "vertical_center.mp4"),
+    "vertical": ("vertical_facetrack.mp4", "vertical_center.mp4", "horizontal_16x9.mp4"),
+}
+
+POSTER_FILES: dict[str, str] = {
+    "horizontal": "poster.jpg",
+    "vertical": "poster_9x16.jpg",
+}
 
 STREAM_CHUNK = 512 * 1024
 
@@ -133,16 +148,25 @@ def mark_stale_if_dead(
 
 
 class JobRequest(BaseModel):
-    url: str
+    url: str = ""
     more: bool = False
     count: int | None = None
     min_score: float | None = None
     max_score_only: float | None = None
-    formats: list[str] = Field(default_factory=lambda: ["face", "9x16", "16x9"])
+    formats: list[str] = Field(default_factory=lambda: ["face", "16x9"])
     captions: str = "both"
     platforms: list[str] = Field(default_factory=lambda: ["yt", "tiktok"])
     dry_run: bool = False
     budget: float | None = None
+    # Estilo e posicionamento de legendas
+    subtitle_style: str = "viral"
+    subtitle_position_v: float | None = None
+    subtitle_font_size: float = 1.0
+    subtitle_color: str | None = None
+    subtitle_outline_color: str | None = None
+    subtitle_uppercase: bool = False
+    subtitle_highlight: str = "pop"
+    subtitle_highlight_color: str | None = None
 
     def to_options(self) -> RunOptions:
         return RunOptions(
@@ -155,12 +179,112 @@ class JobRequest(BaseModel):
             platforms=list(self.platforms),
             dry_run=self.dry_run,
             budget=self.budget,
+            subtitle_style=self.subtitle_style,
+            subtitle_position_v=self.subtitle_position_v,
+            subtitle_font_size=self.subtitle_font_size,
+            subtitle_color=self.subtitle_color,
+            subtitle_outline_color=self.subtitle_outline_color,
+            subtitle_uppercase=self.subtitle_uppercase,
+            subtitle_highlight=self.subtitle_highlight,
+            subtitle_highlight_color=self.subtitle_highlight_color,
         )
+
+
+def _extract_youtube_id(url: str) -> str | None:
+    patterns = [
+        r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/|^)([a-zA-Z0-9_-]{11})(?:[&?]|$)",
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _probe_estimate(duration_s: float, settings: Settings) -> dict[str, Any] | None:
+    """Custo e tempo estimados do job, para a tela mostrar antes de começar."""
+    if duration_s <= 0:
+        return None
+    from .budget import estimate_cost
+    from .progress import predict_total_seconds
+
+    lo, hi = auto_count_range(duration_s)
+    pool = candidate_pool_size(hi)
+    cost = estimate_cost(duration_s, pool, settings)
+    seconds = predict_total_seconds(
+        duration_s / 60.0, candidates=pool, clips=max(1, (lo + hi) // 2)
+    )
+    return {
+        "cost_usd": round(cost.total_usd, 3),
+        "seconds": round(seconds),
+        "clips_min": lo,
+        "clips_max": hi,
+    }
+
+
+def _handle_video_probe(url: str, settings: Settings | None = None) -> dict[str, Any]:
+    url = (url or "").strip()
+    if not url:
+        return {"ok": False, "error": "URL vazia"}
+
+    yt_id = _extract_youtube_id(url)
+    default_thumb = f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg" if yt_id else None
+
+    try:
+        from .download import probe_metadata
+
+        info = probe_metadata(url) or {}
+    except Exception as exc:
+        if yt_id:
+            return {
+                "ok": True,
+                "title": f"Vídeo do YouTube ({yt_id})",
+                "duration_s": 0.0,
+                "thumbnail": default_thumb,
+                "uploader": "",
+                "youtube_id": yt_id,
+                "is_youtube": True,
+                "preview_note": "Metadados simplificados",
+            }
+        return {"ok": False, "error": str(exc)}
+
+    title = info.get("title") or (f"Vídeo ({yt_id})" if yt_id else "Vídeo")
+    duration_s = float(info.get("duration") or 0.0)
+    thumbnail = info.get("thumbnail") or default_thumb
+    uploader = info.get("uploader") or info.get("channel") or ""
+
+    return {
+        "estimate": _probe_estimate(duration_s, settings) if settings else None,
+        "ok": True,
+        "title": title,
+        "duration_s": duration_s,
+        "thumbnail": thumbnail,
+        "uploader": uploader,
+        "youtube_id": yt_id,
+        "is_youtube": yt_id is not None,
+        "view_count": info.get("view_count"),
+        "description": (info.get("description") or "")[:240],
+    }
+
+
+class VideoProbeRequest(BaseModel):
+    url: str
 
 
 class RateRequest(BaseModel):
     verdict: Literal["good", "bad"]
     note: str = ""
+
+
+class SubtitlePatch(BaseModel):
+    style: str | None = None
+    position_v: float | None = None
+    font_size: float | None = None
+    color: str | None = None
+    outline_color: str | None = None
+    uppercase: bool | None = None
+    highlight: str | None = None
+    highlight_color: str | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -305,6 +429,9 @@ class JobRunner:
                     info.update(read_json(job_file))
                 except Exception:  # noqa: BLE001
                     pass
+            info.setdefault("source_title", "")
+            if not info["source_title"]:
+                info["source_title"] = source_title(path)
             snapshot = self.snapshot(path.name)
             if snapshot:
                 info.update(
@@ -337,15 +464,22 @@ def _clip_dir(settings: Settings, slug: str, score: float | None = None) -> Path
     if "/" in slug or "\\" in slug or slug.startswith("."):
         return None
     out_dir = Path(settings.out_dir)
-    if score is not None:
-        candidate = out_dir / f"{round(score)}_{slug}"
-        if candidate.is_dir():
-            return candidate
-    matches = sorted(out_dir.glob(f"*_{slug}")) if out_dir.exists() else []
-    for match in matches:
-        if match.is_dir():
-            return match
-    return None
+    matches = [path for path in out_dir.glob(f"*_{slug}") if path.is_dir()] if out_dir.exists() else []
+    if not matches:
+        return None
+
+    def _freshness(path: Path) -> tuple[int, float]:
+        videos = [
+            child
+            for child in path.glob("*.mp4")
+            if child.is_file() and not child.name.endswith(".silent.mp4") and child.stat().st_size > 1_000_000
+        ]
+        newest = max((child.stat().st_mtime for child in videos), default=path.stat().st_mtime)
+        return (len(videos), newest)
+
+    # Score antigo e score novo geram pastas irmãs (40_slug / 45_slug).
+    # Sempre entregamos a que tem o vídeo mais recente, não a do número da nota.
+    return max(matches, key=_freshness)
 
 
 def _artifacts_in(clip_dir: Path) -> dict[str, str]:
@@ -446,8 +580,20 @@ def collect_clips(settings: Settings, job_id: str, snapshot: dict[str, Any] | No
                 "breakdown": meta.get("breakdown", {}),
                 "speaker_matching": meta.get("speaker_matching", {}),
                 "boundaries": meta.get("boundaries", {}),
+                "copy_source": meta.get("copy_source", "llm"),
                 "youtube": meta.get("youtube", {}),
                 "tiktok": meta.get("tiktok", {}),
+                "subtitles": {
+                    "style": "viral",
+                    "position_v": 0.2,
+                    "font_size": 1.0,
+                    "color": "#FFDE00",
+                    "outline_color": "#000000",
+                    "uppercase": True,
+                    "highlight": "pop",
+                    "highlight_color": "#FFFFFF",
+                    **(meta.get("subtitles") or {}),
+                },
                 "artifacts": artifacts,
                 "rating": verdict.get("verdict"),
                 "rating_note": verdict.get("note"),
@@ -477,30 +623,26 @@ def _tail_lines(path: Path, *, max_bytes: int = HISTORY_TAIL_BYTES) -> list[str]
     return raw.decode("utf-8", errors="replace").splitlines()
 
 
-def _ensure_poster(clip_dir: Path) -> Path | None:
-    """Thumbnail do card, extraído do primeiro export disponível."""
-    poster = clip_dir / "poster.jpg"
+def _ensure_poster(clip_dir: Path, orientation: str = "horizontal") -> Path | None:
+    """Thumbnail do card, extraído do export que corresponde à orientação.
+
+    Gerado sob demanda e guardado ao lado do corte: a extração custa um ffmpeg,
+    e a grade pede a mesma imagem toda vez que a tela abre.
+    """
+    poster = clip_dir / POSTER_FILES.get(orientation, POSTER_FILES["horizontal"])
     if poster.is_file():
         return poster
-    for name in POSTER_SOURCES:
+    for name in POSTER_SOURCES.get(orientation, POSTER_SOURCES["horizontal"]):
         source = clip_dir / name
         if not source.is_file():
             continue
+        # 2s em vez de 1s: o primeiro segundo costuma pegar quem fala de olho
+        # fechado ou no meio de um movimento.
+        width = 540 if orientation == "vertical" else 640
         try:
             run_ffmpeg(
-                [
-                    "-ss",
-                    "1",
-                    "-i",
-                    str(source),
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    "scale=640:-2",
-                    "-q:v",
-                    "4",
-                    str(poster),
-                ]
+                ["-ss", "2", "-i", str(source), "-frames:v", "1",
+                 "-vf", f"scale={width}:-2", "-q:v", "4", str(poster)]
             )
         except Exception:  # noqa: BLE001 - thumbnail é enfeite, não pode quebrar a UI
             return None
@@ -685,7 +827,12 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
     def get_job(job_id: str) -> dict[str, Any]:
         snapshot = _require_snapshot(job_id)
         meta = runner.job_meta(job_id)
-        return {**snapshot, "source_url": meta.get("source_url", ""), "running": runner.is_running(job_id)}
+        return {
+            **snapshot,
+            "source_url": meta.get("source_url", ""),
+            "source_title": source_title(Path(settings.work_dir) / job_id),
+            "running": runner.is_running(job_id),
+        }
 
     @app.get("/api/jobs/{job_id}/events")
     def job_events(job_id: str) -> StreamingResponse:
@@ -754,7 +901,9 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
         job_file = Path(settings.work_dir) / job_id / "job.json"
         if not job_file.is_file():
             raise HTTPException(status_code=404, detail="job não encontrado")
-        source_url = read_json(job_file).get("source_url", "")
+        source_url = (payload.url.strip() if payload and payload.url else "") or read_json(job_file).get("source_url", "")
+        if not source_url:
+            raise HTTPException(status_code=400, detail="job sem URL de origem para retomar")
         options = payload.to_options() if payload is not None else RunOptions()
         runner.start(source_url, options, job_id=job_id)
         return {"job_id": job_id, "retried": True}
@@ -915,6 +1064,14 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
             "out_dir": str(settings.out_dir),
         }
 
+    @app.post("/api/preview/probe")
+    def probe_video_post(payload: VideoProbeRequest) -> dict[str, Any]:
+        return _handle_video_probe(payload.url, resolve_settings())
+
+    @app.get("/api/preview/probe")
+    def probe_video_get(url: str = Query(...)) -> dict[str, Any]:
+        return _handle_video_probe(url, resolve_settings())
+
     @app.get("/api/config")
     def config() -> dict[str, Any]:
         ranges = []
@@ -925,7 +1082,7 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
                 {"from_min": lo_min, "to_min": hi_min, "min_clips": lo, "max_clips": hi}
             )
         return {
-            "formats": ["face", "9x16", "16x9"],
+            "formats": ["face", "16x9"],
             "format_labels": {
                 "face": "9:16 face tracking",
                 "9x16": "9:16 center",
@@ -947,10 +1104,62 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
         snapshot = _require_snapshot(job_id)
         return {"clips": collect_clips(settings, job_id, snapshot)}
 
+    @app.get("/api/jobs/{job_id}/download/{bundle}")
+    def download_bundle(job_id: str, bundle: str) -> Response:
+        """ZIP de todos os 9:16, todos os 16:9, ou os dois."""
+        names: dict[str, tuple[str, ...]] = {
+            "vertical": ("vertical_facetrack.mp4", "vertical_center.mp4"),
+            "horizontal": ("horizontal_16x9.mp4",),
+            "all": ("vertical_facetrack.mp4", "vertical_center.mp4", "horizontal_16x9.mp4"),
+        }
+        wanted = names.get(bundle)
+        if wanted is None:
+            raise HTTPException(status_code=404, detail="lote desconhecido")
+        snapshot = _require_snapshot(job_id)
+        clips = collect_clips(settings, job_id, snapshot)
+        tmp = tempfile.NamedTemporaryFile(prefix=f"{job_id}_{bundle}_", suffix=".zip", delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        added = 0
+        try:
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for clip in clips:
+                    clip_dir = _clip_dir(settings, clip["slug"], clip.get("score"))
+                    if clip_dir is None and clip.get("out_dir"):
+                        maybe = Path(str(clip["out_dir"]))
+                        clip_dir = maybe if maybe.is_dir() else None
+                    if clip_dir is None:
+                        continue
+                    for name in wanted:
+                        path = clip_dir / name
+                        if not path.is_file():
+                            continue
+                        zf.write(path, arcname=f"{clip['slug']}/{name}")
+                        added += 1
+                        break
+            if added == 0:
+                tmp_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=404, detail="nenhum vídeo neste lote ainda")
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        filename = f"{job_id}_{bundle}.zip"
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename=filename,
+            background=BackgroundTask(tmp_path.unlink, missing_ok=True),
+        )
+
     @app.get("/api/jobs/{job_id}/clips/{slug}/poster.jpg")
-    def clip_poster(job_id: str, slug: str, request: Request) -> Response:
+    def clip_poster(
+        job_id: str,
+        slug: str,
+        request: Request,
+        orientation: str = Query("horizontal", pattern="^(horizontal|vertical)$"),
+    ) -> Response:
         clip_dir = _require_clip_dir(job_id, slug)
-        poster = _ensure_poster(clip_dir)
+        poster = _ensure_poster(clip_dir, orientation)
         if poster is None:
             raise HTTPException(status_code=404, detail="sem thumbnail ainda")
         return _ranged_file_response(poster, request)
@@ -974,6 +1183,37 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
         return rate_clip(
             settings.work_dir, job_id, slug, payload.verdict, note=payload.note
         )
+
+    @app.patch("/api/jobs/{job_id}/clips/{slug}/subtitles")
+    def patch_clip_subtitles(job_id: str, slug: str, payload: SubtitlePatch) -> dict[str, Any]:
+        clip_dir = _require_clip_dir(job_id, slug)
+        meta_path = clip_dir / "meta.json"
+        meta: dict[str, Any] = {}
+        if meta_path.is_file():
+            try:
+                meta = read_json(meta_path)
+            except Exception:  # noqa: BLE001
+                meta = {}
+        current = {
+            "style": "viral",
+            "position_v": 0.2,
+            "font_size": 1.0,
+            "color": "#FFDE00",
+            "outline_color": "#000000",
+            "uppercase": True,
+            "highlight": "pop",
+            "highlight_color": "#FFFFFF",
+            **(meta.get("subtitles") or {}),
+        }
+        updates = payload.model_dump(exclude_none=True)
+        if "position_v" in updates:
+            updates["position_v"] = max(0.08, min(0.85, float(updates["position_v"])))
+        if "font_size" in updates:
+            updates["font_size"] = max(0.7, min(1.8, float(updates["font_size"])))
+        current.update(updates)
+        meta["subtitles"] = current
+        write_json(meta_path, meta)
+        return {"ok": True, "subtitles": current}
 
     # -- UI ----------------------------------------------------------------
     if (WEB_DIST / "assets").is_dir():

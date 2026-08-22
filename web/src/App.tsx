@@ -3,10 +3,11 @@ import { api } from "./lib/api";
 import type { AppConfig, Health, JobListItem } from "./lib/types";
 import { useJobProgress } from "./hooks/useJobProgress";
 import { JobView } from "./components/JobView";
-import { NewJobForm } from "./components/NewJobForm";
-import { SettingsPage } from "./components/SettingsPage";
+import { NewJob } from "./components/NewJob";
+import { Onboarding } from "./components/Onboarding";
+import { Settings } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
-import { Button, Card } from "./components/ui";
+import { Button, Callout, Skeleton } from "./components/ui";
 
 type Screen = "new" | "settings" | "job";
 
@@ -18,7 +19,10 @@ export default function App() {
   const [jobs, setJobs] = useState<JobListItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [screen, setScreen] = useState<Screen>("new");
+  const [booting, setBooting] = useState(true);
   const [bootError, setBootError] = useState<string | null>(null);
+  /** Some com o onboarding depois de salvar a chave, sem esperar o /health. */
+  const [setupDone, setSetupDone] = useState(false);
 
   const refreshJobs = useCallback(async () => {
     try {
@@ -28,6 +32,14 @@ export default function App() {
     } catch (err) {
       setBootError(err instanceof Error ? err.message : String(err));
       return [];
+    }
+  }, []);
+
+  const refreshHealth = useCallback(async () => {
+    try {
+      setHealth(await api.health());
+    } catch {
+      /* a tela de Configurações já mostra o erro de salvamento */
     }
   }, []);
 
@@ -41,19 +53,23 @@ export default function App() {
         setBootError(err instanceof Error ? err.message : String(err));
       }
       const list = await refreshJobs();
+      // Abrir direto no job que está rodando: quem volta para a aba quer ver
+      // o andamento, não um formulário em branco.
       const active = list.find((job) => job.status === "running" || job.status === "queued");
       if (active) {
         setSelectedId(active.job_id);
         setScreen("job");
       }
+      setBooting(false);
     })();
   }, [refreshJobs]);
 
-  const { progress, clips, log, live, applyRating, reload } = useJobProgress(selectedId, () =>
-    void refreshJobs(),
+  const { progress, clips, log, live, applyRating, applySubtitles, reload } = useJobProgress(
+    selectedId,
+    () => void refreshJobs(),
   );
 
-  // Mantém a lista lateral (percentual e ETA de cada job) fresca.
+  // Mantém percentual e ETA frescos na lista lateral enquanto algo roda.
   useEffect(() => {
     const hasActive = jobs.some((job) => job.status === "running" || job.status === "queued");
     if (!hasActive) return;
@@ -61,13 +77,28 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [jobs, refreshJobs]);
 
-  const refreshHealth = useCallback(async () => {
-    try {
-      setHealth(await api.health());
-    } catch {
-      /* a tela de Configurações já mostra o erro de salvamento */
-    }
-  }, []);
+  if (booting) {
+    return (
+      <div className="mx-auto max-w-3xl space-y-4 px-4 py-16">
+        <Skeleton className="h-8 w-52" />
+        <Skeleton className="h-32 w-full" />
+      </div>
+    );
+  }
+
+  // Sem chave a ferramenta não faz nada: em vez de deixar a pessoa colar um
+  // link e falhar no meio do caminho, o pré-requisito vem primeiro.
+  if (!setupDone && health != null && !health.openrouter_key) {
+    return (
+      <Onboarding
+        health={health}
+        onReady={() => {
+          setSetupDone(true);
+          void refreshHealth();
+        }}
+      />
+    );
+  }
 
   const onCreated = async (jobId: string) => {
     await refreshJobs();
@@ -77,7 +108,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
-      <div className="mx-auto flex min-h-screen max-w-[100rem] flex-col gap-6 px-4 py-5 lg:flex-row lg:px-6">
+      <div className="mx-auto flex min-h-screen max-w-[100rem] flex-col gap-5 px-4 py-5 lg:flex-row lg:px-6">
         <div className="lg:sticky lg:top-5 lg:h-[calc(100vh-2.5rem)]">
           <Sidebar
             jobs={jobs}
@@ -98,34 +129,46 @@ export default function App() {
 
         <main className="min-w-0 flex-1 pb-10">
           {bootError && (
-            <Card className="mb-4 border-red-400/25 bg-red-500/8">
-              <h2 className="text-sm font-semibold text-red-200">API indisponível</h2>
-              <p className="mt-1 text-[0.8rem] text-red-100/80">{bootError}</p>
-              <p className="mt-2 text-[0.78rem] text-mist-400">
-                Suba o backend com <code className="text-mist-200">clip serve</code> e recarregue.
-              </p>
-              <Button
-                size="sm"
-                className="mt-3"
-                onClick={() => {
-                  setBootError(null);
-                  void refreshJobs();
-                }}
+            <div className="mb-4">
+              <Callout
+                tone="bad"
+                title="Não estou conseguindo falar com a ferramenta"
+                action={
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      setBootError(null);
+                      void refreshJobs();
+                    }}
+                  >
+                    Tentar de novo
+                  </Button>
+                }
               >
-                Tentar de novo
-              </Button>
-            </Card>
+                <p>
+                  Confira se o comando <code>clip serve</code> ainda está rodando no Terminal.
+                </p>
+              </Callout>
+            </div>
           )}
 
           {screen === "settings" ? (
-            <SettingsPage
-              health={health}
-              onChanged={() => {
-                void refreshHealth();
-              }}
-            />
+            <Settings health={health} onChanged={() => void refreshHealth()} />
+          ) : screen === "job" && selectedId !== null && progress === null ? (
+            // Carregando um job já escolhido. Cair no formulário de "novo
+            // corte" aqui fazia a tela piscar como se o clique não tivesse
+            // funcionado.
+            <div className="space-y-4 pt-2">
+              <Skeleton className="h-7 w-64" />
+              <Skeleton className="h-32 w-full" />
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                <Skeleton className="h-56 w-full" />
+                <Skeleton className="h-56 w-full" />
+                <Skeleton className="h-56 w-full" />
+              </div>
+            </div>
           ) : screen === "new" || selectedId === null || progress === null ? (
-            <NewJobForm config={config} health={health} onCreated={onCreated} />
+            <NewJob config={config} health={health} onCreated={onCreated} />
           ) : (
             <JobView
               key={progress.job_id}
@@ -138,6 +181,7 @@ export default function App() {
                 void refreshJobs();
               }}
               onRated={applyRating}
+              onSubtitlesChanged={applySubtitles}
             />
           )}
         </main>

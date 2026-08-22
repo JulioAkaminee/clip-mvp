@@ -55,6 +55,11 @@ export const api = {
   job: (id: string) => request<JobProgress>(`/jobs/${id}`),
   clips: (id: string) => request<{ clips: Clip[] }>(`/jobs/${id}/clips`),
   history: (id: string) => request<{ events: LogLine[] }>(`/jobs/${id}/history`),
+  probeVideo: (url: string) =>
+    request<import("./types").VideoProbeResult>("/preview/probe", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
   createJob: (payload: JobRequest) =>
     request<{ job_id: string; already_running: boolean }>("/jobs", {
       method: "POST",
@@ -71,6 +76,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ verdict, note }),
     }),
+  updateSubtitles: (
+    id: string,
+    slug: string,
+    payload: NonNullable<Clip["subtitles"]>,
+  ) =>
+    request<{ ok: boolean; subtitles: NonNullable<Clip["subtitles"]> }>(
+      `/jobs/${id}/clips/${slug}/subtitles`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      },
+    ),
   settings: () => request<AppSettings>("/settings"),
   updateSettings: (payload: SettingsUpdate) =>
     request<AppSettings>("/settings", {
@@ -102,10 +119,23 @@ export function artifactUrl(
   return `${BASE}/jobs/${jobId}/clips/${encodeURIComponent(slug)}/files/${encodeURIComponent(name)}${suffix}`;
 }
 
-export function posterUrl(jobId: string, slug: string): string {
-  return `${BASE}/jobs/${jobId}/clips/${encodeURIComponent(slug)}/poster.jpg`;
+/**
+ * Thumbnail do corte. `orientation: "vertical"` devolve o quadro do 9:16 — que
+ * é o que vai para o TikTok e o Shorts, e portanto o que se julga na grade.
+ */
+export function posterUrl(
+  jobId: string,
+  slug: string,
+  orientation: "horizontal" | "vertical" = "horizontal",
+): string {
+  const query = orientation === "vertical" ? "?orientation=vertical" : "";
+  return `${BASE}/jobs/${jobId}/clips/${encodeURIComponent(slug)}/poster.jpg${query}`;
 }
 
 export function eventsUrl(jobId: string): string {
   return `${BASE}/jobs/${jobId}/events`;
+}
+
+export function bundleUrl(jobId: string, bundle: "vertical" | "horizontal" | "all"): string {
+  return `${BASE}/jobs/${jobId}/download/${bundle}`;
 }

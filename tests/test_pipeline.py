@@ -146,7 +146,9 @@ def test_full_pipeline_end_to_end_mocked_ai(tmp_path, monkeypatch, sample_video_
     no meio de palavra."""
     _patch_download(monkeypatch, sample_video_path)
     settings = _settings(tmp_path)
-    options = pipeline_mod.RunOptions()
+    # Explícito: o default do produto é face + 16:9 (o center crop virou opção),
+    # mas o teste de ponta a ponta precisa exercitar os três renderizadores.
+    options = pipeline_mod.RunOptions(formats=["face", "9x16", "16x9"])
 
     summary = pipeline_mod.run_job(
         "https://youtube.com/watch?v=fixture", settings, options, client=fake_client

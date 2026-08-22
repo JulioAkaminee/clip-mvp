@@ -230,8 +230,11 @@ class TestSaveModels:
         assert models["diarization"] == "ui/diar"
 
     def test_diarization_defaults_to_the_stt_model_in_health(self, client):
-        client.put("/api/settings", json={"models": {"stt": "ui/stt"}})
-        assert client.get("/api/health").json()["models"]["diarization"] == "ui/stt"
+        # O papel de STT só aceita Whisper: o endpoint de transcrição rejeita
+        # modelo de chat, então a validação barra qualquer outro id.
+        client.put("/api/settings", json={"models": {"stt": "openai/whisper-large-v3"}})
+        health = client.get("/api/health").json()
+        assert health["models"]["diarization"] == "openai/whisper-large-v3"
 
 
 class TestJobsUseTheConfiguredSettings:

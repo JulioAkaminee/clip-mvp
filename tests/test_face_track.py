@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from clip_mvp.face_track import FaceCenter, fill_gaps, render_vertical_facetrack, smooth_centers
+from clip_mvp.face_track import (
+    DetectedFace,
+    FaceCenter,
+    fill_gaps,
+    is_wide_table_shot,
+    pick_featured_face,
+    render_vertical_facetrack,
+    smooth_centers,
+)
 from clip_mvp.models import Window
 from clip_mvp.utils import ffprobe_duration
 
@@ -42,6 +50,29 @@ def test_smooth_centers_first_sample_unchanged():
     smoothed = smooth_centers(centers)
     assert smoothed[0].cx == 0.42
     assert smoothed[0].cy == 0.37
+
+
+def test_pick_featured_face_keeps_current_until_someone_is_clearly_larger():
+    left = DetectedFace(cx=0.22, cy=0.4, area=0.04)
+    mid = DetectedFace(cx=0.50, cy=0.38, area=0.035)
+    right = DetectedFace(cx=0.78, cy=0.42, area=0.033)
+    picked = pick_featured_face([left, mid, right], last_cx=0.22)
+    assert picked is left
+    louder = DetectedFace(cx=0.78, cy=0.40, area=0.09)
+    switched = pick_featured_face([left, mid, louder], last_cx=0.22)
+    assert switched is louder
+
+
+def test_wide_table_shot_uses_full_frame_when_three_faces_are_spread():
+    centers = [
+        FaceCenter(t=i * 0.1, cx=0.3, cy=0.4, n_faces=3, spread_x=0.55)
+        for i in range(12)
+    ]
+    assert is_wide_table_shot(centers) is True
+    closeup = [FaceCenter(t=0.0, cx=0.5, cy=0.4, n_faces=1, spread_x=0.0, area=0.12)]
+    assert is_wide_table_shot(closeup) is False
+    table = [FaceCenter(t=0.0, cx=0.45, cy=0.4, n_faces=1, spread_x=0.0, area=0.032)]
+    assert is_wide_table_shot(table) is True
 
 
 def test_render_vertical_facetrack_with_injected_centers(tmp_path: Path, sample_video_path: Path):

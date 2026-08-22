@@ -219,9 +219,22 @@ def _long_words(n: int = 120, *, sentence_every: int = 10) -> list[Word]:
 
 
 def test_window_already_under_90s_passes_through():
-    result, skipped = fit_vertical_window(2.2, 5.4, CONTEXT_WORDS, max_duration_s=90.0)
+    result, skipped = fit_vertical_window(
+        2.2, 5.4, CONTEXT_WORDS, max_duration_s=90.0, min_duration_s=2.0
+    )
     assert skipped is None
     assert result is not None
+    assert result.duration_s <= 90.0
+
+
+def test_short_vertical_expands_toward_minimum_when_words_allow():
+    words = _long_words(80, sentence_every=8)
+    result, skipped = fit_vertical_window(
+        10.0, 20.0, words, max_duration_s=90.0, min_duration_s=45.0
+    )
+    assert skipped is None
+    assert result is not None
+    assert result.duration_s >= 45.0
     assert result.duration_s <= 90.0
 
 
