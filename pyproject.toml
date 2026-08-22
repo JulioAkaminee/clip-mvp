@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clip-mvp"
+version = "0.1.0"
+description = "Cortes automaticos a partir de link (YouTube/Twitch/etc) com IA via OpenRouter."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+[project.scripts]
+clip = "clip_mvp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+clip_mvp = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
