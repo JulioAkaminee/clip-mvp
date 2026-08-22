@@ -1,7 +1,17 @@
 {
-  "description": "Expectativas minimas para o fixture BR (transcript_pt_br.json + sample_video.mp4), SPEC \u00a714.8.",
+  "description": "Expectativas minimas para o fixture BR (transcript_pt_br.json + sample_video.mp4), SPEC 14.8. Rodar sempre que mexer nos prompts de candidatos/score.",
   "min_candidates_context_complete": 1,
+  "requires_context_complete_in_meta": true,
   "requires_at_least_one_vertical_9x16_le_90s": true,
   "max_vertical_9x16_duration_s": 90,
-  "no_mid_word_cuts": true
+  "no_mid_word_cuts": true,
+  "vertical_window_inside_horizontal": true,
+  "requires_score_in_folder_name": true,
+  "requires_audio_track_in_every_export": true,
+  "expected_format_sizes": {
+    "vertical_center.mp4": [1080, 1920],
+    "vertical_facetrack.mp4": [1080, 1920],
+    "horizontal_16x9.mp4": [1920, 1080]
+  },
+  "captions_must_stay_inside_the_window": true
 }
