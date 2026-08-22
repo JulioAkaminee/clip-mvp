@@ -45,7 +45,15 @@ from .config import Settings, env_settings
 from .feedback import load_recent_feedback, rate_clip
 from .openrouter import OpenRouterError, fetch_models, verify_key
 from .pipeline import RunOptions, make_reporter, resume_job, run_job
-from .progress import STAGE_LABELS, STAGE_ORDER, EventBroker, ProgressReporter
+from .progress import (
+    STAGE_LABELS,
+    STAGE_ORDER,
+    STALE_JOB_AFTER_S,
+    EventBroker,
+    ProgressReporter,
+    is_snapshot_fresh,
+    mark_stale_if_dead,
+)
 from .settings_store import (
     MODEL_ROLES,
     ROLE_BY_KEY,
@@ -84,52 +92,6 @@ POSTER_SOURCES: tuple[str, ...] = (
 )
 
 STREAM_CHUNK = 512 * 1024
-
-#: Um job vivo reescreve ``status.json`` a cada batimento (2s por padrão),
-#: inclusive quando roda na CLI em outro processo. Passado este tempo sem
-#: nenhuma escrita e sem thread viva aqui, o job morreu: `kill`, reboot, ou o
-#: laptop fechou no meio do render. Sem isso a UI herdava um "rodando" eterno,
-#: com ETA congelado e nenhum botão para sair do lugar.
-STALE_JOB_AFTER_S = 45.0
-
-_ACTIVE = {"queued", "running"}
-
-
-def mark_stale_if_dead(
-    snapshot: dict[str, Any], *, running: bool, now: float, after_s: float = STALE_JOB_AFTER_S
-) -> dict[str, Any]:
-    """Converte um job abandonado em estado de erro retriável.
-
-    O objetivo é honestidade: "interrompido" com um botão de retomar é
-    informação; um spinner que gira para sempre não é.
-    """
-    snapshot.setdefault("stale", False)
-    if running or snapshot.get("status") not in _ACTIVE:
-        return snapshot
-
-    updated_at = snapshot.get("updated_at")
-    if not isinstance(updated_at, (int, float)) or (now - updated_at) <= after_s:
-        return snapshot
-
-    stage = snapshot.get("stage") or "queued"
-    idle_min = max(1, int((now - updated_at) // 60))
-    snapshot["status"] = "error"
-    snapshot["stale"] = True
-    snapshot["eta_seconds"] = None
-    snapshot["eta_text"] = "interrompido"
-    snapshot["message"] = f"Job interrompido em {snapshot.get('stage_label', stage)}"
-    snapshot["error"] = {
-        "stage": stage,
-        "stage_label": snapshot.get("stage_label", stage),
-        "type": "JobInterrupted",
-        "message": (
-            f"O job parou de responder há ~{idle_min} min (processo encerrado, "
-            "reinício do servidor ou máquina suspensa)."
-        ),
-        "retriable": True,
-        "hint": "Clique em Tentar de novo: o cache em work/ é reaproveitado, sem re-baixar nem re-transcrever.",
-    }
-    return snapshot
 
 
 class JobRequest(BaseModel):
@@ -205,9 +167,11 @@ class JobRunner:
         job_id = job_id or make_job_id(url)
 
         # job_id é determinístico pela URL: reenviar o mesmo link enquanto o job
-        # roda faria duas threads escreverem o mesmo status.json e a mesma pasta
-        # out/. Nesse caso o certo é acompanhar o job que já existe.
-        if self.is_running(job_id):
+        # roda faria duas execuções escreverem o mesmo status.json e a mesma pasta
+        # out/. Nesse caso o certo é acompanhar o job que já existe — inclusive
+        # quando ele está rodando fora deste processo (`clip "URL"` na CLI), que
+        # nenhuma thread daqui conhece.
+        if self.is_running(job_id) or self.is_alive_elsewhere(job_id):
             return job_id, True
 
         broker = EventBroker()
@@ -280,6 +244,24 @@ class JobRunner:
         with self._lock:
             thread = self._threads.get(job_id)
         return bool(thread and thread.is_alive())
+
+    def is_alive_elsewhere(self, job_id: str) -> bool:
+        """O job está rodando em outro processo (tipicamente a CLI)?
+
+        Só o frescor do ``status.json`` responde isso: o batimento reescreve o
+        arquivo a cada 2s, então um arquivo recente com status ativo é um job
+        vivo que este servidor não iniciou.
+        """
+        if self.is_running(job_id):
+            return False
+        path = Path(self.settings.work_dir) / job_id / "status.json"
+        if not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        return is_snapshot_fresh(payload, now=time.time(), after_s=STALE_JOB_AFTER_S)
 
     def job_meta(self, job_id: str) -> dict[str, Any]:
         job_file = Path(self.settings.work_dir) / job_id / "job.json"
@@ -751,6 +733,11 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
     def retry_job(job_id: str, payload: JobRequest | None = None) -> dict[str, Any]:
         if runner.is_running(job_id):
             raise HTTPException(status_code=409, detail="job ainda está rodando")
+        if runner.is_alive_elsewhere(job_id):
+            raise HTTPException(
+                status_code=409,
+                detail="job está rodando em outro processo (CLI); acompanhe por lá ou espere terminar",
+            )
         job_file = Path(settings.work_dir) / job_id / "job.json"
         if not job_file.is_file():
             raise HTTPException(status_code=404, detail="job não encontrado")
@@ -762,6 +749,13 @@ def create_app(settings: Settings | None = None, *, settings_path: Path | None =
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str) -> dict[str, Any]:
         if not runner.cancel(job_id):
+            if runner.is_alive_elsewhere(job_id):
+                # Cancelar é um Event em memória: só alcança o processo que
+                # iniciou o job.
+                raise HTTPException(
+                    status_code=409,
+                    detail="job foi iniciado na CLI; interrompa por lá (Ctrl+C)",
+                )
             raise HTTPException(status_code=404, detail="job não está em execução")
         return {"job_id": job_id, "canceled": True}
 

@@ -14,7 +14,7 @@ from .console import make_progress_sink
 from .feedback import rate_clip as _rate_clip
 from .models import Window
 from .pipeline import JobCanceled, RunOptions, make_reporter, resume_job, run_job
-from .progress import format_duration
+from .progress import format_duration, mark_stale_if_dead
 
 app = typer.Typer(
     name="clip",
@@ -180,15 +180,27 @@ def status_cmd(
     settings = get_settings()
     work_dir = Path(settings.work_dir)
 
+    def read_status(path: Path) -> dict | None:
+        """Snapshot do job, já com job morto virando erro retomável.
+
+        Sem isso um job que morreu no meio do render (kill, reboot, laptop
+        fechado) ficava em `running` para sempre no terminal, com o ETA
+        congelado — a API já era honesta sobre isso, a CLI não.
+        """
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return mark_stale_if_dead(data, running=False, now=time.time())
+
     if job_id is None:
         if not work_dir.exists():
             console.print("Nenhum job em work/.")
             return
         for path in sorted(work_dir.iterdir(), reverse=True)[:20]:
-            status_path = path / "status.json"
-            if not status_path.is_file():
+            data = read_status(path / "status.json")
+            if data is None:
                 continue
-            data = json.loads(status_path.read_text("utf-8"))
             console.print(
                 f"{data['job_id']}  {data['status']:9} {data['percent']:5.1f}%  "
                 f"{data['stage_label']}"
@@ -197,10 +209,10 @@ def status_cmd(
 
     status_path = work_dir / job_id / "status.json"
     while True:
-        if not status_path.is_file():
+        data = read_status(status_path) if status_path.is_file() else None
+        if data is None:
             console.print(f"[yellow]job {job_id} ainda não registrou progresso[/yellow]")
             raise typer.Exit(code=1)
-        data = json.loads(status_path.read_text("utf-8"))
         console.print(
             f"{data['percent']:5.1f}%  {data['stage_label']}  {data['eta_text']}  "
             f"({data['clips_done']}/{data['clips_total']} cortes)"

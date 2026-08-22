@@ -176,6 +176,72 @@ class TestDuplicateUrl:
         assert client.post("/api/jobs", json={"url": "   "}).status_code == 400
 
 
+class TestJobOwnedByAnotherProcess:
+    """Jobs da CLI e do `clip serve` compartilham `work/<job_id>/`.
+
+    O `job_id` vem da URL, então colar na UI um link que já está rodando no
+    terminal apontava duas execuções para o mesmo `status.json` e a mesma pasta
+    `out/`. O servidor só olhava as próprias threads, e nenhuma delas conhece um
+    job da CLI.
+    """
+
+    def _cli_job(self, settings, *, job_id: str = "job_cli", age_s: float = 2.0) -> None:
+        job_dir = settings.work_dir / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "job.json").write_text(
+            json.dumps({"source_url": "https://example.com/watch?v=cli", "job_id": job_id}),
+            "utf-8",
+        )
+        (job_dir / "status.json").write_text(
+            json.dumps(_snapshot(job_id=job_id, updated_at=time.time() - age_s)), "utf-8"
+        )
+
+    def test_a_fresh_status_file_counts_as_running(self, app_client):
+        client, settings = app_client
+        runner = client.app.state.runner
+        self._cli_job(settings)
+        assert runner.is_alive_elsewhere("job_cli") is True
+
+    def test_a_stale_status_file_does_not(self, app_client):
+        client, settings = app_client
+        runner = client.app.state.runner
+        self._cli_job(settings, age_s=STALE_JOB_AFTER_S + 60)
+        assert runner.is_alive_elsewhere("job_cli") is False
+
+    def test_submitting_the_same_url_attaches_instead_of_duplicating(self, app_client):
+        client, settings = app_client
+        self._cli_job(settings, job_id="job_cli")
+        runner = client.app.state.runner
+        # O job_id é derivado da URL; usamos o mesmo caminho de derivação.
+        from clip_mvp.utils import make_job_id
+
+        url = "https://example.com/watch?v=cli"
+        job_dir = settings.work_dir / make_job_id(url)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "status.json").write_text(
+            json.dumps(_snapshot(job_id=make_job_id(url), updated_at=time.time() - 2.0)), "utf-8"
+        )
+
+        payload = client.post("/api/jobs", json={"url": url}).json()
+
+        assert payload["already_running"] is True
+        assert runner.is_running(payload["job_id"]) is False, "nenhuma segunda execução foi criada"
+
+    def test_retry_refuses_a_job_owned_by_the_cli(self, app_client):
+        client, settings = app_client
+        self._cli_job(settings)
+        response = client.post("/api/jobs/job_cli/retry", json={"url": ""})
+        assert response.status_code == 409
+        assert "CLI" in response.json()["detail"]
+
+    def test_cancel_explains_that_it_cannot_reach_another_process(self, app_client):
+        client, settings = app_client
+        self._cli_job(settings)
+        response = client.post("/api/jobs/job_cli/cancel")
+        assert response.status_code == 409
+        assert "CLI" in response.json()["detail"]
+
+
 class TestHistoryTail:
     def test_a_huge_event_log_is_read_from_the_end(self, app_client):
         client, settings = app_client

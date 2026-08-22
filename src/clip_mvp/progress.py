@@ -56,6 +56,75 @@ STAGE_LABELS: dict[str, str] = {
     "canceled": "Cancelado",
 }
 
+#: Estados em que um job diz estar trabalhando.
+ACTIVE_STATUSES = frozenset({"queued", "running"})
+
+#: Um job vivo reescreve ``status.json`` a cada batimento (2s por padrão),
+#: inclusive quando roda na CLI em outro processo. Passado este tempo sem
+#: nenhuma escrita e sem processo conhecido, o job morreu: `kill`, reboot, ou o
+#: laptop fechou no meio do render. Sem isso a UI (e o `clip status`) herdavam um
+#: "rodando" eterno, com ETA congelado e nenhum caminho para sair do lugar.
+STALE_JOB_AFTER_S = 45.0
+
+
+def is_snapshot_fresh(
+    snapshot: dict[str, Any] | None, *, now: float, after_s: float = STALE_JOB_AFTER_S
+) -> bool:
+    """O job escreveu progresso recentemente, ou seja, está vivo em algum lugar.
+
+    É o que distingue "morreu" de "está rodando em outro processo": um job da CLI
+    é invisível para o servidor, mas o frescor do ``status.json`` não é.
+    """
+    if not snapshot or snapshot.get("status") not in ACTIVE_STATUSES:
+        return False
+    updated_at = snapshot.get("updated_at")
+    if not isinstance(updated_at, (int, float)):
+        return False
+    return (now - updated_at) <= after_s
+
+
+def mark_stale_if_dead(
+    snapshot: dict[str, Any], *, running: bool, now: float, after_s: float = STALE_JOB_AFTER_S
+) -> dict[str, Any]:
+    """Converte um job abandonado em estado de erro retriável.
+
+    O objetivo é honestidade: "interrompido" com um botão de retomar é
+    informação; um spinner que gira para sempre não é.
+    """
+    snapshot.setdefault("stale", False)
+    if running or snapshot.get("status") not in ACTIVE_STATUSES:
+        return snapshot
+    if is_snapshot_fresh(snapshot, now=now, after_s=after_s):
+        return snapshot
+
+    updated_at = snapshot.get("updated_at")
+    if not isinstance(updated_at, (int, float)):
+        return snapshot
+
+    stage = snapshot.get("stage") or "queued"
+    idle_min = max(1, int((now - updated_at) // 60))
+    snapshot["status"] = "error"
+    snapshot["stale"] = True
+    snapshot["eta_seconds"] = None
+    snapshot["eta_text"] = "interrompido"
+    snapshot["message"] = f"Job interrompido em {snapshot.get('stage_label', stage)}"
+    snapshot["error"] = {
+        "stage": stage,
+        "stage_label": snapshot.get("stage_label", stage),
+        "type": "JobInterrupted",
+        "message": (
+            f"O job parou de responder há ~{idle_min} min (processo encerrado, "
+            "reinício do servidor ou máquina suspensa)."
+        ),
+        "retriable": True,
+        "hint": (
+            "Rode `clip resume <job_id>` (ou clique em Tentar de novo na UI): o cache "
+            "em work/ é reaproveitado, sem re-baixar nem re-transcrever."
+        ),
+    }
+    return snapshot
+
+
 #: Peso relativo de cada estágio no percentual global (soma 100).
 #:
 #: Os pesos são re-normalizados em runtime quando estágios são pulados (por
