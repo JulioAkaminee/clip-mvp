@@ -27,9 +27,19 @@ class FakeOpenRouterClient:
         self.meta_payload = meta_payload
         self.chat_calls: list[dict] = []
         self.transcribe_calls: list[Path] = []
+        #: Modelo pedido em cada chamada de STT (`None` = papel de STT default).
+        #: A diarização com modelo próprio se distingue por aqui.
+        self.transcribe_models: list[str | None] = []
+        #: Resposta a devolver quando o modelo pedido não é o de STT.
+        self.diarization_raw: dict | None = None
 
-    def transcribe(self, audio_path: Path, *, language: str = "pt") -> dict:
+    def transcribe(
+        self, audio_path: Path, *, language: str = "pt", model: str | None = None
+    ) -> dict:
         self.transcribe_calls.append(Path(audio_path))
+        self.transcribe_models.append(model)
+        if model is not None and self.diarization_raw is not None:
+            return self.diarization_raw
         return self.whisper_raw
 
     def chat_json(self, *, model: str, system: str, user: str, images_b64=None, temperature: float = 0.4) -> dict:

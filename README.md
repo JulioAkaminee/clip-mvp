@@ -377,10 +377,12 @@ out/87_hook-fulano/
   regenerar candidatos não reaproveita frames de outro momento (o scorer
   avaliaria o vídeo errado), e dois candidatos com a mesma janela dividem a
   extração.
-- Diarização não custa chamada nenhuma: sai dos speaker labels da transcrição que
-  já foi paga. `resume --more`/`--count N` regenera o pool de candidatos **só**
-  quando o pedido não caberia no pool em cache (um prompt de texto; o vídeo e a
-  transcrição continuam vindo do disco).
+- Diarização não custa chamada nenhuma no caminho default: sai dos speaker labels
+  da transcrição que já foi paga. Só há segunda passada de áudio quando o papel de
+  diarização aponta para outro modelo — e aí ela reusa o chunking da transcrição e
+  aparece na estimativa de custo. `resume --more`/`--count N` regenera o pool de
+  candidatos **só** quando o pedido não caberia no pool em cache (um prompt de
+  texto; o vídeo e a transcrição continuam vindo do disco).
 - Chamadas de rede (STT, score, títulos) rodam em paralelo limitado
   (`CLIP_NETWORK_WORKERS`, default 3); render e face tracking usam um pool
   menor (`CLIP_RENDER_WORKERS`, default 2) porque ffmpeg e MediaPipe competem
@@ -414,8 +416,11 @@ bug depois:
 
 - **Diarização depende do provider.** A timeline sai dos speaker labels do STT, e
   a maioria dos modelos Whisper-compatíveis na OpenRouter não os expõe hoje
-  (SPEC §15). Sem labels o face track usa o `activity_proxy`. O proxy é o rosto de
-  maior área, não análise de movimento de boca por frame.
+  (SPEC §15). Dá para apontar o **papel de diarização** (Configurações) para um
+  modelo que exponha — o que custa uma segunda passada de áudio, já refletida na
+  estimativa de custo. Sem labels de nenhuma das duas fontes, o face track usa o
+  `activity_proxy`: o rosto de maior área, não análise de movimento de boca por
+  frame.
 - **Labels de falante valem dentro do bloco de STT.** Diarização vem por
   requisição, então o `SPEAKER_00` de um bloco de ~10 min não é necessariamente a
   mesma pessoa do bloco seguinte. Os labels são escopados por bloco e o

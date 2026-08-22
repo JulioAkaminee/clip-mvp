@@ -12,11 +12,14 @@ import json
 from pathlib import Path
 
 from clip_mvp import pipeline as pipeline_mod
+from clip_mvp.budget import estimate_cost
+from clip_mvp.config import Settings
 from clip_mvp.diarization import (
     diarization_from_transcript,
     resolve_speaker_matching_method,
     speaker_at,
     speaker_timeline,
+    uses_dedicated_pass,
 )
 from clip_mvp.face_track import (
     FaceObservation,
@@ -31,6 +34,10 @@ from test_pipeline import _patch_download, _settings, fake_client  # noqa: F401
 
 LEFT_X = 0.25
 RIGHT_X = 0.75
+
+
+def _settings_with(**kwargs) -> Settings:
+    return Settings(openrouter_api_key="test-key", **kwargs)
 
 
 def _two_face_scene(n_samples: int, *, talking: list[str | None]) -> list[list[FaceObservation]]:
@@ -265,3 +272,140 @@ def test_diarization_does_not_pay_for_a_second_transcription(
     )
 
     assert len(fake_client.transcribe_calls) == 1
+
+
+# -- papel de diarização com modelo próprio (SPEC §9) -----------------------
+
+
+class TestDedicatedDiarizationModel:
+    """O papel de diarização existe porque o modelo de STT pode não expor speaker
+    labels e outro modelo pode. A passada extra só se justifica nesse caso.
+    """
+
+    def test_no_dedicated_pass_when_the_role_is_empty(self):
+        assert uses_dedicated_pass(_settings_with(diarization_model="")) is False
+
+    def test_no_dedicated_pass_when_the_role_repeats_the_stt_model(self):
+        """Mesma requisição, mesmo modelo, mesma ausência de labels: desperdício."""
+        settings = _settings_with(stt_model="openai/whisper-1", diarization_model="openai/whisper-1")
+        assert uses_dedicated_pass(settings) is False
+
+    def test_a_distinct_model_enables_the_dedicated_pass(self):
+        settings = _settings_with(
+            stt_model="openai/whisper-1", diarization_model="algum/modelo-com-speakers"
+        )
+        assert uses_dedicated_pass(settings) is True
+
+    def test_transcript_labels_win_over_the_dedicated_pass(
+        self, tmp_path, monkeypatch, sample_video_path, whisper_verbose_json_diarized, fake_client
+    ):
+        """Se a transcrição já veio com labels, pagar de novo não compra nada."""
+        _patch_download(monkeypatch, sample_video_path)
+        settings = _settings(tmp_path)
+        settings.diarization_model = "algum/modelo-com-speakers"
+        fake_client.whisper_raw = whisper_verbose_json_diarized
+
+        pipeline_mod.run_job(
+            "https://youtube.com/watch?v=d", settings, pipeline_mod.RunOptions(), client=fake_client
+        )
+
+        assert fake_client.transcribe_models == [None]
+
+    def test_the_dedicated_pass_runs_when_the_stt_had_no_labels(
+        self,
+        tmp_path,
+        monkeypatch,
+        sample_video_path,
+        whisper_verbose_json_raw,
+        whisper_verbose_json_diarized,
+        fake_client,
+    ):
+        _patch_download(monkeypatch, sample_video_path)
+        settings = _settings(tmp_path)
+        settings.diarization_model = "algum/modelo-com-speakers"
+        fake_client.whisper_raw = whisper_verbose_json_raw
+        fake_client.diarization_raw = whisper_verbose_json_diarized
+
+        summary = pipeline_mod.run_job(
+            "https://youtube.com/watch?v=d2", settings, pipeline_mod.RunOptions(), client=fake_client
+        )
+
+        # Uma passada de STT + uma de diarização, esta última no modelo do papel.
+        assert fake_client.transcribe_models == [None, "algum/modelo-com-speakers"]
+        meta = json.loads(
+            (Path(summary.clips[0]["out_dir"]) / "meta.json").read_text(encoding="utf-8")
+        )
+        assert meta["speaker_matching"]["method"] == "diarization"
+
+    def test_no_dedicated_pass_without_the_role_even_without_labels(
+        self, tmp_path, monkeypatch, sample_video_path, whisper_verbose_json_raw, fake_client
+    ):
+        _patch_download(monkeypatch, sample_video_path)
+        settings = _settings(tmp_path)
+        fake_client.whisper_raw = whisper_verbose_json_raw
+
+        summary = pipeline_mod.run_job(
+            "https://youtube.com/watch?v=d3", settings, pipeline_mod.RunOptions(), client=fake_client
+        )
+
+        assert fake_client.transcribe_models == [None]
+        meta = json.loads(
+            (Path(summary.clips[0]["out_dir"]) / "meta.json").read_text(encoding="utf-8")
+        )
+        assert meta["speaker_matching"]["method"] == "activity_proxy"
+
+    def test_the_dedicated_pass_is_priced_into_the_budget(self):
+        """SPEC §14.4: o `--budget` não pode ser surpreendido por um segundo STT."""
+        plain = _settings_with(cost_stt_usd_per_min=0.01)
+        dedicated = _settings_with(
+            cost_stt_usd_per_min=0.01, diarization_model="algum/modelo-com-speakers"
+        )
+
+        without = estimate_cost(600, 10, plain)
+        with_pass = estimate_cost(600, 10, dedicated)
+
+        assert without.diarization_usd == 0.0
+        assert with_pass.diarization_usd == round(10 * 0.01, 4)
+        assert with_pass.total_usd > without.total_usd
+        assert with_pass.total_usd == round(
+            with_pass.stt_usd + with_pass.diarization_usd + with_pass.text_usd + with_pass.vision_usd,
+            4,
+        )
+
+    def test_the_dedicated_pass_is_chunked_like_the_transcription(self, tmp_path, monkeypatch):
+        """SPEC §15: o endpoint de STT tem limite de tamanho.
+
+        A versão anterior mandava o arquivo inteiro numa requisição só; reusar
+        `transcribe_audio` faz a diarização herdar o chunking de ~10 min.
+        """
+        import clip_mvp.transcribe as transcribe_mod
+        from clip_mvp.diarization import diarize_with_dedicated_model
+
+        settings = _settings_with(diarization_model="algum/modelo-com-speakers")
+        seen: dict = {}
+
+        def spy(audio_path, s, *, client=None, model=None, **kwargs):
+            seen["model"] = model
+            seen["chunk_seconds"] = kwargs.get("chunk_seconds", transcribe_mod.CHUNK_SECONDS_DEFAULT)
+            return Transcript(segments=[])
+
+        monkeypatch.setattr(transcribe_mod, "transcribe_audio", spy)
+        diarize_with_dedicated_model(tmp_path / "audio.wav", settings, client=None)
+
+        assert seen["model"] == "algum/modelo-com-speakers"
+        assert seen["chunk_seconds"] == transcribe_mod.CHUNK_SECONDS_DEFAULT
+
+    def test_a_failing_dedicated_pass_falls_back_instead_of_killing_the_job(self, tmp_path):
+        from clip_mvp.diarization import resolve_diarization
+
+        class Exploding:
+            def transcribe(self, *args, **kwargs):
+                raise RuntimeError("modelo não suporta áudio")
+
+        settings = _settings_with(diarization_model="algum/modelo-ruim")
+        result = resolve_diarization(
+            Transcript(segments=[]), tmp_path / "audio.wav", settings, client=Exploding()
+        )
+
+        assert result.method == "unavailable"
+        assert resolve_speaker_matching_method(result) == "activity_proxy"
