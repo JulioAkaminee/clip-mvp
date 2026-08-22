@@ -13,6 +13,37 @@ load_dotenv()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+#: Modelo de texto/vision barato o suficiente para rodar o pipeline inteiro
+#: (SPEC §4: "modelo texto barato/rápido" para candidatos, vision no score).
+DEFAULT_TEXT_MODEL = "google/gemini-2.5-flash"
+DEFAULT_STT_MODEL = "openai/whisper-1"
+
+#: Papéis de IA → (variável de ambiente, default do código). O papel de
+#: diarização nasce vazio: sem valor próprio ele reusa o modelo de STT (SPEC §9).
+MODEL_ENV_DEFAULTS: dict[str, tuple[str, str]] = {
+    "stt_model": ("OPENROUTER_STT_MODEL", DEFAULT_STT_MODEL),
+    "candidate_model": ("OPENROUTER_CANDIDATE_MODEL", DEFAULT_TEXT_MODEL),
+    "score_model": ("OPENROUTER_SCORE_MODEL", DEFAULT_TEXT_MODEL),
+    "meta_model": ("OPENROUTER_META_MODEL", ""),
+    "diarization_model": ("OPENROUTER_DIARIZATION_MODEL", ""),
+}
+
+
+def env_default_model(field_name: str) -> str:
+    """Valor de `.env` (ou default do código) de um papel, ignorando a UI.
+
+    É o que a interface mostra como "padrão do projeto" no botão de restaurar.
+    """
+    env_name, fallback = MODEL_ENV_DEFAULTS[field_name]
+    value = (os.getenv(env_name) or "").strip()
+    if value:
+        return value
+    if field_name == "meta_model":
+        # Sem OPENROUTER_META_MODEL o texto social usa o mesmo modelo dos
+        # candidatos: são as duas chamadas de texto puro do pipeline.
+        return env_default_model("candidate_model")
+    return fallback
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -43,16 +74,12 @@ class Settings:
         default_factory=lambda: os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL)
     )
 
-    stt_model: str = field(default_factory=lambda: os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-1"))
-    candidate_model: str = field(
-        default_factory=lambda: os.getenv("OPENROUTER_CANDIDATE_MODEL", "google/gemini-2.5-flash")
-    )
-    score_model: str = field(
-        default_factory=lambda: os.getenv("OPENROUTER_SCORE_MODEL", "google/gemini-2.5-flash")
-    )
-    meta_model: str = field(
-        default_factory=lambda: os.getenv("OPENROUTER_META_MODEL", os.getenv("OPENROUTER_CANDIDATE_MODEL", "google/gemini-2.5-flash"))
-    )
+    stt_model: str = field(default_factory=lambda: env_default_model("stt_model"))
+    candidate_model: str = field(default_factory=lambda: env_default_model("candidate_model"))
+    score_model: str = field(default_factory=lambda: env_default_model("score_model"))
+    meta_model: str = field(default_factory=lambda: env_default_model("meta_model"))
+    #: Vazio = diariza com o modelo de STT (SPEC §9).
+    diarization_model: str = field(default_factory=lambda: env_default_model("diarization_model"))
 
     # Regras de fronteira / padding (SPEC §2.5, §14.1)
     pad_ms_min: int = field(default_factory=lambda: _env_int("CLIP_PAD_MS_MIN", 200))
@@ -130,11 +157,27 @@ class Settings:
     def require_api_key(self) -> str:
         if not self.openrouter_api_key:
             raise RuntimeError(
-                "OPENROUTER_API_KEY não configurada. Copie .env.example para .env e "
-                "preencha sua chave da OpenRouter."
+                "OPENROUTER_API_KEY não configurada. Configure a chave em "
+                "Configurações na interface (clip serve) ou copie .env.example "
+                "para .env e preencha sua chave da OpenRouter."
             )
         return self.openrouter_api_key
 
+    def model_for_diarization(self) -> str:
+        return self.diarization_model or self.stt_model
+
+
+def env_settings() -> Settings:
+    """Configuração só do ambiente (`.env`), sem o que a UI gravou."""
+    return Settings()
+
 
 def get_settings() -> Settings:
-    return Settings()
+    """Configuração efetiva: `.env` com a chave/modelos da UI por cima.
+
+    A interface e a CLI compartilham o mesmo arquivo de settings, então uma chave
+    configurada na tela também vale para `clip "URL"` no terminal.
+    """
+    from .settings_store import apply_stored
+
+    return apply_stored(Settings())

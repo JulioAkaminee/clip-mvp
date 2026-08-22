@@ -227,10 +227,18 @@ def serve_cmd(
         )
         raise typer.Exit(code=1)
 
+    from .config import env_settings
     from .server import WEB_DIST, create_app
+    from .settings_store import settings_file
 
-    settings = get_settings()
+    # A base é só o `.env`: o que a UI salvar entra por cima a cada requisição,
+    # senão salvar a chave na tela exigiria reiniciar o servidor.
+    settings = env_settings()
     console.print(f"[bold green]UI em http://{host}:{port}[/bold green]")
+    console.print(
+        f"[dim]Chave e modelos da OpenRouter: configuráveis em Configurações na UI "
+        f"({settings_file()}).[/dim]"
+    )
     if not (WEB_DIST / "index.html").is_file():
         console.print(
             "[yellow]UI não buildada:[/yellow] rode "
