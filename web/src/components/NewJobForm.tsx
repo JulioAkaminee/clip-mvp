@@ -78,6 +78,7 @@ export function NewJobForm({
   });
   const [busy, setBusy] = useState<"none" | "dry" | "create">("none");
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const patch = (changes: Partial<FormState>) => setForm((current) => ({ ...current, ...changes }));
 
@@ -95,9 +96,15 @@ export function NewJobForm({
       return;
     }
     setError(null);
+    setNotice(null);
     setBusy(dryRun ? "dry" : "create");
     try {
-      const { job_id } = await api.createJob(toRequest(form, dryRun));
+      const { job_id, already_running } = await api.createJob(toRequest(form, dryRun));
+      // O job_id vem da URL, então o mesmo link nunca abre um segundo job. Sem
+      // dizer isso, reenviar parecia não ter efeito nenhum.
+      if (already_running) {
+        setNotice("Esse link já está sendo processado — abrindo o job que está rodando.");
+      }
       onCreated(job_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -295,6 +302,11 @@ export function NewJobForm({
         {error && (
           <p className="rounded-xl border border-red-400/30 bg-red-500/10 px-3.5 py-2.5 text-[0.8rem] text-red-200">
             {error}
+          </p>
+        )}
+        {notice && (
+          <p className="rounded-xl border border-brand-400/30 bg-brand-500/10 px-3.5 py-2.5 text-[0.8rem] text-brand-400">
+            {notice}
           </p>
         )}
         {health && !health.openrouter_key && (

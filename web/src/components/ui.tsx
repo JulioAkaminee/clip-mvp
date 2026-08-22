@@ -264,10 +264,23 @@ export function ProgressBar({
   value,
   active,
   tone = "brand",
+  label,
+  valueText,
+  announce = false,
 }: {
   value: number;
   active?: boolean;
   tone?: "brand" | "done" | "error";
+  /** Nome acessível da barra (ex. "Progresso do job"). */
+  label?: string;
+  /** Leitura humana do estado: "71% — Renderizando cortes, ~2 min restantes". */
+  valueText?: string;
+  /**
+   * Anuncia mudanças em leitor de tela. Um job longo emite dezenas de
+   * atualizações por minuto, então só a barra global pede isso — e em
+   * `polite`, para não interromper o que o usuário está lendo.
+   */
+  announce?: boolean;
 }) {
   const tones = {
     brand: "from-brand-600 to-brand-400",
@@ -278,9 +291,12 @@ export function ProgressBar({
     <div
       className="h-1.5 w-full overflow-hidden rounded-full bg-white/8"
       role="progressbar"
+      aria-label={label}
       aria-valuenow={Math.round(value * 100)}
       aria-valuemin={0}
       aria-valuemax={100}
+      aria-valuetext={valueText}
+      aria-live={announce ? "polite" : undefined}
     >
       <div
         className={cx(

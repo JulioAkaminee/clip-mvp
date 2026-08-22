@@ -201,6 +201,37 @@ class TestPersistence:
         assert result["summary"]["out_dirs"]
 
 
+class TestPerClipFormatStatus:
+    def test_planned_formats_appear_before_the_render_starts(self, run):
+        """O card precisa saber quantos arquivos o corte vai ter, desde o começo.
+
+        Antes o chip de cada formato só nascia quando aquele ffmpeg começava, e o
+        card parecia exportar menos coisa do que o vizinho até o fim do render.
+        """
+        pending_seen = [
+            event
+            for event in run["events"]
+            if any(
+                status == "pending"
+                for clip in event["clips"]
+                for status in clip["formats"].values()
+            )
+        ]
+        assert pending_seen, "nenhum formato foi anunciado como pendente"
+
+    def test_every_planned_format_ends_in_a_terminal_state(self, run):
+        for clip in run["snapshot"]["clips"]:
+            assert clip["formats"], "corte terminou sem nenhum formato registrado"
+            for name, status in clip["formats"].items():
+                assert status in {"done", "error"}, f"{name} ficou em {status}"
+
+    def test_the_render_counter_matches_the_files_produced(self, run):
+        """A contagem de unidades do render tem de fechar com o total planejado."""
+        render = next(s for s in run["snapshot"]["stages"] if s["name"] == "render")
+        assert render["units_done"] == render["units_total"]
+        assert render["percent"] == 100.0
+
+
 class TestFailureState:
     def test_failure_is_reported_and_never_leaves_ui_spinning(
         self, tmp_path, monkeypatch, sample_video_path, fake_client

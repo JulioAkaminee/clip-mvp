@@ -51,7 +51,10 @@ export const api = {
   clips: (id: string) => request<{ clips: Clip[] }>(`/jobs/${id}/clips`),
   history: (id: string) => request<{ events: LogLine[] }>(`/jobs/${id}/history`),
   createJob: (payload: JobRequest) =>
-    request<{ job_id: string }>("/jobs", { method: "POST", body: JSON.stringify(payload) }),
+    request<{ job_id: string; already_running: boolean }>("/jobs", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   cancel: (id: string) => request<{ canceled: boolean }>(`/jobs/${id}/cancel`, { method: "POST" }),
   retry: (id: string, payload?: Partial<JobRequest>) =>
     request<{ retried: boolean }>(`/jobs/${id}/retry`, {

@@ -699,6 +699,19 @@ def _render_selected(
             units += int(want_center) + int(want_face)
     reporter.start_stage("render", units_total=max(1, units))
 
+    # Os formatos entram como "pending" antes de começar: assim o card já mostra
+    # quantos arquivos aquele corte vai ter, em vez de ganhar chips do nada e
+    # parecer que dois cortes exportam coisas diferentes.
+    for candidate, _score in selected:
+        planned = ["horizontal_16x9"] if want_horizontal else []
+        if candidate.window_9x16 is not None:
+            planned += ["vertical_center"] if want_center else []
+            planned += ["vertical_facetrack"] if want_face else []
+        for format_name in planned:
+            reporter.update_clip(
+                slugs[candidate.id], format_name=format_name, format_status="pending"
+            )
+
     def render_one(candidate: Candidate, score: Score) -> None:
         slug = slugs[candidate.id]
         clip_dir = out_clip_dir(settings.out_dir, round(score.total), slug)

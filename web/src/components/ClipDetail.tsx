@@ -59,6 +59,7 @@ export function ClipDetail({
   const [note, setNote] = useState(clip.rating_note ?? "");
   const [rating, setRating] = useState(clip.rating);
   const [busy, setBusy] = useState(false);
+  const [showSafeArea, setShowSafeArea] = useState(false);
 
   // Os artefatos chegam depois do card (o render termina um formato por vez):
   // se a aba escolhida ainda não existe, cai na primeira disponível.
@@ -137,7 +138,7 @@ export function ClipDetail({
                 />
                 <div
                   className={cx(
-                    "mx-auto overflow-hidden rounded-2xl border border-white/10 bg-black",
+                    "relative mx-auto overflow-hidden rounded-2xl border border-white/10 bg-black",
                     isVertical ? "max-w-[19rem]" : "w-full",
                   )}
                 >
@@ -149,7 +150,20 @@ export function ClipDetail({
                     preload="metadata"
                     className={cx("w-full", isVertical ? "aspect-[9/16]" : "aspect-video")}
                   />
+                  {isVertical && showSafeArea && <SafeAreaMask />}
                 </div>
+
+                {isVertical && (
+                  <label className="flex cursor-pointer items-center justify-center gap-2 text-[0.74rem] text-mist-400">
+                    <input
+                      type="checkbox"
+                      checked={showSafeArea}
+                      onChange={(event) => setShowSafeArea(event.target.checked)}
+                      className="size-3.5 accent-brand-500"
+                    />
+                    Mostrar safe area do TikTok/Shorts
+                  </label>
+                )}
               </>
             ) : (
               <p className="rounded-xl border border-dashed border-white/12 px-4 py-8 text-center text-[0.82rem] text-mist-400">
@@ -174,7 +188,11 @@ export function ClipDetail({
               <WindowCard
                 title="9:16 (Shorts / TikTok)"
                 window={vertical}
-                note="máximo 90s, sempre em fronteira de frase"
+                note={
+                  vertical?.shrunk_from_16x9
+                    ? "encolhido a partir do 16:9 para caber em 90s, ainda fechando frase"
+                    : "máximo 90s, sempre em fronteira de frase"
+                }
               />
             </div>
 
@@ -281,6 +299,31 @@ export function ClipDetail({
           </aside>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Máscara da safe area do 9:16 (SPEC §14.5).
+ *
+ * As frações são as mesmas que `subtitles.build_ass` usa para posicionar o
+ * burn-in — a spec exige que preview e burn-in respeitem a mesma máscara, e sem
+ * isso não havia como conferir no preview se a legenda vai cair atrás da UI do
+ * TikTok antes de publicar.
+ */
+function SafeAreaMask() {
+  return (
+    <div className="pointer-events-none absolute inset-0" aria-hidden>
+      {/* ~20% inferior: onde ficam caption, perfil e botões do app */}
+      <div className="absolute inset-x-0 bottom-0 h-[20%] border-t border-dashed border-amber-300/50 bg-amber-300/10">
+        <span className="absolute bottom-1 left-1/2 -translate-x-1/2 whitespace-nowrap rounded bg-ink-950/80 px-1.5 py-0.5 text-[0.6rem] font-medium text-amber-200">
+          UI do app — 20%
+        </span>
+      </div>
+      {/* margens laterais apertadas */}
+      <div className="absolute inset-y-0 left-0 w-[8%] bg-amber-300/8" />
+      <div className="absolute inset-y-0 right-0 w-[8%] bg-amber-300/8" />
+      <div className="absolute inset-x-[8%] bottom-[20%] top-0 border border-dashed border-lime-300/30" />
     </div>
   );
 }

@@ -80,7 +80,12 @@ export function StageTimeline({ stages }: { stages: StageState[] }) {
             )}
             {active && (
               <div className="mt-2 pl-8">
-                <ProgressBar value={stage.percent / 100} active />
+                <ProgressBar
+                  value={stage.percent / 100}
+                  active
+                  label={stage.label}
+                  valueText={`${stage.label}: ${Math.round(stage.percent)}%`}
+                />
               </div>
             )}
           </li>

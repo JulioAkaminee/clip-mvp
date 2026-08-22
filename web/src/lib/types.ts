@@ -36,6 +36,8 @@ export interface StageState {
   predicted_seconds: number | null;
 }
 
+export type FormatStatus = "pending" | "running" | "done" | "error";
+
 export interface ClipProgress {
   slug: string;
   score: number | null;
@@ -72,6 +74,9 @@ export interface JobSummary {
   vertical_ok: number;
   vertical_skipped: number;
   min_score: number;
+  /** Cortes acima do limiar mas muito abaixo do melhor deste vídeo (SPEC §3.5). */
+  below_floor_removed: number;
+  quality_floor: number | null;
   dry_run: boolean;
   cost_estimate: CostEstimate | null;
   notes: string[];
@@ -86,6 +91,8 @@ export interface JobProgress {
   stage: string;
   stage_label: string;
   stage_percent: number;
+  /** Tempo no estágio atual: o único sinal de vida quando não há o que contar. */
+  stage_elapsed_seconds: number | null;
   percent: number;
   eta_seconds: number | null;
   eta_text: string;
@@ -96,11 +103,15 @@ export interface JobProgress {
   stages: StageState[];
   elapsed_seconds: number;
   updated_at: number;
+  /** Reemissão periódica do backend (não é uma transição de estágio). */
+  heartbeat?: boolean;
   error: JobError | null;
   source_minutes: number;
   result: { summary: JobSummary } | null;
   source_url?: string;
   running?: boolean;
+  /** Job abandonado (processo morto / servidor reiniciado), não em execução. */
+  stale?: boolean;
 }
 
 export interface JobListItem {
@@ -117,12 +128,17 @@ export interface JobListItem {
   updated_at?: number;
   source_minutes?: number;
   running?: boolean;
+  stale?: boolean;
 }
 
 export interface WindowInfo {
   start: number;
   end: number;
   duration_s: number;
+  /** Só no 9:16: a janela fecha contexto por conta própria? */
+  context_complete?: boolean;
+  /** Só no 9:16: encolhida a partir do 16:9 para caber no teto de 90s. */
+  shrunk_from_16x9?: boolean;
 }
 
 export interface SocialCopy {

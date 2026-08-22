@@ -131,9 +131,23 @@ export function JobView({
         <ProgressHeader progress={progress} live={live} />
 
         {progress.error && (
-          <div className="space-y-2 rounded-xl border border-red-400/30 bg-red-500/10 px-4 py-3">
-            <p className="text-[0.82rem] font-medium text-red-100">
-              Falhou em {progress.error.stage_label}: {progress.error.message}
+          <div
+            className={cx(
+              "space-y-2 rounded-xl border px-4 py-3",
+              progress.stale
+                ? "border-amber-300/30 bg-amber-300/8"
+                : "border-red-400/30 bg-red-500/10",
+            )}
+          >
+            <p
+              className={cx(
+                "text-[0.82rem] font-medium",
+                progress.stale ? "text-amber-100" : "text-red-100",
+              )}
+            >
+              {progress.stale
+                ? `Interrompido em ${progress.error.stage_label}: ${progress.error.message}`
+                : `Falhou em ${progress.error.stage_label}: ${progress.error.message}`}
             </p>
             {progress.error.hint && (
               <p className="text-[0.78rem] text-amber-100">{progress.error.hint}</p>
@@ -144,7 +158,7 @@ export function JobView({
                 onClick={() => void act("retry", () => api.retry(progress.job_id))}
                 loading={busy === "retry"}
               >
-                Tentar de novo
+                {progress.stale ? "Retomar de onde parou" : "Tentar de novo"}
               </Button>
             )}
           </div>
@@ -169,6 +183,15 @@ export function JobView({
                   <Stat label="selecionados" value={summary.selected} strong />
                   <Stat label="candidatos" value={summary.candidates} />
                   <Stat label="dedupe" value={summary.deduped_removed} />
+                  <Stat
+                    label="abaixo do piso"
+                    value={summary.below_floor_removed ?? 0}
+                    title={
+                      summary.quality_floor != null
+                        ? `Cortes acima do limiar mas abaixo de ${Math.round(summary.quality_floor)} — muito distantes do melhor deste vídeo`
+                        : undefined
+                    }
+                  />
                   <Stat label="9:16 ok" value={summary.vertical_ok} />
                   <Stat label="9:16 descartado" value={summary.vertical_skipped} />
                 </dl>
@@ -258,9 +281,19 @@ export function JobView({
   );
 }
 
-function Stat({ label, value, strong = false }: { label: string; value: number; strong?: boolean }) {
+function Stat({
+  label,
+  value,
+  strong = false,
+  title,
+}: {
+  label: string;
+  value: number;
+  strong?: boolean;
+  title?: string;
+}) {
   return (
-    <div className="flex items-baseline gap-1.5">
+    <div className="flex items-baseline gap-1.5" title={title}>
       <dt className="text-mist-400">{label}</dt>
       <dd className={cx("font-mono", strong ? "text-base text-white" : "text-mist-200")}>
         {value}
