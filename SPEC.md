@@ -399,7 +399,7 @@ Estas oito regras fazem parte da spec do produto (não são “ideias futuras”
 ## 15. Riscos / notas
 
 - Chunks de áudio: respeitar limite de tamanho do endpoint STT do OpenRouter  
-- Costo: vision no score é o item mais caro — só nos candidatos, não em todo o vídeo; usar `--budget`  
+- Custo: vision no score é o item mais caro — só nos candidatos, não em todo o vídeo; usar `--budget`  
 - Word timestamps / diarização: disponibilidade varia por modelo no OpenRouter — ter fallback na spec  
 - ToS: uso de links de terceiros é responsabilidade do usuário  
 - Qualidade PT-BR depende dos prompts + feedback loop (`clip rate`)  
